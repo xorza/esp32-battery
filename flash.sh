@@ -2,12 +2,21 @@
 set -euo pipefail
 
 DIR="$(dirname "$0")"
+CHIP="${MCU:?Set MCU=esp32c3 or MCU=esp32c6}"
 
-cargo build --release
+case "$CHIP" in
+    esp32c3) PARTITIONS="$DIR/partitions-4mb.csv" ; TARGET="riscv32imc-esp-espidf" ;;
+    esp32c6) PARTITIONS="$DIR/partitions-8mb.csv" ; TARGET="riscv32imac-esp-espidf" ;;
+    *)       echo "Unknown MCU: $CHIP"; exit 1 ;;
+esac
+
+ELF="$DIR/target/$TARGET/release/esp32-battery"
+
+cargo build --release --target "$TARGET"
 
 espflash flash \
     --erase-data-parts ota \
     --monitor \
-    --partition-table "$DIR/partitions.csv" \
+    --partition-table "$PARTITIONS" \
     --port /dev/ttyACM0 \
-    "$DIR/target/riscv32imac-esp-espidf/release/esp32-battery"
+    "$ELF"
