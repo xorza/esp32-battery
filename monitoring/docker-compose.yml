@@ -1,5 +1,6 @@
 services:
   influxdb:
+    container_name: battery-monitor-influxdb
     image: influxdb:latest
     volumes:
       - ./volumes/influxdb:/var/lib/influxdb2
@@ -19,6 +20,7 @@ services:
     restart: unless-stopped
 
   telegraf:
+    container_name: battery-monitor-telegraf
     image: telegraf:latest
     volumes:
       - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
@@ -36,6 +38,7 @@ services:
     restart: unless-stopped
 
   grafana:
+    container_name: battery-monitor-grafana
     image: grafana/grafana:latest
     volumes:
       - ./volumes/grafana:/var/lib/grafana

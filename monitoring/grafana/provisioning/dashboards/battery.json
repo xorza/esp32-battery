@@ -76,11 +76,87 @@
       }]
     },
     {
+      "title": "Power Online",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "ON", "color": "green" }, "0": { "text": "OFF", "color": "red" } } }
+          ],
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "datasource": { "type": "influxdb" },
+        "query": "from(bucket: \"battery\") |> range(start: -1m) |> filter(fn: (r) => r._measurement == \"battery\" and r._field == \"power_online\") |> last()"
+      }]
+    },
+    {
+      "title": "Power Online %",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 80 },
+              { "color": "green", "value": 99 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "datasource": { "type": "influxdb" },
+        "query": "from(bucket: \"battery\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"battery\" and r._field == \"power_online\") |> mean() |> map(fn: (r) => ({r with _value: r._value * 100.0}))"
+      }]
+    },
+    {
+      "title": "Max Charge",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 6 },
+      "fieldConfig": {
+        "defaults": { "unit": "Ah", "decimals": 3 }
+      },
+      "targets": [{
+        "datasource": { "type": "influxdb" },
+        "query": "from(bucket: \"battery\") |> range(start: -1m) |> filter(fn: (r) => r._measurement == \"battery\" and r._field == \"max_charge\") |> last()"
+      }]
+    },
+    {
+      "title": "Read Failures",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "datasource": { "type": "influxdb" },
+        "query": "from(bucket: \"battery\") |> range(start: -1m) |> filter(fn: (r) => r._measurement == \"battery\" and r._field == \"read_failures\") |> last()"
+      }]
+    },
+    {
       "title": "Voltage",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 6 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
       "fieldConfig": {
-        "defaults": { "unit": "volt", "decimals": 3, "custom": { "lineWidth": 2 } }
+        "defaults": { "unit": "volt", "decimals": 3, "displayName": "Voltage", "custom": { "lineWidth": 2 } }
       },
       "targets": [{
         "datasource": { "type": "influxdb" },
@@ -90,7 +166,7 @@
     {
       "title": "Current",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
       "fieldConfig": {
         "defaults": { "unit": "amp", "decimals": 3, "custom": { "lineWidth": 2 } },
         "overrides": [
@@ -112,7 +188,7 @@
     {
       "title": "Power",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
       "fieldConfig": {
         "defaults": { "unit": "watt", "decimals": 3, "custom": { "lineWidth": 2 } },
         "overrides": [
@@ -134,9 +210,9 @@
     {
       "title": "Charge",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
       "fieldConfig": {
-        "defaults": { "unit": "Ah", "decimals": 3, "custom": { "lineWidth": 2 } }
+        "defaults": { "unit": "Ah", "decimals": 3, "displayName": "Charge", "custom": { "lineWidth": 2 } }
       },
       "targets": [{
         "datasource": { "type": "influxdb" },
@@ -146,9 +222,9 @@
     {
       "title": "SOC",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
       "fieldConfig": {
-        "defaults": { "unit": "percent", "decimals": 1, "min": 0, "max": 100, "custom": { "lineWidth": 2 } }
+        "defaults": { "unit": "percent", "decimals": 1, "min": 0, "max": 100, "displayName": "SOC", "custom": { "lineWidth": 2 } }
       },
       "targets": [{
         "datasource": { "type": "influxdb" },
