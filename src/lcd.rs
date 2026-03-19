@@ -408,11 +408,11 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
                     let hist: heapless::Vec<(f32, f32, f32), 144> = sd
                         .history()
                         .iter()
-                        .map(|s| (s.voltage, s.current_1, s.current_2))
+                        .map(|s| (s.voltage, s.battery_current, s.ps_current))
                         .collect();
                     (
-                        sd.last_reading_1,
-                        sd.last_reading_2,
+                        sd.battery_reading,
+                        sd.ps_reading,
                         crate::uptime_s(),
                         hist,
                     )

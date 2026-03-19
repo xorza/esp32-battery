@@ -91,15 +91,15 @@ pub fn start_measurement_thread<P: Platform + Send + 'static>(
         .stack_size(4096)
         .spawn(move || {
             let i2c_cell = RefCell::new(i2c);
-            let mut ina1 = init_ina(&i2c_cell, 0x40);
-            let mut ina2 = init_ina(&i2c_cell, 0x41);
+            let mut battery_ina = init_ina(&i2c_cell, 0x40);
+            let mut ps_ina = init_ina(&i2c_cell, 0x41);
 
             let mut max_charge = f64::MIN;
             let mut min_charge = f64::MAX;
 
             loop {
-                let mut acc1 = ReadingAccum::default();
-                let mut acc2 = ReadingAccum::default();
+                let mut bat_acc = ReadingAccum::default();
+                let mut ps_acc = ReadingAccum::default();
                 let mut count: u32 = 0;
                 let mut read_total: u32 = 0;
                 let mut read_failures: u32 = 0;
@@ -108,26 +108,26 @@ pub fn start_measurement_thread<P: Platform + Send + 'static>(
                     thread::sleep(SAMPLE_INTERVAL);
 
                     // Both must succeed — if either fails, discard the pair and retry.
-                    let r1 = ina1.as_mut().map_or(Some(FAKE_READING), read_ina);
-                    let r2 = ina2.as_mut().map_or(Some(FAKE_READING), read_ina);
+                    let bat_r = battery_ina.as_mut().map_or(Some(FAKE_READING), read_ina);
+                    let ps_r = ps_ina.as_mut().map_or(Some(FAKE_READING), read_ina);
                     read_total += 1;
 
-                    if let (Some(r1), Some(r2)) = (r1, r2) {
-                        acc1.add(&r1);
-                        acc2.add(&r2);
+                    if let (Some(bat_r), Some(ps_r)) = (bat_r, ps_r) {
+                        bat_acc.add(&bat_r);
+                        ps_acc.add(&ps_r);
                         count += 1;
                     } else {
                         read_failures += 1;
                     }
                 }
 
-                max_charge = max_charge.max(acc1.last_charge);
-                min_charge = min_charge.min(acc1.last_charge);
+                max_charge = max_charge.max(bat_acc.last_charge);
+                min_charge = min_charge.min(bat_acc.last_charge);
                 let max_charge = max_charge - min_charge;
 
                 sensor_data.lock().unwrap().update(
-                    acc1.average(SAMPLES_PER_UPDATE),
-                    acc2.average(SAMPLES_PER_UPDATE),
+                    bat_acc.average(SAMPLES_PER_UPDATE),
+                    ps_acc.average(SAMPLES_PER_UPDATE),
                     read_total,
                     read_failures,
                     max_charge,

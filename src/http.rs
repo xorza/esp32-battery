@@ -125,7 +125,7 @@ fn write_history(json: &mut impl FmtWrite, key: &str, points: &[Sample]) {
         write!(
             json,
             "[{},{:.3},{:.3},{:.3},{:.2}]",
-            p.time_s, p.voltage, p.current_1, p.current_2, p.power_online
+            p.time_s, p.voltage, p.battery_current, p.ps_current, p.power_online
         )
         .unwrap();
     }
@@ -173,12 +173,12 @@ pub fn start_main<P: Platform + Send + 'static>(
             json.clear();
 
             let store = sensor_data.lock().unwrap();
-            let s1 = store.last_reading_1;
-            let s2 = store.last_reading_2;
+            let bat = store.battery_reading;
+            let ps = store.ps_reading;
             let history = store.history();
             let interval = store.interval();
 
-            let voltage = (s1.voltage + s2.voltage) / 2.0;
+            let voltage = (bat.voltage + ps.voltage) / 2.0;
             let max_charge = history
                 .iter()
                 .map(|s| s.max_charge)
@@ -192,26 +192,26 @@ pub fn start_main<P: Platform + Send + 'static>(
                 interval,
                 store.read_failures,
                 store.read_total,
-                s1.charge,
+                bat.charge,
                 max_charge,
                 store.power_online,
             )
             .unwrap();
 
-            // s1, s2
+            // battery and power supply sensors
             write!(
                 json,
-                r#","s1":{{"soc":{:.1},"current":{:.3},"power":{:.3}}}"#,
-                battery::ocv_soc(s1.voltage),
-                s1.current,
-                s1.power,
+                r#","battery":{{"soc":{:.1},"current":{:.3},"power":{:.3}}}"#,
+                battery::ocv_soc(bat.voltage),
+                bat.current,
+                bat.power,
             )
             .unwrap();
             write!(
                 json,
-                r#","s2":{{"current":{:.3},"power":{:.3}}}"#,
-                s2.current,
-                s2.power,
+                r#","ps":{{"current":{:.3},"power":{:.3}}}"#,
+                ps.current,
+                ps.power,
             )
             .unwrap();
 

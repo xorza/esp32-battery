@@ -176,10 +176,10 @@
                     .then((d) => {
                         // Battery hero
                         let status, color;
-                        if (d.s1.current < -0.01) {
+                        if (d.battery.current < -0.01) {
                             status = "Charging";
                             color = "#4ade80";
-                        } else if (d.s1.current > 0.01) {
+                        } else if (d.battery.current > 0.01) {
                             status = "Discharging";
                             color = "#f87171";
                         } else {
@@ -189,27 +189,27 @@
                         $("s1_status").textContent = status;
                         $("s1_status").style.color = color;
                         $("s1_status_dot").style.background = color;
-                        $("s1_soc").textContent = d.s1.soc.toFixed(1) + "%";
-                        $("s1_bar").style.width = d.s1.soc + "%";
+                        $("s1_soc").textContent = d.battery.soc.toFixed(1) + "%";
+                        $("s1_bar").style.width = d.battery.soc + "%";
                         $("s1_bar").style.backgroundSize =
-                            (d.s1.soc > 0 ? 10000 / d.s1.soc : 0) + "% 100%";
+                            (d.battery.soc > 0 ? 10000 / d.battery.soc : 0) + "% 100%";
 
                         $("voltage").textContent = d.voltage.toFixed(3) + " V";
 
                         // Battery metrics
                         $("s1_current").textContent = Math.abs(
-                            d.s1.current,
+                            d.battery.current,
                         ).toFixed(3);
-                        $("s1_power").textContent = d.s1.power.toFixed(3);
+                        $("s1_power").textContent = d.battery.power.toFixed(3);
                         $("s1_max_charge").textContent = Math.abs(
                             d.max_charge,
                         ).toFixed(3);
 
                         // Power supply metrics
                         $("s2_current").textContent = Math.abs(
-                            d.s2.current,
+                            d.ps.current,
                         ).toFixed(3);
-                        $("s2_power").textContent = d.s2.power.toFixed(3);
+                        $("s2_power").textContent = d.ps.power.toFixed(3);
 
                         histInterval = d.interval;
                         if (d.history) {

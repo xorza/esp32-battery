@@ -38,8 +38,8 @@ pub struct Ina228Reading {
 pub struct Sample {
     pub time_s: u32,
     pub voltage: f32,
-    pub current_1: f32,
-    pub current_2: f32,
+    pub battery_current: f32,
+    pub ps_current: f32,
     /// 1.0 when power supply is online, 0.0 when offline. Averaged during compaction.
     pub power_online: f32,
     pub max_charge: f64,
@@ -48,8 +48,8 @@ pub struct Sample {
 #[derive(Default)]
 struct SampleAccum {
     voltage: f32,
-    current_1: f32,
-    current_2: f32,
+    battery_current: f32,
+    ps_current: f32,
     power_online: f32,
     max_charge: f64,
 }
@@ -57,8 +57,8 @@ struct SampleAccum {
 impl SampleAccum {
     fn add(&mut self, s: &Sample) {
         self.voltage += s.voltage;
-        self.current_1 += s.current_1;
-        self.current_2 += s.current_2;
+        self.battery_current += s.battery_current;
+        self.ps_current += s.ps_current;
         self.power_online += s.power_online;
         self.max_charge = self.max_charge.max(s.max_charge);
     }
@@ -69,8 +69,8 @@ impl SampleAccum {
         Sample {
             time_s,
             voltage: self.voltage / n,
-            current_1: self.current_1 / n,
-            current_2: self.current_2 / n,
+            battery_current: self.battery_current / n,
+            ps_current: self.ps_current / n,
             power_online: self.power_online / n,
             max_charge: self.max_charge,
         }
@@ -83,8 +83,8 @@ impl SampleAccum {
 /// (halving the count) and the sampling interval doubles. This gives
 /// exponentially growing time coverage in fixed memory (~4 KB).
 pub struct SensorData<P: Platform> {
-    pub last_reading_1: Ina228Reading,
-    pub last_reading_2: Ina228Reading,
+    pub battery_reading: Ina228Reading,
+    pub ps_reading: Ina228Reading,
     pub read_total: u32,
     pub read_failures: u32,
     pub power_online: f32,
@@ -120,8 +120,8 @@ impl BufWriter<'_> {
     fn sample(&mut self, s: &Sample) {
         self.u32(s.time_s);
         self.f32(s.voltage);
-        self.f32(s.current_1);
-        self.f32(s.current_2);
+        self.f32(s.battery_current);
+        self.f32(s.ps_current);
         self.f32(s.power_online);
         self.f64(s.max_charge);
     }
@@ -152,8 +152,8 @@ impl BufReader<'_> {
         Sample {
             time_s: self.u32(),
             voltage: self.f32(),
-            current_1: self.f32(),
-            current_2: self.f32(),
+            battery_current: self.f32(),
+            ps_current: self.f32(),
             power_online: self.f32(),
             max_charge: self.f64(),
         }
@@ -163,8 +163,8 @@ impl BufReader<'_> {
 impl<P: Platform> SensorData<P> {
     pub fn new(platform: P) -> Self {
         Self {
-            last_reading_1: Ina228Reading::default(),
-            last_reading_2: Ina228Reading::default(),
+            battery_reading: Ina228Reading::default(),
+            ps_reading: Ina228Reading::default(),
             read_total: 0,
             read_failures: 0,
             power_online: 0.0,
@@ -215,14 +215,14 @@ impl<P: Platform> SensorData<P> {
         let sample = Sample {
             time_s,
             voltage: (s1.voltage + s2.voltage) / 2.0,
-            current_1: s1.current,
-            current_2: s2.current,
+            battery_current: s1.current,
+            ps_current: s2.current,
             power_online,
             max_charge,
         };
 
-        self.last_reading_1 = s1;
-        self.last_reading_2 = s2;
+        self.battery_reading = s1;
+        self.ps_reading = s2;
         self.power_online = power_online;
 
         self.acc.add(&sample);
@@ -266,8 +266,8 @@ impl<P: Platform> SensorData<P> {
             self.history[i] = Sample {
                 time_s: b.time_s,
                 voltage: (a.voltage + b.voltage) / 2.0,
-                current_1: (a.current_1 + b.current_1) / 2.0,
-                current_2: (a.current_2 + b.current_2) / 2.0,
+                battery_current: (a.battery_current + b.battery_current) / 2.0,
+                ps_current: (a.ps_current + b.ps_current) / 2.0,
                 power_online: (a.power_online + b.power_online) / 2.0,
                 max_charge: a.max_charge.max(b.max_charge),
             };
@@ -459,8 +459,8 @@ mod tests {
         assert_eq!(s.time_s, 100);
         // voltage = avg(13.0, 13.0) = 13.0
         assert!((s.voltage - 13.0).abs() < 0.001);
-        assert!((s.current_1 - 1.0).abs() < 0.001);
-        assert!((s.current_2 - 2.0).abs() < 0.001);
+        assert!((s.battery_current - 1.0).abs() < 0.001);
+        assert!((s.ps_current - 2.0).abs() < 0.001);
     }
 
     #[test]
@@ -476,8 +476,8 @@ mod tests {
         let (time, mut sd) = new_sd();
         time.set(10);
         update(&mut sd, reading(13.0, 1.5), reading(13.1, 2.5));
-        assert!((sd.last_reading_1.current - 1.5).abs() < 0.001);
-        assert!((sd.last_reading_2.current - 2.5).abs() < 0.001);
+        assert!((sd.battery_reading.current - 1.5).abs() < 0.001);
+        assert!((sd.ps_reading.current - 2.5).abs() < 0.001);
     }
 
     #[test]
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(h.len(), 10);
         for (i, s) in h.iter().enumerate() {
             assert_eq!(s.time_s, i as u32);
-            assert!((s.current_1 - i as f32).abs() < 0.001);
+            assert!((s.battery_current - i as f32).abs() < 0.001);
         }
     }
 
@@ -532,8 +532,8 @@ mod tests {
             0,
             0.0,
         );
-        assert!((sd.last_reading_1.charge - 1.234).abs() < 0.0001);
-        assert!((sd.last_reading_2.charge - 5.678).abs() < 0.0001);
+        assert!((sd.battery_reading.charge - 1.234).abs() < 0.0001);
+        assert!((sd.ps_reading.charge - 5.678).abs() < 0.0001);
     }
 
     #[test]
@@ -652,8 +652,8 @@ mod tests {
         // Each compacted pair averages: voltage=(12+14)/2=13, c1=(1+3)/2=2, c2=(2+4)/2=3
         for s in &sd.history[..HALF] {
             assert!((s.voltage - 13.0).abs() < 0.01);
-            assert!((s.current_1 - 2.0).abs() < 0.01);
-            assert!((s.current_2 - 3.0).abs() < 0.01);
+            assert!((s.battery_current - 2.0).abs() < 0.01);
+            assert!((s.ps_current - 3.0).abs() < 0.01);
         }
         // Compaction keeps the later timestamp of each pair.
         assert_eq!(sd.history[0].time_s, 10); // pair t=0,t=10 → keeps t=10
@@ -677,9 +677,9 @@ mod tests {
         time.set(t + 1);
         update(&mut sd, reading(13.0, 7.0), reading(13.0, 0.0));
         assert_eq!(sd.history.len(), HALF + 2);
-        // Averaged: current_1 = (5+7)/2 = 6
+        // Averaged: battery_current = (5+7)/2 = 6
         let last = sd.history.last().unwrap();
-        assert!((last.current_1 - 6.0).abs() < 0.01);
+        assert!((last.battery_current - 6.0).abs() < 0.01);
         assert_eq!(last.time_s, t + 1);
     }
 
@@ -864,8 +864,8 @@ mod tests {
         time2.set(5001);
         update(&mut sd2, reading(13.0, 3.0), reading(13.0, 4.0));
         assert_eq!(sd2.history.len(), base_len + 1);
-        // current_1 = (1+3)/2 = 2.0
-        assert!((sd2.history.last().unwrap().current_1 - 2.0).abs() < 0.01);
+        // battery_current = (1+3)/2 = 2.0
+        assert!((sd2.history.last().unwrap().battery_current - 2.0).abs() < 0.01);
     }
 
     #[test]
@@ -905,11 +905,11 @@ mod tests {
         assert_eq!(sd2.history.len(), 11);
         assert_eq!(sd2.interval, 1);
         assert_eq!(sd2.history[0].time_s, 1000);
-        assert!((sd2.history[0].current_1 - 1.0).abs() < 0.001);
-        // New sample: voltage=avg(14,14)=14, current_1=3
+        assert!((sd2.history[0].battery_current - 1.0).abs() < 0.001);
+        // New sample: voltage=avg(14,14)=14, battery_current=3
         assert_eq!(sd2.history[10].time_s, 1009);
         assert!((sd2.history[10].voltage - 14.0).abs() < 0.001);
-        assert!((sd2.history[10].current_1 - 3.0).abs() < 0.001);
+        assert!((sd2.history[10].battery_current - 3.0).abs() < 0.001);
         // Charge restored
         let max = sd2.history.iter().map(|s| s.max_charge).fold(0.0_f64, f64::max);
         assert!((max - 5.0).abs() < 1e-10);
@@ -1026,10 +1026,10 @@ mod tests {
         assert!(sd2.read(blob.len()));
         assert_eq!(sd2.history.len(), 103);
         assert!((sd2.history[100].voltage - 12.0).abs() < 0.001);
-        assert!((sd2.history[100].current_1 - 1.0).abs() < 0.001);
+        assert!((sd2.history[100].battery_current - 1.0).abs() < 0.001);
         assert!((sd2.history[101].voltage - 14.0).abs() < 0.001);
         assert_eq!(sd2.history[102].time_s, 1000 + SAVE_INTERVAL_S);
-        assert!((sd2.history[102].current_1 - 9.0).abs() < 0.001);
+        assert!((sd2.history[102].battery_current - 9.0).abs() < 0.001);
     }
 
     #[test]
@@ -1072,10 +1072,10 @@ mod tests {
         sd3.buf[..blob.len()].copy_from_slice(&blob);
         assert!(sd3.read(blob.len()));
         assert_eq!(sd3.history.len(), 102);
-        assert!((sd3.history[0].current_1 - 1.0).abs() < 0.001);
-        assert!((sd3.history[100].current_1 - 7.0).abs() < 0.001);
+        assert!((sd3.history[0].battery_current - 1.0).abs() < 0.001);
+        assert!((sd3.history[100].battery_current - 7.0).abs() < 0.001);
         assert_eq!(sd3.history[101].time_s, trigger_t);
-        assert!((sd3.history[101].current_1 - 9.0).abs() < 0.001);
+        assert!((sd3.history[101].battery_current - 9.0).abs() < 0.001);
     }
 
     // --- Read error tracking ---
@@ -1111,8 +1111,8 @@ mod tests {
                     .push(Sample {
                         time_s: start_t + i as u32,
                         voltage: 13.0,
-                        current_1: 1.0,
-                        current_2: 2.0,
+                        battery_current: 1.0,
+                        ps_current: 2.0,
                         power_online: 1.0,
                         max_charge: 0.0,
                     })
@@ -1140,7 +1140,7 @@ mod tests {
         assert_eq!(sd.history.len(), CAP);
         assert_eq!(sd.interval, MAX_INTERVAL);
         assert!(sd.history[0].time_s > oldest_before);
-        assert!((sd.history.last().unwrap().current_1 - 5.0).abs() < 0.01);
+        assert!((sd.history.last().unwrap().battery_current - 5.0).abs() < 0.01);
     }
 
     #[test]
