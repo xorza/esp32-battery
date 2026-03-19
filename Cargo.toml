@@ -1,0 +1,44 @@
+[package]
+name = "esp32-battery"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "esp32-battery"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[workspace]
+exclude = ["logic"]
+
+[features]
+default = ["lcd"]
+lcd = ["mipidsi", "embedded-graphics"]
+
+[dependencies]
+esp32-battery-logic = { path = "logic" }
+log = "*"
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git", branch = "master" }
+esp-idf-hal = "*"
+ina228 = "*"
+embedded-hal = "*"
+embedded-hal-bus = "*"
+heapless = "*"
+hmac = "*"
+sha2 = { version = "*", default-features = false }
+mipidsi = { version = "*", optional = true }
+embedded-graphics = { version = "*", optional = true }
+
+[build-dependencies]
+embuild = "*"
+flate2 = "*"
+
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mdns", version = "*" }

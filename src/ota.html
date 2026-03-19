@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>OTA Update</title>
+        <link rel="stylesheet" href="/style.css" />
+        <link rel="icon" href="/favicon.ico" type="image/x-icon" />
+    </head>
+    <body>
+        <div class="card">
+            <h1>OTA Update</h1>
+            <p class="muted">
+                Select a signed firmware binary (.bin) to upload.
+            </p>
+            <input type="file" id="file" accept=".bin" />
+            <button id="upload" onclick="doUpload()">Upload &amp; Flash</button>
+            <div class="bar-bg" id="bar-bg" style="display: none">
+                <div class="bar-fill" id="bar"></div>
+            </div>
+            <div class="msg" id="status"></div>
+            <p style="margin-top: 1.5em"><a href="/">&larr; Dashboard</a></p>
+        </div>
+
+        <script>
+            function doUpload() {
+                const file = document.getElementById("file").files[0];
+                if (!file) return;
+
+                const btn = document.getElementById("upload");
+                const status = document.getElementById("status");
+                const barBg = document.getElementById("bar-bg");
+                const bar = document.getElementById("bar");
+
+                btn.disabled = true;
+                status.className = "msg progress";
+                status.textContent = "Uploading...";
+                barBg.style.display = "block";
+                bar.style.width = "0%";
+
+                const xhr = new XMLHttpRequest();
+                xhr.open("POST", "/ota/upload");
+                xhr.setRequestHeader(
+                    "Content-Type",
+                    "application/octet-stream",
+                );
+
+                function showReboot() {
+                    status.className = "msg ok";
+                    status.textContent = "Rebooting with new firmware...";
+                    setTimeout(function () {
+                        window.location.href = "/";
+                    }, 5000);
+                }
+
+                function showError(msg) {
+                    status.className = "msg err";
+                    status.textContent = msg;
+                    btn.disabled = false;
+                }
+
+                xhr.upload.onprogress = function (e) {
+                    if (e.lengthComputable) {
+                        const pct = Math.round((e.loaded / e.total) * 100);
+                        bar.style.width = pct + "%";
+                        status.textContent = "Uploading... " + pct + "%";
+                    }
+                };
+
+                xhr.upload.onload = function () {
+                    status.textContent = "Verifying firmware...";
+                };
+
+                xhr.onload = function () {
+                    if (xhr.status === 200) {
+                        showReboot();
+                    } else {
+                        try {
+                            showError(
+                                "Error: " + JSON.parse(xhr.responseText).error,
+                            );
+                        } catch (e) {
+                            showError("Error: " + xhr.responseText);
+                        }
+                    }
+                };
+
+                xhr.onerror = function () {
+                    showError("Upload failed (connection error)");
+                };
+
+                xhr.ontimeout = function () {
+                    showError("Upload timed out");
+                };
+
+                xhr.send(file);
+            }
+        </script>
+    </body>
+</html>

@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>WiFi Setup</title>
+        <link rel="stylesheet" href="/style.css" />
+        <link rel="icon" href="/favicon.ico" type="image/x-icon" />
+    </head>
+    <body>
+        <div class="card">
+            <h1>WiFi Setup</h1>
+            <form id="f">
+                <label for="s">SSID</label>
+                <div class="ssid-row">
+                    <select id="s" name="ssid" required>
+                        <option value="">Scanning...</option>
+                    </select>
+                    <button
+                        type="button"
+                        id="refresh"
+                        class="refresh-btn"
+                        onclick="scan()"
+                        title="Refresh"
+                    >
+                        <span class="icon">&#x21bb;</span>
+                    </button>
+                </div>
+                <label for="p">Password</label>
+                <input
+                    id="p"
+                    name="pass"
+                    type="password"
+                    minlength="8"
+                    maxlength="63"
+                    placeholder="Empty for open network"
+                />
+                <button type="submit">Connect</button>
+            </form>
+            <div class="msg" id="msg"></div>
+        </div>
+        <script>
+            var sel = document.getElementById("s"),
+                btn = document.getElementById("refresh");
+
+            function scanDone() {
+                btn.disabled = false;
+                btn.classList.remove("spinning");
+            }
+
+            function scan() {
+                btn.disabled = true;
+                btn.classList.add("spinning");
+                sel.innerHTML = '<option value="">Scanning...</option>';
+                var x = new XMLHttpRequest();
+                x.timeout = 15000;
+                x.open("GET", "/scan");
+                x.onload = function () {
+                    scanDone();
+                    if (x.status !== 200) {
+                        sel.innerHTML = '<option value="">Scan failed</option>';
+                        return;
+                    }
+                    var aps = JSON.parse(x.responseText);
+                    if (!aps.length) {
+                        sel.innerHTML = '<option value="">None found</option>';
+                        return;
+                    }
+                    sel.innerHTML = "";
+                    for (var i = 0; i < aps.length; i++) {
+                        var o = document.createElement("option");
+                        o.value = aps[i][0];
+                        o.textContent = aps[i][0] + " (" + aps[i][1] + " dBm)";
+                        sel.appendChild(o);
+                    }
+                };
+                x.onerror = x.ontimeout = function () {
+                    scanDone();
+                    sel.innerHTML = '<option value="">Scan failed</option>';
+                };
+                x.send();
+            }
+            scan();
+
+            document.getElementById("f").onsubmit = function (e) {
+                e.preventDefault();
+                var m = document.getElementById("msg");
+                var p = document.getElementById("p").value;
+                if (p.length > 0 && (p.length < 8 || p.length > 63)) {
+                    m.className = "msg err";
+                    m.textContent = "Password must be 8-63 characters";
+                    return;
+                }
+                var b = this.querySelector("button[type=submit]");
+                b.disabled = true;
+                var f = new FormData(this);
+                var x = new XMLHttpRequest();
+                x.open("POST", "/save");
+                x.setRequestHeader(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded",
+                );
+                x.onload = function () {
+                    var m = document.getElementById("msg");
+                    if (x.status === 200) {
+                        m.className = "msg ok";
+                        m.textContent = "Saved! Rebooting...";
+                    } else {
+                        m.className = "msg err";
+                        m.textContent = "Error: " + x.responseText;
+                        b.disabled = false;
+                    }
+                };
+                x.onerror = function () {
+                    document.getElementById("msg").className = "msg err";
+                    document.getElementById("msg").textContent =
+                        "Connection failed";
+                    b.disabled = false;
+                };
+                x.send(
+                    "ssid=" +
+                        encodeURIComponent(f.get("ssid")) +
+                        "&pass=" +
+                        encodeURIComponent(f.get("pass")),
+                );
+            };
+        </script>
+    </body>
+</html>

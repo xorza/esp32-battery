@@ -1,0 +1,402 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Battery Monitor</title>
+        <link rel="stylesheet" href="/style.css" />
+        <link rel="icon" href="/favicon.ico" type="image/x-icon" />
+    </head>
+    <body>
+        <div class="card hero">
+            <div class="hero-status">
+                <span class="status-dot" id="s1_status_dot"></span>
+                <span id="s1_status">--</span>
+            </div>
+            <div class="hero-soc" id="s1_soc">--%</div>
+            <div class="hero-voltage" id="voltage">-- V</div>
+            <div class="bar-bg">
+                <div
+                    class="bar-fill gradient"
+                    id="s1_bar"
+                    style="width: 0%"
+                ></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">Battery:</div>
+            <div class="metrics">
+                <div class="metric">
+                    <div class="metric-value a" id="s1_current">--</div>
+                    <div class="metric-label">Current (A)</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value a" id="s1_power">--</div>
+                    <div class="metric-label">Power (W)</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value charge-pos" id="s1_max_charge">
+                        --
+                    </div>
+                    <div class="metric-label">Charge (Ah)</div>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">Power supply:</div>
+            <div class="metrics">
+                <div class="metric">
+                    <div class="metric-value a2" id="s2_current">--</div>
+                    <div class="metric-label">Current (A)</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value a2" id="s2_power">--</div>
+                    <div class="metric-label">Power (W)</div>
+                </div>
+                <div class="metric">
+                    <div
+                        class="metric-value"
+                        style="color: #f87171"
+                        id="s2_offline"
+                    >
+                        --
+                    </div>
+                    <div class="metric-label">Offline</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card chart-card">
+            <div class="chart-title">History</div>
+            <canvas id="chart" height="200"></canvas>
+            <table class="stats-table">
+                <tr class="stats-header">
+                    <td></td>
+                    <td>min</td>
+                    <td>avg</td>
+                    <td>max</td>
+                </tr>
+                <tr>
+                    <td>
+                        <span
+                            class="legend-dot"
+                            style="background: #39ff14"
+                        ></span
+                        >Voltage
+                    </td>
+                    <td id="st_v_min">--</td>
+                    <td id="st_v_avg">--</td>
+                    <td id="st_v_max">--</td>
+                </tr>
+                <tr>
+                    <td>
+                        <span
+                            class="legend-dot"
+                            style="background: #00e5ff"
+                        ></span
+                        >Battery current
+                    </td>
+                    <td id="st_c1_min">--</td>
+                    <td id="st_c1_avg">--</td>
+                    <td id="st_c1_max">--</td>
+                </tr>
+                <tr>
+                    <td>
+                        <span
+                            class="legend-dot"
+                            style="background: #ff9800"
+                        ></span
+                        >Power supply current
+                    </td>
+                    <td id="st_c2_min">--</td>
+                    <td id="st_c2_avg">--</td>
+                    <td id="st_c2_max">--</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="footer">
+            <span id="uptime">--</span>
+            <span id="read_err" style="color: #f87171; display: none"></span>
+            <span class="wifi-icon" id="wifi_icon">
+                <span class="wifi-bar"></span>
+                <span class="wifi-bar"></span>
+                <span class="wifi-bar"></span>
+                <span class="wifi-bar"></span>
+            </span>
+        </div>
+
+        <script>
+            const $ = (id) => document.getElementById(id);
+
+            function formatUptime(s) {
+                const d = Math.floor(s / 86400);
+                const h = Math.floor((s % 86400) / 3600);
+                const m = Math.floor((s % 3600) / 60);
+                if (d > 0) return d + "d " + h + "h";
+                if (h > 0) return h + "h " + m + "m";
+                return m + "m " + (s % 60) + "s";
+            }
+
+            function updateStats(h) {
+                // h entries: [time, voltage, c1, c2, power_online]
+                function colStats(col) {
+                    let min = Infinity, max = -Infinity, sum = 0;
+                    for (const row of h) {
+                        const v = row[col];
+                        if (v < min) min = v;
+                        if (v > max) max = v;
+                        sum += v;
+                    }
+                    return [min, max, sum / h.length];
+                }
+                const v = colStats(1), c1 = colStats(2), c2 = colStats(3);
+                $("st_v_min").textContent = v[0].toFixed(3);
+                $("st_v_avg").textContent = v[2].toFixed(3);
+                $("st_v_max").textContent = v[1].toFixed(3);
+                $("st_c1_min").textContent = c1[0].toFixed(3);
+                $("st_c1_avg").textContent = c1[2].toFixed(3);
+                $("st_c1_max").textContent = c1[1].toFixed(3);
+                $("st_c2_min").textContent = c2[0].toFixed(3);
+                $("st_c2_avg").textContent = c2[2].toFixed(3);
+                $("st_c2_max").textContent = c2[1].toFixed(3);
+            }
+
+            let hist = [];
+            let histInterval = 0;
+
+            function update() {
+                let url = "/api";
+                if (hist.length > 0 && histInterval > 0) {
+                    const since = hist[hist.length - 1][0];
+                    url += "?since=" + since + "&interval=" + histInterval;
+                }
+                fetch(url)
+                    .then((r) => r.json())
+                    .then((d) => {
+                        // Battery hero
+                        let status, color;
+                        if (d.s1.current < -0.01) {
+                            status = "Charging";
+                            color = "#4ade80";
+                        } else if (d.s1.current > 0.01) {
+                            status = "Discharging";
+                            color = "#f87171";
+                        } else {
+                            status = "Idle";
+                            color = "#555";
+                        }
+                        $("s1_status").textContent = status;
+                        $("s1_status").style.color = color;
+                        $("s1_status_dot").style.background = color;
+                        $("s1_soc").textContent = d.s1.soc.toFixed(1) + "%";
+                        $("s1_bar").style.width = d.s1.soc + "%";
+                        $("s1_bar").style.backgroundSize =
+                            (d.s1.soc > 0 ? 10000 / d.s1.soc : 0) + "% 100%";
+
+                        $("voltage").textContent = d.voltage.toFixed(3) + " V";
+
+                        // Battery metrics
+                        $("s1_current").textContent = Math.abs(
+                            d.s1.current,
+                        ).toFixed(3);
+                        $("s1_power").textContent = d.s1.power.toFixed(3);
+                        $("s1_max_charge").textContent = Math.abs(
+                            d.max_charge,
+                        ).toFixed(3);
+
+                        // Power supply metrics
+                        $("s2_current").textContent = Math.abs(
+                            d.s2.current,
+                        ).toFixed(3);
+                        $("s2_power").textContent = d.s2.power.toFixed(3);
+
+                        histInterval = d.interval;
+                        if (d.history) {
+                            hist = d.history;
+                        } else if (
+                            d.history_append &&
+                            d.history_append.length > 0
+                        ) {
+                            hist = hist.concat(d.history_append);
+                        }
+                        if (hist.length > 0) {
+                            updateStats(hist);
+                            drawChart(hist);
+                        }
+
+                        // Footer
+                        if (d.read_err && d.read_err[0] > 0) {
+                            const pct = (
+                                (d.read_err[0] / d.read_err[1]) *
+                                100
+                            ).toFixed(1);
+                            $("read_err").textContent = "I2C err " + pct + "%";
+                            $("read_err").style.display = "";
+                        } else {
+                            $("read_err").style.display = "none";
+                        }
+                        $("uptime").textContent = formatUptime(d.uptime);
+                        const bars = $("wifi_icon").children;
+                        const level =
+                            d.rssi >= -50
+                                ? 4
+                                : d.rssi >= -60
+                                  ? 3
+                                  : d.rssi >= -70
+                                    ? 2
+                                    : d.rssi
+                                      ? 1
+                                      : 0;
+                        for (let i = 0; i < bars.length; i++)
+                            bars[i].classList.toggle("active", i < level);
+                    })
+                    .catch(() => {})
+                    .finally(() => {
+                        setTimeout(update, 1000);
+                    });
+            }
+
+            function drawChart(h) {
+                const canvas = $("chart");
+                const dpr = window.devicePixelRatio || 1;
+                const rect = canvas.getBoundingClientRect();
+                canvas.width = rect.width * dpr;
+                canvas.height = rect.height * dpr;
+                const ctx = canvas.getContext("2d");
+                ctx.scale(dpr, dpr);
+                const W = rect.width,
+                    H = rect.height;
+
+                ctx.clearRect(0, 0, W, H);
+
+                if (h.length < 2) return;
+
+                const pad = { l: 45, r: 45, t: 10, b: 25 };
+                const cW = W - pad.l - pad.r;
+                const cH = H - pad.t - pad.b;
+
+                // [time, voltage, c1, c2, power_online]
+                const times = h.map((d) => d[0]);
+                const voltages = h.map((d) => d[1]);
+                const currents1 = h.map((d) => d[2]);
+                const currents2 = h.map((d) => d[3]);
+                const powerOnline = h.map((d) => d[4]);
+
+                // Offline percentage
+                let offlineSum = 0;
+                for (const v of powerOnline) offlineSum += 1 - v;
+                $("s2_offline").textContent =
+                    ((offlineSum / h.length) * 100).toFixed(1) + "%";
+
+                const t0 = times[0],
+                    t1 = times[times.length - 1];
+                const tRange = t1 - t0 || 1;
+
+                function axisRange(arrs, opts) {
+                    let min = Infinity,
+                        max = -Infinity;
+                    for (const arr of arrs)
+                        for (const v of arr) {
+                            if (v < min) min = v;
+                            if (v > max) max = v;
+                        }
+                    if (opts?.zero) {
+                        min = Math.min(min, 0);
+                        max = Math.max(max, 0);
+                    }
+                    const m =
+                        Math.max(opts?.minMargin || 0, (max - min) * 0.1) ||
+                        0.1;
+                    return [min - m, max + m];
+                }
+
+                const [vMin, vMax] = axisRange([voltages], { minMargin: 0.2 });
+                const [cMin, cMax] = axisRange([currents1, currents2], {
+                    zero: true,
+                });
+
+                // Draw red background for power-offline spans (alpha scales with offline fraction)
+                for (let i = 0; i < powerOnline.length; i++) {
+                    if (powerOnline[i] < 0.99) {
+                        const alpha = 0.35 * (1 - powerOnline[i]);
+                        ctx.fillStyle = "rgba(200, 30, 30, " + alpha + ")";
+                        const x0 =
+                            i > 0
+                                ? pad.l +
+                                  (((times[i - 1] + times[i]) / 2 - t0) /
+                                      tRange) *
+                                      cW
+                                : pad.l;
+                        const x1 =
+                            i < powerOnline.length - 1
+                                ? pad.l +
+                                  (((times[i] + times[i + 1]) / 2 - t0) /
+                                      tRange) *
+                                      cW
+                                : pad.l + cW;
+                        ctx.fillRect(x0, pad.t, x1 - x0, cH);
+                    }
+                }
+
+                ctx.strokeStyle = "#1a1a1a";
+                ctx.lineWidth = 1;
+                for (let i = 0; i <= 4; i++) {
+                    const y = pad.t + (cH * i) / 4;
+                    ctx.beginPath();
+                    ctx.moveTo(pad.l, y);
+                    ctx.lineTo(pad.l + cW, y);
+                    ctx.stroke();
+                }
+
+                function drawLine(arr, yMin, yMax, color) {
+                    const yRange = yMax - yMin || 1;
+                    ctx.beginPath();
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 1.5;
+                    for (let i = 0; i < arr.length; i++) {
+                        const x = pad.l + ((times[i] - t0) / tRange) * cW;
+                        const y = pad.t + cH - ((arr[i] - yMin) / yRange) * cH;
+                        if (i === 0) ctx.moveTo(x, y);
+                        else ctx.lineTo(x, y);
+                    }
+                    ctx.stroke();
+                }
+
+                function drawAxisLabels(yMin, yMax, color, side, unit) {
+                    ctx.fillStyle = color;
+                    ctx.font = "11px sans-serif";
+                    ctx.textAlign = side === "left" ? "right" : "left";
+                    const x = side === "left" ? pad.l - 5 : W - pad.r + 5;
+                    ctx.fillText(yMax.toFixed(1) + unit, x, pad.t + 10);
+                    ctx.fillText(yMin.toFixed(1) + unit, x, pad.t + cH);
+                }
+
+                drawLine(voltages, vMin, vMax, "#39ff14");
+                drawAxisLabels(vMin, vMax, "#39ff14", "left", "V");
+
+                drawLine(currents1, cMin, cMax, "#00e5ff");
+                drawLine(currents2, cMin, cMax, "#ff9800");
+                drawAxisLabels(cMin, cMax, "#00e5ff", "right", "A");
+
+                ctx.fillStyle = "#555";
+                ctx.font = "11px sans-serif";
+                ctx.textAlign = "center";
+                let timeLabel;
+                if (tRange >= 86400) {
+                    timeLabel = "-" + (tRange / 86400).toFixed(1) + "d";
+                } else if (tRange >= 3600) {
+                    timeLabel = "-" + (tRange / 3600).toFixed(1) + "h";
+                } else if (tRange >= 60) {
+                    timeLabel = "-" + Math.round(tRange / 60) + "m";
+                } else {
+                    timeLabel = "-" + Math.round(tRange) + "s";
+                }
+                ctx.fillText(timeLabel, pad.l, H - 5);
+                ctx.fillText("now", W - pad.r, H - 5);
+            }
+
+            update();
+        </script>
+    </body>
+</html>

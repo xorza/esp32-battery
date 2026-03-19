@@ -1,0 +1,6 @@
+**/target
+**/.embuild
+**/.env
+/certs
+
+ota_key.bin
