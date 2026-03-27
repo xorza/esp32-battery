@@ -62,7 +62,6 @@ fn start_sntp() -> esp_idf_svc::sntp::EspSntp<'static> {
     .unwrap()
 }
 
-
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -84,8 +83,8 @@ fn main() {
 
     let i2c = I2cDriver::new(
         peripherals.i2c0,
-        peripherals.pins.gpio8,
-        peripherals.pins.gpio9,
+        peripherals.pins.gpio20,
+        peripherals.pins.gpio23,
         &I2cConfig::new().baudrate(400.kHz().into()),
     )
     .unwrap();
