@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp_idf_hal::i2c::{I2cMasterBus, config::MasterBusConfig};
+use esp_idf_hal::i2c::{I2cBusDriver, config::BusConfig};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -80,12 +80,12 @@ fn main() {
         nvs_partition,
     )));
 
-    let i2c_bus: &'static I2cMasterBus = Box::leak(Box::new(
-        I2cMasterBus::new(
+    let i2c_bus: &'static I2cBusDriver = Box::leak(Box::new(
+        I2cBusDriver::new(
             peripherals.i2c0,
             peripherals.pins.gpio20,
             peripherals.pins.gpio23,
-            &MasterBusConfig::new(),
+            &BusConfig::new(),
         )
         .unwrap(),
     ));

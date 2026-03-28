@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp_idf_hal::i2c::{I2cMasterBus, I2cMasterDevice, config::MasterDeviceConfig};
+use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::DeviceConfig};
 
 const I2C_SPEED_HZ: u32 = 400_000;
 
@@ -55,10 +55,9 @@ fn retry<T, E>(mut f: impl FnMut() -> Result<T, E>) -> Option<T> {
     None
 }
 
-fn init_ina(
-    dev: I2cMasterDevice<'static>,
-    addr: u8,
-) -> Option<ina228::Ina228<I2cMasterDevice<'static>>> {
+type I2cDev = I2cDriver<'static, &'static I2cBusDriver<'static>>;
+
+fn init_ina(dev: I2cDev, addr: u8) -> Option<ina228::Ina228<I2cDev>> {
     let mut ina = ina228::Ina228::new(dev, addr);
     if ina.reset().is_ok() && ina.calibrate(MAX_CURRENT_A, SHUNT_RESISTANCE_OHM).is_ok() {
         Some(ina)
@@ -68,7 +67,7 @@ fn init_ina(
     }
 }
 
-fn read_ina(ina: &mut ina228::Ina228<I2cMasterDevice<'static>>) -> Option<Ina228Reading> {
+fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Option<Ina228Reading> {
     let voltage = retry(|| ina.bus_voltage())?;
     let current = retry(|| ina.current())?;
     let power = retry(|| ina.power())?;
@@ -82,15 +81,15 @@ fn read_ina(ina: &mut ina228::Ina228<I2cMasterDevice<'static>>) -> Option<Ina228
 }
 
 pub fn start_measurement_thread<P: Platform + Send + 'static>(
-    i2c_bus: &'static I2cMasterBus<'static>,
+    i2c_bus: &'static I2cBusDriver<'static>,
     sensor_data: Arc<Mutex<SensorData<P>>>,
 ) {
     thread::Builder::new()
         .stack_size(4096)
         .spawn(move || {
-            let dev_config = MasterDeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
-            let battery_dev = I2cMasterDevice::new(i2c_bus, 0x40, &dev_config).unwrap();
-            let ps_dev = I2cMasterDevice::new(i2c_bus, 0x41, &dev_config).unwrap();
+            let dev_config = DeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
+            let battery_dev = I2cDriver::new(i2c_bus, 0x40, &dev_config).unwrap();
+            let ps_dev = I2cDriver::new(i2c_bus, 0x41, &dev_config).unwrap();
 
             let mut battery_ina = init_ina(battery_dev, 0x40);
             let mut ps_ina = init_ina(ps_dev, 0x41);
