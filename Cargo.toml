@@ -25,13 +25,14 @@ lcd = ["mipidsi", "embedded-graphics"]
 esp32-battery-logic = { path = "logic" }
 log = "*"
 esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git", branch = "master" }
+# esp-idf-svc = "*"
 esp-idf-hal = "*"
 ina228 = "*"
 embedded-hal = "*"
 embedded-hal-bus = "*"
 heapless = "*"
 hmac = "*"
-sha2 = { version = "*", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 mipidsi = { version = "*", optional = true }
 embedded-graphics = { version = "*", optional = true }
 
