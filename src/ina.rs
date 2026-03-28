@@ -1,10 +1,10 @@
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use embedded_hal_bus::i2c::RefCellDevice;
-use esp_idf_hal::i2c::I2cDriver;
+use esp_idf_hal::i2c::{I2cMasterBus, I2cMasterDevice, config::MasterDeviceConfig};
+
+const I2C_SPEED_HZ: u32 = 400_000;
 
 use esp32_battery_logic::data::{Ina228Reading, Platform, SensorData};
 
@@ -55,11 +55,11 @@ fn retry<T, E>(mut f: impl FnMut() -> Result<T, E>) -> Option<T> {
     None
 }
 
-fn init_ina<'a>(
-    i2c_ref: &'a RefCell<I2cDriver<'static>>,
+fn init_ina(
+    dev: I2cMasterDevice<'static>,
     addr: u8,
-) -> Option<ina228::Ina228<RefCellDevice<'a, I2cDriver<'static>>>> {
-    let mut ina = ina228::Ina228::new(RefCellDevice::new(i2c_ref), addr);
+) -> Option<ina228::Ina228<I2cMasterDevice<'static>>> {
+    let mut ina = ina228::Ina228::new(dev, addr);
     if ina.reset().is_ok() && ina.calibrate(MAX_CURRENT_A, SHUNT_RESISTANCE_OHM).is_ok() {
         Some(ina)
     } else {
@@ -68,9 +68,7 @@ fn init_ina<'a>(
     }
 }
 
-fn read_ina(
-    ina: &mut ina228::Ina228<RefCellDevice<'_, I2cDriver<'static>>>,
-) -> Option<Ina228Reading> {
+fn read_ina(ina: &mut ina228::Ina228<I2cMasterDevice<'static>>) -> Option<Ina228Reading> {
     let voltage = retry(|| ina.bus_voltage())?;
     let current = retry(|| ina.current())?;
     let power = retry(|| ina.power())?;
@@ -84,15 +82,18 @@ fn read_ina(
 }
 
 pub fn start_measurement_thread<P: Platform + Send + 'static>(
-    i2c: I2cDriver<'static>,
+    i2c_bus: &'static I2cMasterBus<'static>,
     sensor_data: Arc<Mutex<SensorData<P>>>,
 ) {
     thread::Builder::new()
         .stack_size(4096)
         .spawn(move || {
-            let i2c_cell = RefCell::new(i2c);
-            let mut battery_ina = init_ina(&i2c_cell, 0x40);
-            let mut ps_ina = init_ina(&i2c_cell, 0x41);
+            let dev_config = MasterDeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
+            let battery_dev = I2cMasterDevice::new(i2c_bus, 0x40, &dev_config).unwrap();
+            let ps_dev = I2cMasterDevice::new(i2c_bus, 0x41, &dev_config).unwrap();
+
+            let mut battery_ina = init_ina(battery_dev, 0x40);
+            let mut ps_ina = init_ina(ps_dev, 0x41);
 
             let mut max_charge = f64::MIN;
             let mut min_charge = f64::MAX;

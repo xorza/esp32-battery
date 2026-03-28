@@ -493,16 +493,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "embedded-hal-bus"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "513e0b3a8fb7d3013a8ae17a834283f170deaf7d0eeab0a7c1a36ad4dd356d22"
-dependencies = [
- "critical-section",
- "embedded-hal 1.0.0",
-]
-
-[[package]]
 name = "embedded-hal-nb"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -632,8 +622,7 @@ dependencies = [
 [[package]]
 name = "esp-idf-hal"
 version = "0.46.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2585c80f488be431ad14e199883a05ff31576adaa23014befa0f040fd91490b8"
+source = "git+https://github.com/xorza/esp-idf-hal.git?branch=feat%2Fi2c-master-driver#78ac9a1190b8c7595260a8395925281f2e1295e2"
 dependencies = [
  "atomic-waker",
  "embassy-sync",
@@ -696,7 +685,6 @@ version = "0.1.0"
 dependencies = [
  "embedded-graphics",
  "embedded-hal 1.0.0",
- "embedded-hal-bus",
  "embuild",
  "esp-idf-hal",
  "esp-idf-svc",

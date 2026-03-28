@@ -13,9 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
+use esp_idf_hal::i2c::{I2cMasterBus, config::MasterBusConfig};
 use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_hal::units::FromValueType;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
@@ -81,17 +80,19 @@ fn main() {
         nvs_partition,
     )));
 
-    let i2c = I2cDriver::new(
-        peripherals.i2c0,
-        peripherals.pins.gpio20,
-        peripherals.pins.gpio23,
-        &I2cConfig::new().baudrate(400.kHz().into()),
-    )
-    .unwrap();
+    let i2c_bus: &'static I2cMasterBus = Box::leak(Box::new(
+        I2cMasterBus::new(
+            peripherals.i2c0,
+            peripherals.pins.gpio20,
+            peripherals.pins.gpio23,
+            &MasterBusConfig::new(),
+        )
+        .unwrap(),
+    ));
     let sensor_data = Arc::new(Mutex::new(esp32_battery_logic::data::SensorData::new(
         esp_platform,
     )));
-    ina::start_measurement_thread(i2c, sensor_data.clone());
+    ina::start_measurement_thread(i2c_bus, sensor_data.clone());
 
     #[cfg(feature = "lcd")]
     lcd::start_lcd_thread(
