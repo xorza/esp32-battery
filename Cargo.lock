@@ -622,7 +622,7 @@ dependencies = [
 [[package]]
 name = "esp-idf-hal"
 version = "0.46.2"
-source = "git+https://github.com/xorza/esp-idf-hal.git?branch=feat%2Fi2c-master-driver#3ee862af1c2dc2cd2b95ffd0a399dc79e9ff3ebc"
+source = "git+https://github.com/xorza/esp-idf-hal.git?branch=feat%2Fi2c-master-driver#487be398ccc6317cc5cdbff22a10340516abab77"
 dependencies = [
  "atomic-waker",
  "embassy-sync",
@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "esp-idf-svc"
 version = "0.52.1"
-source = "git+https://github.com/esp-rs/esp-idf-svc.git?branch=master#fe1673cc5e501eeeacfc80cc8c7858c13e3b80c5"
+source = "git+https://github.com/esp-rs/esp-idf-svc.git?branch=master#e1761de00f0ac905da0ce592767184f8c851d5e0"
 dependencies = [
  "embassy-futures",
  "embedded-hal-async",
@@ -1316,9 +1316,9 @@ dependencies = [
 
 [[package]]
 name = "rustc-hash"
-version = "2.1.1"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustix"
