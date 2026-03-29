@@ -622,7 +622,7 @@ dependencies = [
 [[package]]
 name = "esp-idf-hal"
 version = "0.46.2"
-source = "git+https://github.com/xorza/esp-idf-hal.git?branch=feat%2Fi2c-master-driver#487be398ccc6317cc5cdbff22a10340516abab77"
+source = "git+https://github.com/xorza/esp-idf-hal.git?branch=feat%2Fi2c-master-driver#3b66f23339fe51ae2323c2b4d32bd1203280c18d"
 dependencies = [
  "atomic-waker",
  "embassy-sync",
@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "esp-idf-svc"
 version = "0.52.1"
-source = "git+https://github.com/esp-rs/esp-idf-svc.git?branch=master#e1761de00f0ac905da0ce592767184f8c851d5e0"
+source = "git+https://github.com/esp-rs/esp-idf-svc.git?branch=master#372dd81884ce3537ef5087eba3e0483a83c83057"
 dependencies = [
  "embassy-futures",
  "embedded-hal-async",
