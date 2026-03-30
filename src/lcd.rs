@@ -468,10 +468,10 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
             // Static labels (drawn once)
             let label_style = MonoTextStyle::new(&FONT_5X8, COLOR_LABEL);
             for &(text, pos) in &[
-                ("VOLTAGE", Point::new(COL_LEFT, ROW1_LABEL_Y)),
-                ("BATTERY", Point::new(COL_LEFT, ROW2_LABEL_Y)),
-                ("POWER", Point::new(COL_RIGHT, ROW1_LABEL_Y)),
-                ("PSU", Point::new(COL_RIGHT, ROW2_LABEL_Y)),
+                ("VOLTAGE", Point::new(COL_LEFT + 8, ROW1_LABEL_Y)),
+                ("BATTERY", Point::new(COL_LEFT + 8, ROW2_LABEL_Y)),
+                ("POWER", Point::new(COL_RIGHT + 8, ROW1_LABEL_Y)),
+                ("PSU", Point::new(COL_RIGHT + 8, ROW2_LABEL_Y)),
             ] {
                 Text::new(text, pos, label_style)
                     .draw(&mut display)
