@@ -201,33 +201,7 @@ fn map_to_y(val: f32, min: f32, max: f32, h: u32) -> i32 {
     y.clamp(0.0, h as f32 - 1.0) as i32
 }
 
-fn draw_line(gb: &mut GraphBuf, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb565) {
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    let mut x = x0;
-    let mut y = y0;
-    loop {
-        gb.set_pixel(x, y, color);
-        gb.set_pixel(x, y + 1, color);
-        if x == x1 && y == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y += sy;
-        }
-    }
-}
-
-fn draw_dotted_line(gb: &mut GraphBuf, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb565) {
+fn draw_line(gb: &mut GraphBuf, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb565, dotted: bool) {
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
@@ -237,8 +211,11 @@ fn draw_dotted_line(gb: &mut GraphBuf, x0: i32, y0: i32, x1: i32, y1: i32, color
     let mut y = y0;
     let mut step = 0;
     loop {
-        if step % 6 < 3 {
+        if !dotted || step % 6 < 3 {
             gb.set_pixel(x, y, color);
+            if !dotted {
+                gb.set_pixel(x, y + 1, color);
+            }
         }
         if x == x1 && y == y1 {
             break;
@@ -388,11 +365,7 @@ fn draw_graph(
         for (j, &(lo, hi, color)) in traces.iter().enumerate() {
             let y0 = margin + map_to_y(vals_prev[j], lo, hi, plot_h);
             let y1 = margin + map_to_y(vals_curr[j], lo, hi, plot_h);
-            if is_gap {
-                draw_dotted_line(gb, x0, y0, x1, y1, color);
-            } else {
-                draw_line(gb, x0, y0, x1, y1, color);
-            }
+            draw_line(gb, x0, y0, x1, y1, color, is_gap);
         }
     }
 }
