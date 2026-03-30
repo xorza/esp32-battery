@@ -26,7 +26,7 @@ esp32-battery-logic = { path = "logic" }
 log = "*"
 esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git", branch = "master" }
 # esp-idf-svc = "*"
-esp-idf-hal = { git = "https://github.com/xorza/esp-idf-hal.git", branch = "feat/i2c-master-driver" }
+esp-idf-hal = { git = "https://github.com/xorza/esp-idf-hal.git", branch = "feat/i2c-driver" }
 ina228 = "*"
 embedded-hal = "*"
 heapless = "*"
@@ -41,7 +41,7 @@ flate2 = "*"
 
 
 [patch.crates-io]
-esp-idf-hal = { git = "https://github.com/xorza/esp-idf-hal.git", branch = "feat/i2c-master-driver" }
+esp-idf-hal = { git = "https://github.com/xorza/esp-idf-hal.git", branch = "feat/i2c-driver" }
 
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/mdns", version = "*" }

@@ -622,7 +622,7 @@ dependencies = [
 [[package]]
 name = "esp-idf-hal"
 version = "0.46.2"
-source = "git+https://github.com/xorza/esp-idf-hal.git?branch=feat%2Fi2c-master-driver#63a005122bb0bbbf3bf3a1d3cd94c8ab06d227b5"
+source = "git+https://github.com/xorza/esp-idf-hal.git?branch=feat%2Fi2c-driver#befd657150fb1499d2463de336c80212d83ef1a9"
 dependencies = [
  "atomic-waker",
  "embassy-sync",
