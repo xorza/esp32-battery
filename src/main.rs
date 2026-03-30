@@ -21,7 +21,7 @@ use log::{info, warn};
 
 pub fn reboot_after(msg: &'static str) {
     thread::Builder::new()
-        .stack_size(2048)
+        .stack_size(4096)
         .spawn(move || {
             thread::sleep(Duration::from_secs(2));
             info!("{}", msg);

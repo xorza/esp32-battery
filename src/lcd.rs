@@ -401,7 +401,7 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
     sensor_data: Arc<Mutex<SensorData<P>>>,
 ) {
     thread::Builder::new()
-        .stack_size(12288)
+        .stack_size(16384)
         .spawn(move || {
             // PWM backlight at reduced brightness
             let timer = LedcTimerDriver::new(

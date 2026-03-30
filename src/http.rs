@@ -136,8 +136,10 @@ fn write_history(json: &mut impl FmtWrite, key: &str, points: &[Sample]) {
 fn query_param<'a>(uri: &'a str, key: &str) -> Option<&'a str> {
     let q = uri.split_once('?')?.1;
     for pair in q.split('&') {
-        if let Some(val) = pair.strip_prefix(key).and_then(|s| s.strip_prefix('=')) {
-            return Some(val);
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(v);
+            }
         }
     }
     None

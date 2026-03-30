@@ -88,11 +88,13 @@ pub fn start_measurement_thread<P: Platform + Send + 'static>(
         .stack_size(4096)
         .spawn(move || {
             let dev_config = DeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
-            let battery_dev = I2cDriver::new(i2c_bus, 0x40, &dev_config).unwrap();
-            let ps_dev = I2cDriver::new(i2c_bus, 0x41, &dev_config).unwrap();
 
-            let mut battery_ina = init_ina(battery_dev, 0x40);
-            let mut ps_ina = init_ina(ps_dev, 0x41);
+            let mut battery_ina = I2cDriver::new(i2c_bus, 0x40, &dev_config)
+                .ok()
+                .and_then(|dev| init_ina(dev, 0x40));
+            let mut ps_ina = I2cDriver::new(i2c_bus, 0x41, &dev_config)
+                .ok()
+                .and_then(|dev| init_ina(dev, 0x41));
 
             let mut max_charge = f64::MIN;
             let mut min_charge = f64::MAX;
@@ -123,14 +125,14 @@ pub fn start_measurement_thread<P: Platform + Send + 'static>(
 
                 max_charge = max_charge.max(bat_acc.last_charge);
                 min_charge = min_charge.min(bat_acc.last_charge);
-                let max_charge = max_charge - min_charge;
+                let charge_range = max_charge - min_charge;
 
                 sensor_data.lock().unwrap().update(
                     bat_acc.average(SAMPLES_PER_UPDATE),
                     ps_acc.average(SAMPLES_PER_UPDATE),
                     read_total,
                     read_failures,
-                    max_charge,
+                    charge_range,
                 );
             }
         })
