@@ -295,24 +295,31 @@ fn draw_graph(
     c_max += c_range * 0.05;
 
     // Power-offline shading (drawn first so grid/labels render on top)
+    // Build a per-column flag array, then fill once.
     let x_scale = (GRAPH_W as f32 - 1.0) / (n - 1) as f32;
+    let mut offline_cols = [false; GRAPH_W as usize];
     for i in 0..n {
-        let power_online = history[i].4;
-        if power_online < 0.99 {
+        if history[i].4 < 0.99 {
             let x0 = if i > 0 {
-                (((i - 1) as f32 + 0.5) * x_scale) as i32
+                (((i - 1) as f32 + 0.5) * x_scale) as usize
             } else {
                 0
             };
             let x1 = if i < n - 1 {
-                ((i as f32 + 0.5) * x_scale) as i32
+                ((i as f32 + 0.5) * x_scale) as usize
             } else {
-                GRAPH_W as i32
+                GRAPH_W as usize
             };
-            for y in 0..GRAPH_H as i32 {
-                for x in x0..x1 {
-                    gb.set_pixel(x, y, COLOR_OFFLINE);
-                }
+            for col in &mut offline_cols[x0..x1.min(GRAPH_W as usize)] {
+                *col = true;
+            }
+        }
+    }
+    for y in 0..GRAPH_H as usize {
+        let row = y * GRAPH_W as usize;
+        for (x, &offline) in offline_cols.iter().enumerate() {
+            if offline {
+                gb.pixels[row + x] = COLOR_OFFLINE;
             }
         }
     }
@@ -566,18 +573,16 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
 
                 // Graph / Captive portal
                 let is_captive = crate::CAPTIVE_PORTAL_ACTIVE.load(Ordering::Relaxed);
-                if is_captive && prev_captive {
-                    continue;
+                if !(is_captive && prev_captive) {
+                    prev_captive = is_captive;
+                    gb.clear();
+                    if is_captive {
+                        draw_captive_portal(&mut gb);
+                    } else {
+                        draw_graph(&mut gb, &history, interval, &mut buf);
+                    }
+                    gb.blit(&mut display, Point::new(0, GRAPH_Y));
                 }
-                prev_captive = is_captive;
-
-                gb.clear();
-                if is_captive {
-                    draw_captive_portal(&mut gb);
-                } else {
-                    draw_graph(&mut gb, &history, interval, &mut buf);
-                }
-                gb.blit(&mut display, Point::new(0, GRAPH_Y));
             }
         })
         .unwrap();
