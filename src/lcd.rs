@@ -47,19 +47,19 @@ const COLOR_GRID: Rgb565 = Rgb565::new(4, 8, 4);
 
 const COL_LEFT: i32 = 5;
 const COL_RIGHT: i32 = 165;
-const ROW1_LABEL_Y: i32 = 8;
-const ROW1_VALUE_Y: i32 = 28;
-const ROW2_LABEL_Y: i32 = 38;
-const ROW2_VALUE_Y: i32 = 58;
+const ROW1_LABEL_Y: i32 = 10;
+const ROW1_VALUE_Y: i32 = 30;
+const ROW2_LABEL_Y: i32 = 44;
+const ROW2_VALUE_Y: i32 = 62;
 const UPTIME_X: i32 = 240;
 
 const VALUE_W: u32 = 150;
 const VALUE_H: u32 = 22;
 const VALUE_PIXELS: usize = (VALUE_W * VALUE_H) as usize;
 
-const GRAPH_Y: i32 = 62;
+const GRAPH_Y: i32 = 68;
 const GRAPH_W: u32 = 320;
-const GRAPH_H: u32 = 110;
+const GRAPH_H: u32 = 104;
 const GRAPH_PIXELS: usize = (GRAPH_W * GRAPH_H) as usize;
 
 // --- Pins ---
