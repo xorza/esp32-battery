@@ -38,8 +38,8 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const COLOR_BG: Rgb565 = Rgb565::BLACK;
 const COLOR_LABEL: Rgb565 = Rgb565::new(18, 36, 18);
 const COLOR_VOLTAGE: Rgb565 = Rgb565::new(0, 63, 0);
-const COLOR_BAT_CURRENT: Rgb565 = Rgb565::new(31, 50, 0);
-const COLOR_PSU_CURRENT: Rgb565 = Rgb565::new(0, 40, 31);
+const COLOR_BAT_CURRENT: Rgb565 = Rgb565::new(0, 57, 31); // cyan, matches #00e5ff
+const COLOR_PSU_CURRENT: Rgb565 = Rgb565::new(31, 38, 0); // orange, matches #ff9800
 const COLOR_POWER: Rgb565 = Rgb565::new(31, 20, 0);
 const COLOR_GRID: Rgb565 = Rgb565::new(4, 8, 4);
 
@@ -227,13 +227,52 @@ fn draw_line(gb: &mut GraphBuf, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb56
     }
 }
 
+fn draw_dotted_line(gb: &mut GraphBuf, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb565) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut x = x0;
+    let mut y = y0;
+    let mut step = 0;
+    loop {
+        if step % 6 < 3 {
+            gb.set_pixel(x, y, color);
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+            step += 1;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
 // --- Graph rendering ---
 
-fn draw_graph(gb: &mut GraphBuf, history: &[(f32, f32, f32)], buf: &mut heapless::String<16>) {
+const COLOR_OFFLINE: Rgb565 = Rgb565::new(8, 2, 2); // dim red background
+
+fn draw_graph(
+    gb: &mut GraphBuf,
+    history: &[(u32, f32, f32, f32, f32)],
+    interval: u32,
+    buf: &mut heapless::String<16>,
+) {
     let n = history.len();
     if n < 2 {
         return;
     }
+
+    // Gap threshold: if time between samples exceeds 3x the interval, interpolate
+    let gap_threshold = interval * 3;
 
     // Compute ranges
     let mut v_min = f32::MAX;
@@ -241,7 +280,7 @@ fn draw_graph(gb: &mut GraphBuf, history: &[(f32, f32, f32)], buf: &mut heapless
     let mut c_min = f32::MAX;
     let mut c_max = f32::MIN;
 
-    for &(v, c1, c2) in history {
+    for &(_, v, c1, c2, _) in history {
         v_min = v_min.min(v);
         v_max = v_max.max(v);
         c_min = c_min.min(c1).min(c2);
@@ -263,23 +302,58 @@ fn draw_graph(gb: &mut GraphBuf, history: &[(f32, f32, f32)], buf: &mut heapless
         }
     }
 
-    // Scale labels
+    // Scale labels — voltage on left, current on right
     let scale_style = MonoTextStyle::new(&FONT_5X8, COLOR_LABEL);
     buf.clear();
     let _ = write!(buf, "{:.1}V", v_max);
-    Text::new(buf, Point::new(12, 8), scale_style)
+    Text::new(buf, Point::new(2, 8), scale_style)
         .draw(gb)
         .unwrap();
     buf.clear();
     let _ = write!(buf, "{:.1}V", v_min);
-    Text::new(buf, Point::new(12, GRAPH_H as i32 - 6), scale_style)
+    Text::new(buf, Point::new(2, GRAPH_H as i32 - 2), scale_style)
         .draw(gb)
         .unwrap();
+
+    buf.clear();
+    let _ = write!(buf, "{:.2}A", c_max);
+    let right_x = GRAPH_W as i32 - buf.len() as i32 * 5 - 2;
+    Text::new(buf, Point::new(right_x, 8), scale_style)
+        .draw(gb)
+        .unwrap();
+    buf.clear();
+    let _ = write!(buf, "{:.2}A", c_min);
+    let right_x = GRAPH_W as i32 - buf.len() as i32 * 5 - 2;
+    Text::new(buf, Point::new(right_x, GRAPH_H as i32 - 2), scale_style)
+        .draw(gb)
+        .unwrap();
+
+    // Power-offline shading
+    let x_scale = (GRAPH_W as f32 - 1.0) / (n - 1) as f32;
+    for i in 0..n {
+        let power_online = history[i].4;
+        if power_online < 0.99 {
+            let x0 = if i > 0 {
+                (((i - 1) as f32 + 0.5) * x_scale) as i32
+            } else {
+                0
+            };
+            let x1 = if i < n - 1 {
+                ((i as f32 + 0.5) * x_scale) as i32
+            } else {
+                GRAPH_W as i32
+            };
+            for y in 0..GRAPH_H as i32 {
+                for x in x0..x1 {
+                    gb.set_pixel(x, y, COLOR_OFFLINE);
+                }
+            }
+        }
+    }
 
     // Traces: voltage on its own scale, both currents share a scale
     let margin = 2i32;
     let plot_h = GRAPH_H - margin as u32 * 2;
-    let x_scale = (GRAPH_W as f32 - 1.0) / (n - 1) as f32;
 
     let traces: [(f32, f32, Rgb565); 3] = [
         (v_min, v_max, COLOR_VOLTAGE),
@@ -292,18 +366,22 @@ fn draw_graph(gb: &mut GraphBuf, history: &[(f32, f32, f32)], buf: &mut heapless
         let x1 = (i as f32 * x_scale) as i32;
         let prev = history[i - 1];
         let curr = history[i];
-        let vals_prev = [prev.0, prev.1, prev.2];
-        let vals_curr = [curr.0, curr.1, curr.2];
+        let dt = curr.0.saturating_sub(prev.0);
+
+        // For large gaps, draw a dotted interpolation line instead of solid
+        let is_gap = dt > gap_threshold;
+
+        let vals_prev = [prev.1, prev.2, prev.3]; // voltage, bat_current, ps_current
+        let vals_curr = [curr.1, curr.2, curr.3];
 
         for (j, &(lo, hi, color)) in traces.iter().enumerate() {
-            draw_line(
-                gb,
-                x0,
-                margin + map_to_y(vals_prev[j], lo, hi, plot_h),
-                x1,
-                margin + map_to_y(vals_curr[j], lo, hi, plot_h),
-                color,
-            );
+            let y0 = margin + map_to_y(vals_prev[j], lo, hi, plot_h);
+            let y1 = margin + map_to_y(vals_curr[j], lo, hi, plot_h);
+            if is_gap {
+                draw_dotted_line(gb, x0, y0, x1, y1, color);
+            } else {
+                draw_line(gb, x0, y0, x1, y1, color);
+            }
         }
     }
 }
@@ -339,7 +417,7 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
     sensor_data: Arc<Mutex<SensorData<P>>>,
 ) {
     thread::Builder::new()
-        .stack_size(8192)
+        .stack_size(12288)
         .spawn(move || {
             // PWM backlight at reduced brightness
             let timer = LedcTimerDriver::new(
@@ -403,18 +481,20 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
             loop {
                 thread::sleep(REFRESH_INTERVAL);
 
-                let (r1, r2, uptime_s, history) = {
+                let (r1, r2, uptime_s, history, interval) = {
                     let sd = sensor_data.lock().unwrap();
-                    let hist: heapless::Vec<(f32, f32, f32), 144> = sd
+                    let hist: heapless::Vec<(u32, f32, f32, f32, f32), 144> = sd
                         .history()
                         .iter()
-                        .map(|s| (s.voltage, s.battery_current, s.ps_current))
+                        .map(|s| (s.time_s, s.voltage, s.battery_current, s.ps_current, s.power_online))
                         .collect();
+                    let ivl = sd.interval();
                     (
                         sd.battery_reading,
                         sd.ps_reading,
                         crate::uptime_s(),
                         hist,
+                        ivl,
                     )
                 };
 
@@ -483,7 +563,7 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
                 if is_captive {
                     draw_captive_portal(&mut gb);
                 } else {
-                    draw_graph(&mut gb, &history, &mut buf);
+                    draw_graph(&mut gb, &history, interval, &mut buf);
                 }
                 gb.blit(&mut display, Point::new(0, GRAPH_Y));
             }
