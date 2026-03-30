@@ -264,26 +264,35 @@ fn draw_graph(
         c_max = c_max.max(c1).max(c2);
     }
 
-    let v_range = (v_max - v_min).max(0.1);
-    v_min -= v_range * 0.05;
-    v_max += v_range * 0.05;
-    let c_range = (c_max - c_min).max(0.01);
-    c_min -= c_range * 0.05;
-    c_max += c_range * 0.05;
+    let v_margin = (v_max - v_min).max(0.2) * 0.1;
+    v_min -= v_margin;
+    v_max += v_margin;
+    c_min = c_min.min(0.0);
+    c_max = c_max.max(0.0);
+    let c_margin = (c_max - c_min).max(0.01) * 0.1;
+    c_min -= c_margin;
+    c_max += c_margin;
+
+    // Time-proportional X mapping
+    let t0 = history[0].0 as f32;
+    let t1 = history[n - 1].0 as f32;
+    let t_range = (t1 - t0).max(1.0);
+    let time_to_x = |t: u32| -> i32 {
+        ((t as f32 - t0) / t_range * (GRAPH_W as f32 - 1.0)) as i32
+    };
 
     // Power-offline shading (drawn first so grid/labels render on top)
     // Build a per-column flag array, then fill once.
-    let x_scale = (GRAPH_W as f32 - 1.0) / (n - 1) as f32;
     let mut offline_cols = [false; GRAPH_W as usize];
     for i in 0..n {
         if history[i].4 < 0.99 {
             let x0 = if i > 0 {
-                (((i - 1) as f32 + 0.5) * x_scale) as usize
+                ((time_to_x(history[i - 1].0) + time_to_x(history[i].0)) / 2) as usize
             } else {
                 0
             };
             let x1 = if i < n - 1 {
-                ((i as f32 + 0.5) * x_scale) as usize
+                ((time_to_x(history[i].0) + time_to_x(history[i + 1].0)) / 2) as usize
             } else {
                 GRAPH_W as usize
             };
@@ -350,10 +359,10 @@ fn draw_graph(
     ];
 
     for i in 1..n {
-        let x0 = ((i - 1) as f32 * x_scale) as i32;
-        let x1 = (i as f32 * x_scale) as i32;
         let prev = history[i - 1];
         let curr = history[i];
+        let x0 = time_to_x(prev.0);
+        let x1 = time_to_x(curr.0);
         let dt = curr.0.saturating_sub(prev.0);
 
         // For large gaps, draw a dotted interpolation line instead of solid
