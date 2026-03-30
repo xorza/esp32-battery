@@ -258,7 +258,7 @@ fn draw_dotted_line(gb: &mut GraphBuf, x0: i32, y0: i32, x1: i32, y1: i32, color
 
 // --- Graph rendering ---
 
-const COLOR_OFFLINE: Rgb565 = Rgb565::new(8, 2, 2); // dim red background
+const COLOR_OFFLINE: Rgb565 = Rgb565::new(2, 0, 0); // very dim red background
 
 fn draw_graph(
     gb: &mut GraphBuf,
@@ -294,41 +294,7 @@ fn draw_graph(
     c_min -= c_range * 0.05;
     c_max += c_range * 0.05;
 
-    // Grid lines
-    for i in 1..4 {
-        let gy = (GRAPH_H as i32 * i) / 4;
-        for gx in (0..GRAPH_W as i32).step_by(4) {
-            gb.set_pixel(gx, gy, COLOR_GRID);
-        }
-    }
-
-    // Scale labels — voltage on left, current on right
-    let scale_style = MonoTextStyle::new(&FONT_5X8, COLOR_LABEL);
-    buf.clear();
-    let _ = write!(buf, "{:.1}V", v_max);
-    Text::new(buf, Point::new(2, 8), scale_style)
-        .draw(gb)
-        .unwrap();
-    buf.clear();
-    let _ = write!(buf, "{:.1}V", v_min);
-    Text::new(buf, Point::new(2, GRAPH_H as i32 - 2), scale_style)
-        .draw(gb)
-        .unwrap();
-
-    buf.clear();
-    let _ = write!(buf, "{:.2}A", c_max);
-    let right_x = GRAPH_W as i32 - buf.len() as i32 * 5 - 2;
-    Text::new(buf, Point::new(right_x, 8), scale_style)
-        .draw(gb)
-        .unwrap();
-    buf.clear();
-    let _ = write!(buf, "{:.2}A", c_min);
-    let right_x = GRAPH_W as i32 - buf.len() as i32 * 5 - 2;
-    Text::new(buf, Point::new(right_x, GRAPH_H as i32 - 2), scale_style)
-        .draw(gb)
-        .unwrap();
-
-    // Power-offline shading
+    // Power-offline shading (drawn first so grid/labels render on top)
     let x_scale = (GRAPH_W as f32 - 1.0) / (n - 1) as f32;
     for i in 0..n {
         let power_online = history[i].4;
@@ -350,6 +316,44 @@ fn draw_graph(
             }
         }
     }
+
+    // Grid lines
+    for i in 1..4 {
+        let gy = (GRAPH_H as i32 * i) / 4;
+        for gx in (0..GRAPH_W as i32).step_by(4) {
+            gb.set_pixel(gx, gy, COLOR_GRID);
+        }
+    }
+
+    // Scale labels — voltage on left, current on right
+    // Inset from top/bottom to avoid rounded screen corners
+    let label_top_y = 10;
+    let label_bot_y = GRAPH_H as i32 - 4;
+    let label_left_x = 12; // inset from left rounded corner
+    let scale_style = MonoTextStyle::new(&FONT_5X8, COLOR_LABEL);
+    buf.clear();
+    let _ = write!(buf, "{:.1}V", v_max);
+    Text::new(buf, Point::new(label_left_x, label_top_y), scale_style)
+        .draw(gb)
+        .unwrap();
+    buf.clear();
+    let _ = write!(buf, "{:.1}V", v_min);
+    Text::new(buf, Point::new(label_left_x, label_bot_y), scale_style)
+        .draw(gb)
+        .unwrap();
+
+    buf.clear();
+    let _ = write!(buf, "{:.2}A", c_max);
+    let right_x = GRAPH_W as i32 - buf.len() as i32 * 5 - 12;
+    Text::new(buf, Point::new(right_x, label_top_y), scale_style)
+        .draw(gb)
+        .unwrap();
+    buf.clear();
+    let _ = write!(buf, "{:.2}A", c_min);
+    let right_x = GRAPH_W as i32 - buf.len() as i32 * 5 - 12;
+    Text::new(buf, Point::new(right_x, label_bot_y), scale_style)
+        .draw(gb)
+        .unwrap();
 
     // Traces: voltage on its own scale, both currents share a scale
     let margin = 2i32;
@@ -486,7 +490,15 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
                     let hist: heapless::Vec<(u32, f32, f32, f32, f32), 144> = sd
                         .history()
                         .iter()
-                        .map(|s| (s.time_s, s.voltage, s.battery_current, s.ps_current, s.power_online))
+                        .map(|s| {
+                            (
+                                s.time_s,
+                                s.voltage,
+                                s.battery_current,
+                                s.ps_current,
+                                s.power_online,
+                            )
+                        })
                         .collect();
                     let ivl = sd.interval();
                     (
