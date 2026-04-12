@@ -18,7 +18,9 @@ opt-level = "z"
 exclude = ["logic"]
 
 [features]
-default = ["lcd"]
+default = ["esp32c6", "lcd"]
+esp32c3 = []
+esp32c6 = []
 lcd = ["mipidsi", "embedded-graphics"]
 
 [dependencies]
@@ -31,7 +33,7 @@ ina228 = "*"
 embedded-hal = "*"
 heapless = "*"
 hmac = "*"
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "*", default-features = false }
 mipidsi = { version = "*", optional = true }
 embedded-graphics = { version = "*", optional = true }
 

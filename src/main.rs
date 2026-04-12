@@ -80,14 +80,13 @@ fn main() {
         nvs_partition,
     )));
 
+    #[cfg(feature = "esp32c3")]
+    let (i2c_sda, i2c_scl) = (peripherals.pins.gpio8, peripherals.pins.gpio9);
+    #[cfg(feature = "esp32c6")]
+    let (i2c_sda, i2c_scl) = (peripherals.pins.gpio20, peripherals.pins.gpio23);
+
     let i2c_bus: &'static I2cBusDriver = Box::leak(Box::new(
-        I2cBusDriver::new(
-            peripherals.i2c0,
-            peripherals.pins.gpio20,
-            peripherals.pins.gpio23,
-            &BusConfig::new(),
-        )
-        .unwrap(),
+        I2cBusDriver::new(peripherals.i2c0, i2c_sda, i2c_scl, &BusConfig::new()).unwrap(),
     ));
     let sensor_data = Arc::new(Mutex::new(esp32_battery_logic::data::SensorData::new(
         esp_platform,

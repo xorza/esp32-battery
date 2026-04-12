@@ -5,7 +5,7 @@ DIR="$(dirname "$0")"
 CHIP="${MCU:?Set MCU=esp32c3 or MCU=esp32c6}"
 
 case "$CHIP" in
-    esp32c3) PARTITIONS="$DIR/partitions-4mb.csv" ; TARGET="riscv32imc-esp-espidf" ; FEATURES="--no-default-features" ;;
+    esp32c3) PARTITIONS="$DIR/partitions-4mb.csv" ; TARGET="riscv32imc-esp-espidf" ; FEATURES="--no-default-features --features esp32c3" ;;
     esp32c6) PARTITIONS="$DIR/partitions-8mb.csv" ; TARGET="riscv32imac-esp-espidf" ; FEATURES="" ;;
     *)       echo "Unknown MCU: $CHIP"; exit 1 ;;
 esac

@@ -2,7 +2,7 @@ use esp_idf_hal::io::Write;
 use esp_idf_svc::http::server::{EspHttpConnection, EspHttpServer};
 use esp_idf_svc::ota::EspOta;
 use esp_idf_svc::sys::EspError;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, Mac, digest::KeyInit};
 use log::{info, warn};
 use sha2::Sha256;
 

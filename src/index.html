@@ -7,7 +7,7 @@
         <link rel="stylesheet" href="/style.css" />
         <link rel="icon" href="/favicon.ico" type="image/x-icon" />
     </head>
-    <body>
+    <body style="opacity:0;transition:opacity .15s">
         <div class="card hero">
             <div class="hero-status">
                 <span class="status-dot" id="s1_status_dot"></span>
@@ -253,6 +253,7 @@
                     })
                     .catch(() => {})
                     .finally(() => {
+                        document.body.style.opacity = "1";
                         setTimeout(update, 1000);
                     });
             }
