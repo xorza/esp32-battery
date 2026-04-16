@@ -237,6 +237,11 @@ impl<P: Platform> SensorData<P> {
             assert!(self.history.push(averaged).is_ok(), "history overflow");
         }
 
+        // NOTE: save_blob runs while the SensorData mutex is held by the caller,
+        // stalling other readers for ~50–100 ms every SAVE_INTERVAL_S (10 min).
+        // Moving the save outside the lock would require removing `platform` from
+        // SensorData — a large refactor touching every test. The stall is rare
+        // and brief enough that the current design is accepted.
         if time_s.saturating_sub(self.last_save_s) >= SAVE_INTERVAL_S {
             self.last_save_s = time_s;
             let len = self.write();

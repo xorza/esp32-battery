@@ -7,14 +7,14 @@ use esp_idf_hal::io::Write;
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::sys::EspError;
-use log::info;
+use log::{debug, warn};
 
 use esp32_battery_logic::battery;
 
 use crate::AppState;
 use crate::api::{ApiResponse, BatteryReading, HistoryRow, PsReading, RESPONSE_BUF_SIZE};
 
-use super::{create_server, get_rssi, serve_common_assets, serve_static};
+use super::{create_server, get_rssi, serve_common_assets, serve_static, text_response};
 
 pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServer<'static> {
     let mut server = create_server(10240, false, 4, Some(Duration::from_secs(0)), true);
@@ -40,7 +40,13 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
                 let bat = store.battery_reading;
                 let ps = store.ps_reading;
                 let history = store.history();
-                let voltage = (bat.voltage + ps.voltage) / 2.0;
+                // When PS is offline its sensor may be absent or reading zero; averaging
+                // would halve the reported voltage. Use battery voltage alone in that case.
+                let voltage = if store.power_online >= 0.5 {
+                    (bat.voltage + ps.voltage) / 2.0
+                } else {
+                    bat.voltage
+                };
                 let max_charge = history
                     .iter()
                     .map(|s| s.max_charge)
@@ -70,12 +76,16 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
 
             let mut guard = json_buf.lock().unwrap();
             let buf: &mut [u8] = &mut **guard;
-            let len = serde_json_core::to_slice(&response, buf).unwrap();
+            let len = match serde_json_core::to_slice(&response, buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("API: JSON serialization failed ({:?}); returning 500", e);
+                    return super::text_response(req, 500, b"serialization error");
+                }
+            };
 
-            let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-            let peak = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
-            info!(
-                "API: history={} json={}/{} heap={heap} peak={peak}",
+            debug!(
+                "API: history={} json={}/{}",
                 response.history.len(),
                 len,
                 RESPONSE_BUF_SIZE,
@@ -99,17 +109,7 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
     server
         .fn_handler("/wifi-reset", esp_idf_svc::http::Method::Post, move |req| {
             crate::nvs_creds::clear(&nvs);
-
-            let mut resp = req
-                .into_response(
-                    200,
-                    None,
-                    &[("Content-Type", "text/plain"), ("Connection", "close")],
-                )
-                .map_err(|e| e.0)?;
-            resp.write_all(b"WiFi credentials cleared. Rebooting...")
-                .map_err(|e| e.0)?;
-
+            text_response(req, 200, b"WiFi credentials cleared. Rebooting...")?;
             crate::reboot_after("Rebooting after WiFi reset");
             Ok::<(), EspError>(())
         })

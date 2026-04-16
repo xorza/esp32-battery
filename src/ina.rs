@@ -98,8 +98,10 @@ pub fn start_measurement_thread(
                 .ok()
                 .and_then(|dev| init_ina(dev, 0x41));
 
-            let mut max_charge = f64::MIN;
-            let mut min_charge = f64::MAX;
+            // Track the battery charge register's swing since boot. Seeded on the first
+            // valid reading (not f64::MIN/MAX) so a single spurious sample can't poison
+            // the range for the rest of the session.
+            let mut charge_bounds: Option<(f64, f64)> = None;
 
             loop {
                 let mut bat_acc = ReadingAccum::default();
@@ -125,9 +127,11 @@ pub fn start_measurement_thread(
                     }
                 }
 
-                max_charge = max_charge.max(bat_acc.last_charge);
-                min_charge = min_charge.min(bat_acc.last_charge);
-                let charge_range = max_charge - min_charge;
+                let (min_c, max_c) = charge_bounds
+                    .map(|(mn, mx)| (mn.min(bat_acc.last_charge), mx.max(bat_acc.last_charge)))
+                    .unwrap_or((bat_acc.last_charge, bat_acc.last_charge));
+                charge_bounds = Some((min_c, max_c));
+                let charge_range = max_c - min_c;
 
                 state.sensor_data.lock().unwrap().update(
                     bat_acc.average(SAMPLES_PER_UPDATE),

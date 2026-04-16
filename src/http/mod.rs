@@ -8,7 +8,7 @@ mod main_server;
 use std::time::Duration;
 
 use esp_idf_hal::io::Write;
-use esp_idf_svc::http::server::{Configuration as HttpConfig, EspHttpServer};
+use esp_idf_svc::http::server::{Configuration as HttpConfig, EspHttpConnection, EspHttpServer, Request};
 use esp_idf_svc::sys::EspError;
 use esp_idf_svc::tls::X509;
 
@@ -109,4 +109,17 @@ fn get_rssi() -> i32 {
     } else {
         0
     }
+}
+
+/// Send a `Connection: close` plaintext response with the given status and body.
+fn text_response(
+    req: Request<&mut EspHttpConnection>,
+    status: u16,
+    body: &[u8],
+) -> Result<(), EspError> {
+    let mut resp = req
+        .into_response(status, None, &[("Connection", "close")])
+        .map_err(|e| e.0)?;
+    resp.write_all(body).map_err(|e| e.0)?;
+    Ok(())
 }

@@ -50,7 +50,7 @@ pub struct ApiResponse {
     pub history: Vec<HistoryRow>,
 }
 
-/// Worst-case serialized size. `ryu` produces shortest-round-trip f32 (typically 4–10 chars);
-/// row = `[u32,f32,f32,f32,f32]` → ~50 chars. At HISTORY_CAPACITY=144 plus metadata, 8 KiB
-/// leaves generous headroom.
-pub const RESPONSE_BUF_SIZE: usize = 8192;
+/// Response buffer. Typical size is ~5 KiB (144 rows × ~30 chars). Bad sensor readings
+/// (NaN, denormals) can push ryu up to ~17 chars per float → 144 × 85 = 12 KiB worst case,
+/// so 16 KiB leaves margin. If serialization still overflows we return 500 instead of panicking.
+pub const RESPONSE_BUF_SIZE: usize = 16_384;

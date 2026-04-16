@@ -1,6 +1,5 @@
 //! Captive portal HTTP server: WiFi scan, credential save, portal page.
 
-use std::fmt::Write as FmtWrite;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +14,10 @@ use esp32_battery_logic::form;
 use crate::dns::DnsHandle;
 use crate::wifi::Wifi;
 
-use super::{create_server, serve_common_assets, serve_static};
+use super::{create_server, serve_common_assets, serve_static, text_response};
+
+/// Max JSON size for /scan: 10 APs × ~40 bytes (quoted 32-char SSID + rssi) + brackets.
+const SCAN_BUF_SIZE: usize = 1024;
 
 pub fn start(
     nvs: Arc<EspNvs<NvsDefault>>,
@@ -25,23 +27,16 @@ pub fn start(
 
     let mut server = create_server(8192, true, 4, Some(Duration::from_secs(2)), false);
 
-    // GET /scan — scan for visible WiFi networks
-    let scan_buf = Mutex::new(Box::new(heapless::String::<1024>::new()));
+    // GET /scan — scan for visible WiFi networks, serialized as [["ssid",rssi], ...]
+    let scan_buf = Mutex::new(Box::new([0u8; SCAN_BUF_SIZE]));
     server
         .fn_handler("/scan", esp_idf_svc::http::Method::Get, move |req| {
             let entries = wifi.lock().unwrap().scan();
+            let rows: Vec<(&str, i8)> = entries.iter().map(|(s, r)| (s.as_str(), *r)).collect();
 
             let mut guard = scan_buf.lock().unwrap();
-            let buf = &mut **guard;
-            buf.clear();
-            write!(buf, "[").unwrap();
-            for (i, (ssid, rssi)) in entries.iter().enumerate() {
-                if i > 0 {
-                    write!(buf, ",").unwrap();
-                }
-                write!(buf, r#"["{}",{}]"#, ssid, rssi).unwrap();
-            }
-            write!(buf, "]").unwrap();
+            let buf: &mut [u8] = &mut **guard;
+            let len = serde_json_core::to_slice(&rows, buf).unwrap();
 
             let mut resp = req
                 .into_response(
@@ -53,7 +48,7 @@ pub fn start(
                     ],
                 )
                 .map_err(|e| e.0)?;
-            resp.write_all(buf.as_bytes()).map_err(|e| e.0)?;
+            resp.write_all(&buf[..len]).map_err(|e| e.0)?;
             Ok::<(), EspError>(())
         })
         .unwrap();
@@ -75,15 +70,8 @@ pub fn start(
             }
             let body = std::str::from_utf8(&body_buf[..filled]).unwrap_or("");
 
-            let (ssid_raw, pass_raw) = match form::parse_form(body) {
-                Some(pair) => pair,
-                None => {
-                    let mut resp = req
-                        .into_response(400, None, &[("Connection", "close")])
-                        .map_err(|e| e.0)?;
-                    resp.write_all(b"Missing SSID").map_err(|e| e.0)?;
-                    return Ok::<(), EspError>(());
-                }
+            let Some((ssid_raw, pass_raw)) = form::parse_form(body) else {
+                return text_response(req, 400, b"Missing SSID");
             };
 
             let mut ssid_buf = [0u8; 33];
@@ -95,30 +83,15 @@ pub fn start(
             let password = std::str::from_utf8(&pass_buf[..pass_len]).unwrap_or("");
 
             if ssid.is_empty() || ssid.len() > 32 {
-                let mut resp = req
-                    .into_response(400, None, &[("Connection", "close")])
-                    .map_err(|e| e.0)?;
-                resp.write_all(b"Invalid SSID").map_err(|e| e.0)?;
-                return Ok::<(), EspError>(());
+                return text_response(req, 400, b"Invalid SSID");
             }
-
             // WPA/WPA2: 8-63 chars, or empty for open networks
             if !password.is_empty() && !(8..=63).contains(&password.len()) {
-                let mut resp = req
-                    .into_response(400, None, &[("Connection", "close")])
-                    .map_err(|e| e.0)?;
-                resp.write_all(b"Password must be 8-63 characters")
-                    .map_err(|e| e.0)?;
-                return Ok::<(), EspError>(());
+                return text_response(req, 400, b"Password must be 8-63 characters");
             }
 
             crate::nvs_creds::save(&nvs, ssid, password);
-
-            let mut resp = req
-                .into_response(200, None, &[("Connection", "close")])
-                .map_err(|e| e.0)?;
-            resp.write_all(b"OK").map_err(|e| e.0)?;
-
+            text_response(req, 200, b"OK")?;
             crate::reboot_after("Rebooting after WiFi setup");
             Ok::<(), EspError>(())
         })

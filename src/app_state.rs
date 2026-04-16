@@ -10,7 +10,7 @@ use crate::platform::EspPlatform;
 
 pub struct AppState {
     pub sensor_data: Mutex<SensorData<EspPlatform>>,
-    pub captive_portal_active: AtomicBool,
+    captive_portal_active: AtomicBool,
     /// Set by the SNTP callback once system time has been synchronized.
     /// Shared with `EspPlatform` so `epoch_s()` returns `None` until sync.
     pub ntp_synced: Arc<AtomicBool>,

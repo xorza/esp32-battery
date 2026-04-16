@@ -1,6 +1,7 @@
 //! Board-specific peripheral wiring. All GPIO / peripheral assignments live here.
 
 use esp_idf_hal::gpio::AnyIOPin;
+use esp_idf_hal::i2c::{I2cBusDriver, config::BusConfig};
 use esp_idf_hal::modem::Modem;
 use esp_idf_hal::peripherals::Peripherals;
 
@@ -15,6 +16,16 @@ pub struct I2cPins {
     pub i2c: esp_idf_hal::i2c::I2C0<'static>,
     pub sda: AnyIOPin<'static>,
     pub scl: AnyIOPin<'static>,
+}
+
+impl I2cPins {
+    /// Construct an I2C bus driver and leak it for a `'static` lifetime.
+    /// The bus lives for the entire process so the leak is intentional.
+    pub fn init_bus(self) -> &'static I2cBusDriver<'static> {
+        Box::leak(Box::new(
+            I2cBusDriver::new(self.i2c, self.sda, self.scl, &BusConfig::new()).unwrap(),
+        ))
+    }
 }
 
 #[cfg(feature = "lcd")]

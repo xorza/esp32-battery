@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp_idf_hal::i2c::{I2cBusDriver, config::BusConfig};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
@@ -36,7 +35,14 @@ pub fn reboot_after(msg: &'static str) {
 
 #[allow(dead_code)]
 enum Server<'a> {
-    Main(esp_idf_svc::http::server::EspHttpServer<'a>),
+    /// Main HTTPS dashboard + SNTP client. The SNTP lifetime is bound to Server::Main
+    /// so there is never more than one SNTP client running (two would race on the
+    /// system clock). Any transition out of Main drops the variant, which drops SNTP.
+    Main(
+        esp_idf_svc::http::server::EspHttpServer<'a>,
+        esp_idf_svc::sntp::EspSntp<'static>,
+    ),
+    /// Captive portal HTTP + DNS. No SNTP here — time sync is not needed for setup.
     Captive(esp_idf_svc::http::server::EspHttpServer<'a>, dns::DnsHandle),
     None,
 }
@@ -57,6 +63,15 @@ fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    // Reboot on any thread panic. Without this, a panic in (e.g.) the INA thread
+    // poisons the sensor_data mutex; subsequent HTTP / LCD handlers then panic on
+    // lock(), leaving a half-dead device that doesn't get caught by the watchdog.
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("panic: {info}");
+        thread::sleep(Duration::from_millis(500));
+        esp_idf_svc::hal::reset::restart();
+    }));
+
     let board = board::Board::take();
     let sysloop = EspSystemEventLoop::take().unwrap();
     let nvs_partition = EspDefaultNvsPartition::take().unwrap();
@@ -73,20 +88,10 @@ fn main() {
         nvs_partition,
     )));
 
-    let i2c_bus: &'static I2cBusDriver = Box::leak(Box::new(
-        I2cBusDriver::new(
-            board.i2c.i2c,
-            board.i2c.sda,
-            board.i2c.scl,
-            &BusConfig::new(),
-        )
-        .unwrap(),
-    ));
-
     let sensor_data = esp32_battery_logic::data::SensorData::new(esp_platform);
     let state = AppState::new(ntp_synced, sensor_data);
 
-    ina::start_measurement_thread(i2c_bus, state.clone());
+    ina::start_measurement_thread(board.i2c.init_bus(), state.clone());
 
     #[cfg(feature = "lcd")]
     lcd::start_lcd_thread(board.lcd, state.clone());
@@ -96,28 +101,29 @@ fn main() {
     }
 
     let mut server = Server::None;
-    let mut sntp: Option<esp_idf_svc::sntp::EspSntp<'static>> = None;
 
     loop {
         thread::sleep(Duration::from_secs(1));
 
-        let mut wf = wifi.lock().unwrap();
-        wf.try_reconnect();
-        let connected = wf.is_connected();
-        drop(wf);
+        let connected = {
+            let mut wf = wifi.lock().unwrap();
+            wf.try_reconnect();
+            wf.is_connected()
+        };
 
         match (&server, connected) {
-            (Server::Main(_), true) | (Server::Captive(_, _), false) => {}
+            (Server::Main(..), true) | (Server::Captive(..), false) => {}
 
             (Server::None, true) => {
                 info!("WiFi connected, starting main server");
                 state.set_captive(false);
-                drop(sntp.take());
-                sntp = Some(start_sntp(state.ntp_synced.clone()));
-                server = Server::Main(http::start_main(state.clone(), nvs.clone()));
+                // server was None here — no prior SNTP to conflict with.
+                let http = http::start_main(state.clone(), nvs.clone());
+                let sntp = start_sntp(state.ntp_synced.clone());
+                server = Server::Main(http, sntp);
             }
 
-            (Server::Captive(_, _), true) => {
+            (Server::Captive(..), true) => {
                 info!("WiFi reconnected, switching to STA-only");
                 state.set_captive(false);
                 server = Server::None;
@@ -127,7 +133,8 @@ fn main() {
 
             (_, false) => {
                 warn!("WiFi disconnected, starting captive portal");
-                drop(sntp.take());
+                // Drop the old Main (which owns SNTP) and any old Captive first,
+                // before reconfiguring WiFi and starting the new captive HTTP.
                 drop(std::mem::replace(&mut server, Server::None));
                 wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
                 let (s, d) = http::start_captive(nvs.clone(), wifi.clone());
