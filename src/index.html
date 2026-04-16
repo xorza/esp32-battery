@@ -163,15 +163,9 @@
             }
 
             let hist = [];
-            let histInterval = 0;
 
             function update() {
-                let url = "/api";
-                if (hist.length > 0 && histInterval > 0) {
-                    const since = hist[hist.length - 1][0];
-                    url += "?since=" + since + "&interval=" + histInterval;
-                }
-                fetch(url)
+                fetch("/api")
                     .then((r) => r.json())
                     .then((d) => {
                         // Battery hero
@@ -211,15 +205,7 @@
                         ).toFixed(3);
                         $("s2_power").textContent = d.ps.power.toFixed(3);
 
-                        histInterval = d.interval;
-                        if (d.history) {
-                            hist = d.history;
-                        } else if (
-                            d.history_append &&
-                            d.history_append.length > 0
-                        ) {
-                            hist = hist.concat(d.history_append);
-                        }
+                        hist = d.history;
                         if (hist.length > 0) {
                             updateStats(hist);
                             drawChart(hist);

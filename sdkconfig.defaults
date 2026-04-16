@@ -1,5 +1,7 @@
-# Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000
+# Rust often needs a bit of an extra main task stack size compared to C (the default is 3K).
+# AppState::new takes SensorData by value (~4KB inline heapless::Vec for history) + Mutex + Arc
+# construction all transit the stack before the Arc escapes to heap.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12000
 
 # Use this to set FreeRTOS kernel tick frequency to 1000 Hz (100 Hz by default).
 # This allows to use 1 ms granularity for thread sleeps (10 ms by default).
@@ -67,3 +69,7 @@ CONFIG_ESP_TASK_WDT_EN=n
 
 # HTTPS server support
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+
+# Route esp_log output to the built-in USB-Serial/JTAG peripheral so logs
+# are visible on /dev/ttyACM0 without a separate UART-to-USB cable.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

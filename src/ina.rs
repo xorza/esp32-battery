@@ -1,12 +1,14 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::DeviceConfig};
 
-const I2C_SPEED_HZ: u32 = 400_000;
+use esp32_battery_logic::data::Ina228Reading;
 
-use esp32_battery_logic::data::{Ina228Reading, Platform, SensorData};
+use crate::AppState;
+
+const I2C_SPEED_HZ: u32 = 400_000;
 
 const SHUNT_RESISTANCE_OHM: f32 = 0.002;
 const MAX_CURRENT_A: f32 = 15.0;
@@ -80,9 +82,9 @@ fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Option<Ina228Reading> {
     })
 }
 
-pub fn start_measurement_thread<P: Platform + Send + 'static>(
+pub fn start_measurement_thread(
     i2c_bus: &'static I2cBusDriver<'static>,
-    sensor_data: Arc<Mutex<SensorData<P>>>,
+    state: Arc<AppState>,
 ) {
     thread::Builder::new()
         .stack_size(4096)
@@ -127,7 +129,7 @@ pub fn start_measurement_thread<P: Platform + Send + 'static>(
                 min_charge = min_charge.min(bat_acc.last_charge);
                 let charge_range = max_charge - min_charge;
 
-                sensor_data.lock().unwrap().update(
+                state.sensor_data.lock().unwrap().update(
                     bat_acc.average(SAMPLES_PER_UPDATE),
                     ps_acc.average(SAMPLES_PER_UPDATE),
                     read_total,

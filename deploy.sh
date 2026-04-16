@@ -5,8 +5,8 @@ DIR="$(dirname "$0")"
 CHIP="${MCU:?Set MCU=esp32c3 or MCU=esp32c6}"
 
 case "$CHIP" in
-    esp32c3) TARGET="riscv32imc-esp-espidf" ; FEATURES="--no-default-features --features esp32c3" ;;
-    esp32c6) TARGET="riscv32imac-esp-espidf" ; FEATURES="" ;;
+    esp32c3) TARGET="riscv32imc-esp-espidf" ; ALIAS="c3" ;;
+    esp32c6) TARGET="riscv32imac-esp-espidf" ; ALIAS="c6" ;;
     *)       echo "Unknown MCU: $CHIP"; exit 1 ;;
 esac
 
@@ -21,7 +21,7 @@ if [ ! -f "$KEY" ]; then
 fi
 
 echo "Building release for $CHIP..."
-cargo build --release --target "$TARGET" $FEATURES
+cargo "$ALIAS"
 
 echo "Creating binary image..."
 espflash save-image --chip "$CHIP" "$ELF" "$BIN"

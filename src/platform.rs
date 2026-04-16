@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
 use esp32_battery_logic::data::Platform;
@@ -7,19 +10,24 @@ const NVS_KEY: &str = "hist";
 
 pub struct EspPlatform {
     nvs: EspNvs<NvsDefault>,
+    ntp_synced: Arc<AtomicBool>,
 }
 
 impl EspPlatform {
-    pub fn new(partition: EspDefaultNvsPartition) -> Self {
+    pub fn new(partition: EspDefaultNvsPartition, ntp_synced: Arc<AtomicBool>) -> Self {
         Self {
             nvs: EspNvs::new(partition, NAMESPACE, true).unwrap(),
+            ntp_synced,
         }
     }
 }
 
 impl Platform for EspPlatform {
     fn epoch_s(&self) -> Option<u32> {
-        crate::epoch_s()
+        if !self.ntp_synced.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(esp_idf_svc::systime::EspSystemTime.now().as_secs() as u32)
     }
 
     fn save_blob(&self, data: &[u8]) {

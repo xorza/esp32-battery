@@ -34,6 +34,8 @@ embedded-hal = "*"
 heapless = "*"
 hmac = "*"
 sha2 = { version = "*", default-features = false }
+serde = { version = "*", default-features = false, features = ["derive"] }
+serde-json-core = "*"
 mipidsi = { version = "*", optional = true }
 embedded-graphics = { version = "*", optional = true }
 

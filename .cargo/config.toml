@@ -1,6 +1,12 @@
 [build]
-# Default target is esp32c6. For esp32c3: MCU=esp32c3 cargo build --target riscv32imc-esp-espidf
+# Default target is esp32c6. Use `cargo c3` or `cargo c6` for explicit chip selection.
 target = "riscv32imac-esp-espidf"
+
+[alias]
+c6 = "build --release --target riscv32imac-esp-espidf"
+c3 = "build --release --target riscv32imc-esp-espidf --no-default-features --features esp32c3"
+check-c6 = "check --target riscv32imac-esp-espidf"
+check-c3 = "check --target riscv32imc-esp-espidf --no-default-features --features esp32c3"
 
 [target.riscv32imac-esp-espidf]
 linker = "ldproxy"

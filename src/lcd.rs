@@ -1,6 +1,5 @@
 use core::fmt::Write;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -12,17 +11,18 @@ use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::Text;
-use esp_idf_hal::gpio::{AnyIOPin, AnyOutputPin, PinDriver};
+use esp_idf_hal::gpio::{AnyIOPin, PinDriver};
 use esp_idf_hal::ledc::{LedcDriver, LedcTimerDriver, config::TimerConfig};
 use esp_idf_hal::spi::config::{Config as SpiConfig, DriverConfig};
-use esp_idf_hal::spi::{Dma, SPI2, SpiDeviceDriver, SpiDriver};
+use esp_idf_hal::spi::{Dma, SpiDeviceDriver, SpiDriver};
 use esp_idf_hal::units::FromValueType;
 use mipidsi::Builder;
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
 
-use esp32_battery_logic::data::{Platform, SensorData};
+use crate::AppState;
+use crate::board::LcdPins;
 
 // --- SPI / DMA ---
 
@@ -61,20 +61,6 @@ const GRAPH_Y: i32 = 68;
 const GRAPH_W: u32 = 320;
 const GRAPH_H: u32 = 104;
 const GRAPH_PIXELS: usize = (GRAPH_W * GRAPH_H) as usize;
-
-// --- Pins ---
-
-pub struct LcdPins {
-    pub sclk: AnyIOPin<'static>,
-    pub mosi: AnyIOPin<'static>,
-    pub cs: AnyOutputPin<'static>,
-    pub dc: AnyOutputPin<'static>,
-    pub rst: AnyOutputPin<'static>,
-    pub blk: AnyOutputPin<'static>,
-    pub spi: SPI2<'static>,
-    pub ledc_timer: esp_idf_hal::ledc::TIMER0<'static>,
-    pub ledc_channel: esp_idf_hal::ledc::CHANNEL0<'static>,
-}
 
 /// Backlight brightness 0–100%.
 const BACKLIGHT_PERCENT: u32 = 50;
@@ -405,10 +391,7 @@ fn draw_captive_portal(gb: &mut GraphBuf) {
 
 // --- Main thread ---
 
-pub fn start_lcd_thread<P: Platform + Send + 'static>(
-    pins: LcdPins,
-    sensor_data: Arc<Mutex<SensorData<P>>>,
-) {
+pub fn start_lcd_thread(pins: LcdPins, state: Arc<AppState>) {
     thread::Builder::new()
         .stack_size(16384)
         .spawn(move || {
@@ -475,7 +458,7 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
                 thread::sleep(REFRESH_INTERVAL);
 
                 let (r1, r2, uptime_s, history, interval) = {
-                    let sd = sensor_data.lock().unwrap();
+                    let sd = state.sensor_data.lock().unwrap();
                     let hist: heapless::Vec<(u32, f32, f32, f32, f32), 144> = sd
                         .history()
                         .iter()
@@ -554,7 +537,7 @@ pub fn start_lcd_thread<P: Platform + Send + 'static>(
                 fb.blit_rows(&mut display, Point::new(UPTIME_X, 0), 12);
 
                 // Graph / Captive portal
-                let is_captive = crate::CAPTIVE_PORTAL_ACTIVE.load(Ordering::Relaxed);
+                let is_captive = state.is_captive();
                 if !(is_captive && prev_captive) {
                     prev_captive = is_captive;
                     gb.clear();
