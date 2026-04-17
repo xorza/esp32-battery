@@ -22,6 +22,6 @@ build-std = ["std", "panic_abort"]
 [env]
 # Override with: MCU=esp32c3 cargo build --release
 MCU = { value = "esp32c6", relative = false }
-ESP_IDF_VERSION = "v5.5.3"
+ESP_IDF_VERSION = "v6.0"
 ESP_IDF_TOOLS_INSTALL_DIR = "global"
 LIBCLANG_PATH = { value = "/usr/lib/llvm19/lib/", force = true }

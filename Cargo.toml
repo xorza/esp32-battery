@@ -26,9 +26,8 @@ lcd = ["mipidsi", "embedded-graphics"]
 [dependencies]
 esp32-battery-logic = { path = "logic" }
 log = "*"
-esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git", branch = "master" }
-# esp-idf-svc = "*"
-esp-idf-hal = { git = "https://github.com/xorza/esp-idf-hal.git", branch = "feat/i2c-driver" }
+esp-idf-svc = "*"
+esp-idf-hal = "*"
 ina228 = "*"
 embedded-hal = "*"
 heapless = "*"
@@ -43,8 +42,9 @@ embedded-graphics = { version = "*", optional = true }
 embuild = "*"
 flate2 = "*"
 
-
 [patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git", branch = "master" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git", branch = "master" }
 esp-idf-hal = { git = "https://github.com/xorza/esp-idf-hal.git", branch = "feat/i2c-driver" }
 
 [[package.metadata.esp-idf-sys.extra_components]]
