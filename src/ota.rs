@@ -24,7 +24,7 @@ struct ErrorResponse<'a> {
     error: &'a str,
 }
 
-const OTA_KEY: &[u8; 32] = include_bytes!("../ota_key.bin");
+const OTA_KEY: &[u8; 32] = include_bytes!(concat!(env!("OUT_DIR"), "/ota_key.bin"));
 
 type HmacSha256 = Hmac<Sha256>;
 

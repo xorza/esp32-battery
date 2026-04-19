@@ -50,7 +50,7 @@ cargo build --release --no-default-features
 ./deploy.sh
 ```
 
-Requires `ota_key.bin` (32-byte HMAC key, not in repo). The signed binary is uploaded to `https://<IP>/ota/upload`.
+Requires `OTA_KEY` (64 hex chars = 32-byte HMAC key) in a `.env` file at the repo root (not committed), or set as an environment variable. The signed binary is uploaded to `https://<IP>/ota/upload`.
 
 ## WiFi Setup
 
