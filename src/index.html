@@ -128,6 +128,7 @@
 
         <script>
             const $ = (id) => document.getElementById(id);
+            const IDLE_CURRENT_A = 0.1;
 
             function formatUptime(s) {
                 const d = Math.floor(s / 86400);
@@ -170,10 +171,10 @@
                     .then((d) => {
                         // Battery hero
                         let status, color;
-                        if (d.battery.current < -0.01) {
+                        if (d.battery.current < -IDLE_CURRENT_A) {
                             status = "Charging";
                             color = "#4ade80";
-                        } else if (d.battery.current > 0.01) {
+                        } else if (d.battery.current > IDLE_CURRENT_A) {
                             status = "Discharging";
                             color = "#f87171";
                         } else {
