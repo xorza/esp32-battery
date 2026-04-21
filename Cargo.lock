@@ -683,7 +683,7 @@ dependencies = [
 [[package]]
 name = "esp-idf-sys"
 version = "0.37.2"
-source = "git+https://github.com/esp-rs/esp-idf-sys.git?branch=master#846091be26e4ec1e30829756d583d55fa72d503d"
+source = "git+https://github.com/esp-rs/esp-idf-sys.git?branch=master#9d49cb5a4c9abdbc2615a6083af8faa97157e701"
 dependencies = [
  "anyhow",
  "build-time",
