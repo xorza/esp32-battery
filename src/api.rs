@@ -100,8 +100,8 @@ pub fn register(server: &mut EspHttpServer<'static>, shared: Arc<Shared>) {
             // Keeps the measurement thread unblocked during JSON serialization.
             let response = {
                 let store = shared.sensor_data.lock().unwrap();
-                let bat = store.battery_reading.unwrap_or_default();
-                let ps = store.ps_reading.unwrap_or_default();
+                let bat = store.battery_reading().unwrap_or_default();
+                let ps = store.ps_reading().unwrap_or_default();
                 let power_online = store.power_online();
                 let history_rows: Vec<HistoryRow> =
                     store.history().iter().map(HistoryRow::from).collect();

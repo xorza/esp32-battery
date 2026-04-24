@@ -499,8 +499,8 @@ pub fn start(pins: LcdPins, shared: Arc<Shared>) {
                         .collect();
                     let ivl = sd.interval();
                     (
-                        sd.battery_reading.unwrap_or_default(),
-                        sd.ps_reading.unwrap_or_default(),
+                        sd.battery_reading().unwrap_or_default(),
+                        sd.ps_reading().unwrap_or_default(),
                         crate::uptime_s(),
                         hist,
                         ivl,

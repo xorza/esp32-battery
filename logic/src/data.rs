@@ -84,30 +84,36 @@ impl SampleAccum {
     }
 }
 
+/// Ticks a sensor's reading can go unrefreshed before `tick` treats it as
+/// absent. At 1 Hz ticks this is ~5 s — enough to ride out a single missed
+/// poll, short enough that a stuck producer flips the dashboard / history
+/// to its zero fallback before the user notices.
+const STALE_TICKS: u32 = 5;
+
 /// Central data store with adaptive-resolution history.
 ///
 /// Stores up to `HISTORY_CAPACITY` samples. When full, pairs are averaged
 /// (halving the count) and the sampling interval doubles. This gives
 /// exponentially growing time coverage in fixed memory (~4 KB).
 pub struct SensorData<C: Clock> {
-    /// Latest reading from each side. `None` only until the first real reading
-    /// from that sensor — then always `Some` so HTTP/LCD can snapshot live values.
-    pub battery_reading: Option<Ina228Reading>,
-    pub ps_reading: Option<PsReading>,
-    /// Updated-since-last-commit flags. Each `update_*` sets its flag; a history
-    /// row is committed only once both are set, after which both are cleared.
-    /// Without this we'd commit twice per cycle (once per thread), each time
-    /// pairing a fresh reading with the other side's previous value.
-    battery_updated: bool,
-    ps_updated: bool,
+    /// Latest readings published by producer threads. Raw fields — readers
+    /// should go through `battery_reading()` / `ps_reading()` which apply
+    /// the staleness filter. Kept private so the filter can't be bypassed.
+    latest_battery: Option<Ina228Reading>,
+    latest_ps: Option<PsReading>,
+    /// Ticks since the last `update_*`. Initialised to `u32::MAX` so a
+    /// fresh or just-loaded `SensorData` treats both sensors as absent
+    /// until the first live reading lands.
+    battery_ticks_stale: u32,
+    ps_ticks_stale: u32,
     history: heapless::Vec<Sample, HISTORY_CAPACITY>,
-    /// Current sampling interval: how many raw updates per stored sample.
+    /// Current sampling interval: how many ticks per stored sample.
     interval: u32,
     acc: SampleAccum,
     acc_count: u32,
     clock: C,
     /// Has the save-interval elapsed since the last `take_save_payload` call?
-    /// Set by `try_commit`; cleared when the caller drains the payload.
+    /// Set by `tick`; cleared when the caller drains the payload.
     save_pending: bool,
     /// `None` until the first successful commit anchors it. Non-anchoring
     /// ensures we don't immediately re-save a just-loaded blob.
@@ -144,10 +150,10 @@ impl BufReader<'_> {
 impl<C: Clock> SensorData<C> {
     pub fn new(clock: C) -> Self {
         Self {
-            battery_reading: None,
-            ps_reading: None,
-            battery_updated: false,
-            ps_updated: false,
+            latest_battery: None,
+            latest_ps: None,
+            battery_ticks_stale: u32::MAX,
+            ps_ticks_stale: u32::MAX,
             history: heapless::Vec::new(),
             interval: 1,
             acc: SampleAccum::default(),
@@ -158,33 +164,47 @@ impl<C: Clock> SensorData<C> {
         }
     }
 
-    /// Called by the INA thread once per cycle. Publishes the latest reading
-    /// and runs `try_commit` — the commit only fires once both sides have
-    /// produced a fresh reading.
+    /// Called by the INA thread once per cycle. Stores the latest reading
+    /// and resets its staleness counter. Does NOT commit — the main-loop
+    /// 1 Hz `tick` drives commits so one dead producer can't halt history.
     pub fn update_battery(&mut self, bat: Ina228Reading) {
-        self.battery_reading = Some(bat);
-        self.battery_updated = true;
-        self.try_commit();
+        self.latest_battery = Some(bat);
+        self.battery_ticks_stale = 0;
     }
 
     /// Called by the XY thread once per poll. Same shape as `update_battery`.
     pub fn update_ps(&mut self, ps: PsReading) {
-        self.ps_reading = Some(ps);
-        self.ps_updated = true;
-        self.try_commit();
+        self.latest_ps = Some(ps);
+        self.ps_ticks_stale = 0;
     }
 
-    /// `1.0` when the latest PS reading shows measurable voltage, `0.0` otherwise.
-    /// Returns `0.0` before the first PS reading arrives.
+    /// Latest battery reading, filtered by staleness. `None` before the
+    /// first update, or once `STALE_TICKS` have passed without a refresh.
+    pub fn battery_reading(&self) -> Option<Ina228Reading> {
+        if self.battery_ticks_stale > STALE_TICKS {
+            return None;
+        }
+        self.latest_battery
+    }
+
+    pub fn ps_reading(&self) -> Option<PsReading> {
+        if self.ps_ticks_stale > STALE_TICKS {
+            return None;
+        }
+        self.latest_ps
+    }
+
+    /// `1.0` when a fresh PS reading shows measurable voltage, `0.0` otherwise
+    /// (including before the first reading and after PS goes stale).
     pub fn power_online(&self) -> f32 {
-        match self.ps_reading {
+        match self.ps_reading() {
             Some(ps) if ps.voltage > POWER_ONLINE_VOLTAGE_THRESHOLD => 1.0,
             _ => 0.0,
         }
     }
 
     /// Restore history from a previously-saved blob. Call at startup before
-    /// the first `try_commit`. Returns false if the blob is malformed.
+    /// the first `tick`. Returns false if the blob is malformed.
     pub fn load_from_bytes(&mut self, bytes: &[u8]) -> bool {
         let ok = self.deserialize(bytes);
         if ok {
@@ -212,24 +232,23 @@ impl<C: Clock> SensorData<C> {
         Some(out)
     }
 
-    /// Commit one history sample when both sides have a reading that has been
-    /// updated since the last commit. Clears the updated flags (but keeps the
-    /// readings themselves) so HTTP/LCD still see live values between commits.
-    /// Sets `save_pending` when a save-interval has elapsed; the actual write
-    /// is deferred to the caller via `take_save_payload` to keep NVS I/O out
-    /// of the data mutex.
-    fn try_commit(&mut self) {
-        if !(self.battery_updated && self.ps_updated) {
-            return;
-        }
-        let (Some(bat), Some(ps)) = (self.battery_reading, self.ps_reading) else {
-            return;
-        };
+    /// Drive the history pipeline forward by one tick. Called once per
+    /// second by the main-loop supervisor. Commits one raw sample per call
+    /// using whichever readings are currently fresh — stale producers
+    /// contribute zeros, so history stays continuous and the dead side
+    /// surfaces as flat-line zero on the dashboard.
+    ///
+    /// Replaces the old "commit when both producers tick" rendezvous, which
+    /// coupled history liveness to the least-available sensor. Sets
+    /// `save_pending` when a save-interval has elapsed; the caller drains
+    /// via `take_save_payload` to keep NVS I/O out of the data mutex.
+    pub fn tick(&mut self) {
+        self.battery_ticks_stale = self.battery_ticks_stale.saturating_add(1);
+        self.ps_ticks_stale = self.ps_ticks_stale.saturating_add(1);
+
         let Some(time_s) = self.clock.epoch_s() else {
             return;
         };
-        self.battery_updated = false;
-        self.ps_updated = false;
 
         // First commit anchors the save timer so we don't immediately dump a
         // just-loaded blob back to flash.
@@ -251,6 +270,11 @@ impl<C: Clock> SensorData<C> {
             return;
         }
 
+        // Stale / absent producers yield zeroed readings. History stays
+        // continuous; the zeros surface the dead producer to the dashboard
+        // rather than silently freezing the timeline.
+        let bat = self.battery_reading().unwrap_or_default();
+        let ps = self.ps_reading().unwrap_or_default();
         let sample = Sample {
             time_s,
             voltage: bat.voltage,
@@ -407,11 +431,11 @@ mod tests {
         }
     }
 
-    /// Shorthand: publish battery + PS readings and commit.
+    /// Shorthand: publish battery + PS readings and run one supervisor tick.
     fn update(sd: &mut SensorData<TestClockSrc>, bat: Ina228Reading, p: PsReading) {
-        sd.update_ps(p);
         sd.update_battery(bat);
-        sd.try_commit();
+        sd.update_ps(p);
+        sd.tick();
     }
 
     /// Push n uniform samples (v=13, c1=1, c2=2). Returns the next time_s value.
@@ -457,32 +481,32 @@ mod tests {
 
     #[test]
     fn latest_readings_visible_after_commit() {
-        // Readings persist across commits so HTTP/LCD can always snapshot
-        // live values — only the `_updated` flags get cleared.
+        // Readings stay visible via the getters after a tick so HTTP/LCD can
+        // always snapshot live values.
         let (time, mut sd) = new_sd();
         time.set(10);
         update(&mut sd, bat_reading(13.0, 1.5), ps_reading(13.1, 2.5));
-        assert!((sd.battery_reading.unwrap().current - 1.5).abs() < 0.001);
-        assert!((sd.ps_reading.unwrap().current - 2.5).abs() < 0.001);
-        assert!(!sd.battery_updated && !sd.ps_updated);
+        assert!((sd.battery_reading().unwrap().current - 1.5).abs() < 0.001);
+        assert!((sd.ps_reading().unwrap().current - 2.5).abs() < 0.001);
     }
 
     #[test]
-    fn only_one_commit_per_pair_of_updates() {
-        // With both sides at 1 Hz we want 1 history row per second, not 2.
+    fn one_commit_per_tick_regardless_of_update_order() {
+        // tick-driven commits: one tick → at most one history row, regardless
+        // of how many update_* calls landed in between.
         let (time, mut sd) = new_sd();
         time.set(1);
         sd.update_ps(ps_reading(13.0, 2.0));
         sd.update_battery(bat_reading(13.0, 1.0));
-        sd.try_commit(); // first commit
-        assert_eq!(sd.history.len(), 1);
-        // A second update_ps without a new update_battery must NOT commit.
-        time.set(2);
         sd.update_ps(ps_reading(13.0, 2.0));
-        sd.try_commit();
-        assert_eq!(sd.history.len(), 1);
         sd.update_battery(bat_reading(13.0, 1.0));
-        sd.try_commit(); // second commit
+        sd.tick();
+        assert_eq!(sd.history.len(), 1);
+
+        // Next tick produces exactly one more row — whatever the latest
+        // readings are — not a backlog of the earlier updates.
+        time.set(2);
+        sd.tick();
         assert_eq!(sd.history.len(), 2);
     }
 
@@ -512,12 +536,12 @@ mod tests {
         let mut sd = SensorData::new(NoClock);
         sd.update_ps(ps_reading(13.0, 2.0));
         sd.update_battery(bat_reading(13.0, 1.5));
-        sd.try_commit();
+        sd.tick();
         assert!(sd.history.is_empty());
         assert!(sd.last_save_s.is_none());
         // Latest readings must still be visible to HTTP/LCD before NTP sync.
-        assert!((sd.battery_reading.unwrap().current - 1.5).abs() < 0.001);
-        assert!((sd.ps_reading.unwrap().current - 2.0).abs() < 0.001);
+        assert!((sd.battery_reading().unwrap().current - 1.5).abs() < 0.001);
+        assert!((sd.ps_reading().unwrap().current - 2.0).abs() < 0.001);
     }
 
     #[test]
@@ -840,7 +864,7 @@ mod tests {
         for _ in 0..100 {
             sd.update_ps(ps_reading(13.0, 2.0));
             sd.update_battery(bat_reading(13.0, 1.0));
-            sd.try_commit();
+            sd.tick();
         }
         assert!(sd.history.is_empty(), "no samples before NTP sync");
         assert!(
@@ -1070,5 +1094,98 @@ mod tests {
         assert_eq!(sd.history.len(), CAP - 1);
         assert_eq!(sd.interval, MAX_INTERVAL);
         assert!(sd.history[0].time_s > first_after_compact);
+    }
+
+    // --- Producer-independence (F1): a dead sensor must not halt history ---
+
+    #[test]
+    fn battery_only_still_commits_with_ps_zeros() {
+        // XY thread never publishes. Battery keeps flowing. History must
+        // still grow — the ps_current / power_online fields report 0.
+        let (time, mut sd) = new_sd();
+        for i in 0..10u32 {
+            time.set(100 + i);
+            sd.update_battery(bat_reading(13.0, 1.5));
+            sd.tick();
+        }
+        assert_eq!(sd.history.len(), 10, "battery-only ticks must still commit");
+        for s in sd.history() {
+            assert!((s.battery_current - 1.5).abs() < 0.001);
+            assert!(s.ps_current.abs() < 0.001, "no PS reading → 0 A");
+            assert!(s.power_online.abs() < 0.001, "no PS reading → offline");
+        }
+    }
+
+    #[test]
+    fn ps_goes_stale_after_threshold() {
+        // PS updates once, then stops. Within STALE_TICKS the reading is
+        // still visible and the sample carries the last-known ps_current.
+        // Past STALE_TICKS the getter returns None and samples fall back to
+        // zeros — surfacing the stuck producer on the dashboard / history.
+        let (time, mut sd) = new_sd();
+        time.set(1000);
+        sd.update_battery(bat_reading(13.0, 1.0));
+        sd.update_ps(ps_reading(13.0, 2.5));
+        sd.tick();
+        // First tick increments ps_ticks_stale from 0 to 1 before the commit,
+        // so we've already "used" one unit of the budget.
+        assert_eq!(sd.history.len(), 1);
+        assert!((sd.history[0].ps_current - 2.5).abs() < 0.001);
+        assert!((sd.history[0].power_online - 1.0).abs() < 0.001);
+        assert!(sd.ps_reading().is_some());
+
+        // Keep battery live, don't touch PS, run up to the boundary: one
+        // tick past the first takes stale to 2, ..., STALE_TICKS-1 more
+        // ticks take it to STALE_TICKS (still fresh).
+        for i in 1..STALE_TICKS {
+            time.set(1000 + i);
+            sd.update_battery(bat_reading(13.0, 1.0));
+            sd.tick();
+        }
+        assert!(sd.ps_reading().is_some(), "PS still fresh at STALE_TICKS");
+        let last_fresh = sd.history.last().unwrap();
+        assert!((last_fresh.ps_current - 2.5).abs() < 0.001);
+
+        // One more tick past the boundary: PS reported stale, sample zeros.
+        time.set(1000 + STALE_TICKS);
+        sd.update_battery(bat_reading(13.0, 1.0));
+        sd.tick();
+        assert!(sd.ps_reading().is_none(), "PS should be stale now");
+        let latest = sd.history.last().unwrap();
+        assert!(latest.ps_current.abs() < 0.001);
+        assert!(latest.power_online.abs() < 0.001);
+    }
+
+    #[test]
+    fn battery_stale_commits_zeros() {
+        // Symmetry: a stale battery contributes zeros too (not a commit
+        // skip). Timeline stays continuous so a dead INA shows as flat-line
+        // zero on the dashboard rather than frozen last-known values.
+        let (time, mut sd) = new_sd();
+        time.set(2000);
+        sd.update_battery(bat_reading(13.0, 1.0));
+        sd.update_ps(ps_reading(13.0, 2.0));
+        sd.tick();
+        assert_eq!(sd.history.len(), 1);
+        assert!((sd.history[0].voltage - 13.0).abs() < 0.001);
+
+        // Run long enough for battery to go stale; keep PS fresh.
+        let ticks = STALE_TICKS + 3;
+        for i in 1..=ticks {
+            time.set(2000 + i);
+            sd.update_ps(ps_reading(13.0, 2.0));
+            sd.tick();
+        }
+        assert_eq!(
+            sd.history.len(),
+            1 + ticks as usize,
+            "history must keep growing even with a dead battery sensor"
+        );
+        assert!(sd.battery_reading().is_none());
+        let latest = sd.history.last().unwrap();
+        assert!(latest.voltage.abs() < 0.001);
+        assert!(latest.battery_current.abs() < 0.001);
+        // PS side still fresh → still shows its reading.
+        assert!((latest.ps_current - 2.0).abs() < 0.001);
     }
 }

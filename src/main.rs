@@ -32,8 +32,12 @@ use crate::nvs_creds::WifiCredentials;
 /// initial DHCP/DNS at boot and brief link blips without flapping the SSID.
 const CAPTIVE_AFTER_FAILURES: u32 = 15;
 
-fn persist_history(state: &AppState) {
-    let payload = state.shared.sensor_data.lock().unwrap().take_save_payload();
+fn tick_and_persist(state: &AppState) {
+    let payload = {
+        let mut sd = state.shared.sensor_data.lock().unwrap();
+        sd.tick();
+        sd.take_save_payload()
+    };
     if let Some(bytes) = payload {
         state.history_store.save(&bytes);
     }
@@ -138,7 +142,7 @@ fn main() {
     loop {
         thread::sleep(Duration::from_secs(1));
 
-        persist_history(&state);
+        tick_and_persist(&state);
 
         if let Some(new) = drain_pending_creds(&mut state, &wifi) {
             creds = Some(new);
