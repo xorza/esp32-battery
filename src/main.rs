@@ -6,6 +6,7 @@ mod http;
 mod ina;
 #[cfg(feature = "lcd")]
 mod lcd;
+mod log_ring;
 mod nvs_creds;
 mod ota;
 mod platform;
@@ -72,6 +73,7 @@ fn start_sntp(flag: Arc<AtomicBool>) -> esp_idf_svc::sntp::EspSntp<'static> {
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log_ring::init();
 
     // Reboot on any thread panic. Without this, a panic in (e.g.) the INA thread
     // poisons the sensor_data mutex; subsequent HTTP / LCD handlers then panic on

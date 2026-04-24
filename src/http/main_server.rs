@@ -12,7 +12,8 @@ use log::{debug, warn};
 use esp32_battery_logic::battery;
 
 use crate::AppState;
-use crate::api::{ApiResponse, BatteryReading, HistoryRow, PsReading, RESPONSE_BUF_SIZE};
+use crate::api::{ApiResponse, BatteryReading, HeapInfo, HistoryRow, PsReading, RESPONSE_BUF_SIZE};
+use crate::log_ring;
 
 use super::{create_server, get_rssi, serve_common_assets, serve_static, text_response};
 
@@ -48,6 +49,7 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
                     rssi: get_rssi(),
                     voltage: bat.voltage,
                     power_online,
+                    heap: HeapInfo::new(),
                     battery: BatteryReading {
                         soc: battery::ocv_soc(bat.voltage),
                         current: bat.current,
@@ -90,6 +92,25 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
                 )
                 .map_err(|e| e.0)?;
             resp.write_all(&buf[..len]).map_err(|e| e.0)?;
+            Ok::<(), EspError>(())
+        })
+        .unwrap();
+
+    server
+        .fn_handler("/api/log", esp_idf_svc::http::Method::Get, move |req| {
+            let body = log_ring::snapshot();
+            let mut resp = req
+                .into_response(
+                    200,
+                    None,
+                    &[
+                        ("Content-Type", "text/plain; charset=utf-8"),
+                        ("Cache-Control", "no-store"),
+                        ("Connection", "close"),
+                    ],
+                )
+                .map_err(|e| e.0)?;
+            resp.write_all(&body).map_err(|e| e.0)?;
             Ok::<(), EspError>(())
         })
         .unwrap();

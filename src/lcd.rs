@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use esp32_battery_logic::data::HISTORY_CAPACITY;
+
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Point, Size};
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -475,7 +477,7 @@ pub fn start_lcd_thread(pins: LcdPins, state: Arc<AppState>) {
 
                 let (r1, r2, uptime_s, history, interval) = {
                     let sd = state.sensor_data.lock().unwrap();
-                    let hist: heapless::Vec<(u32, f32, f32, f32, f32), 144> = sd
+                    let hist: heapless::Vec<(u32, f32, f32, f32, f32), HISTORY_CAPACITY> = sd
                         .history()
                         .iter()
                         .map(|s| {

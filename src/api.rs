@@ -38,11 +38,31 @@ impl From<&Sample> for HistoryRow {
 }
 
 #[derive(Serialize)]
+pub struct HeapInfo {
+    /// Bytes currently free in the default heap.
+    pub free: u32,
+    /// Low-water mark of `free` since boot — useful to spot leaks/growth.
+    pub min_free: u32,
+}
+
+impl HeapInfo {
+    pub fn new() -> Self {
+        unsafe {
+            Self {
+                free: esp_idf_svc::sys::esp_get_free_heap_size(),
+                min_free: esp_idf_svc::sys::esp_get_minimum_free_heap_size(),
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub struct ApiResponse {
     pub uptime: u32,
     pub rssi: i32,
     pub voltage: f32,
     pub power_online: f32,
+    pub heap: HeapInfo,
     pub battery: BatteryReading,
     pub ps: PsReading,
     pub history: Vec<HistoryRow>,
