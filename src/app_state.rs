@@ -7,13 +7,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use esp_idf_svc::http::server::EspHttpServer;
+use log::{info, warn};
 
 use esp32_battery_logic::data::SensorData;
 
-use crate::dns::DnsHandle;
-use crate::nvs_creds::WifiCredentials;
 use crate::clock::EspClock;
+use crate::dns::DnsHandle;
 use crate::history_store::HistoryStore;
+use crate::nvs_creds::WifiCredentials;
 
 /// HTTP server held for `Drop`. Two shapes — captive portal pairs HTTP with
 /// a DNS hijack so the device's own SSID resolves; host mode is HTTPS only.
@@ -32,29 +33,11 @@ pub enum Server {
     },
 }
 
-impl Server {
-    pub fn kind(&self) -> ServerKind {
-        match self {
-            Server::Captive { .. } => ServerKind::Captive,
-            Server::Host { .. } => ServerKind::Host,
-        }
-    }
-}
-
-/// Three-state classifier for the active server: nothing yet, captive portal,
-/// or host dashboard. Used by the main loop to decide swaps without juggling
-/// `Option<bool>`.
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum ServerKind {
-    None,
-    Captive,
-    Host,
-}
-
-/// Cross-thread network status — what readers (LCD, etc.) should display.
-/// `Connecting` is a transient between Captive (user submitted creds) and
-/// Host (STA actually came up). The captive HTTP server is still running
-/// during `Connecting` so the user can resubmit if STA never connects.
+/// Cross-thread net status — what readers (LCD, etc.) should display.
+/// `Connecting` is a transient: STA has been started (boot with creds, or
+/// captive `/save` submission) but hasn't associated yet, OR was previously
+/// Host and dropped the link but is still inside the reconnect grace window.
+/// The currently-mounted server may not match the status during `Connecting`.
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NetStatus {
@@ -80,9 +63,6 @@ pub struct Shared {
     /// Set by the captive `/save` handler when fresh credentials land.
     /// Drained by the main loop, which then drives the live STA reconnect.
     pub pending_creds: Mutex<Option<WifiCredentials>>,
-    /// Cross-thread net status. Written only via `AppState::set_server`
-    /// and `AppState::set_status`; the field is private so callers can't
-    /// desync from the actual server.
     status: AtomicU8,
 }
 
@@ -95,9 +75,8 @@ impl Shared {
 pub struct AppState {
     pub shared: Arc<Shared>,
     pub history_store: HistoryStore,
-    /// Private — only `set_server` can write it, which keeps the
-    /// `Shared::captive_active` mirror in sync.
     server: Option<Server>,
+    reconnect_failures: u32,
 }
 
 impl AppState {
@@ -110,28 +89,59 @@ impl AppState {
             }),
             history_store,
             server: None,
+            reconnect_failures: 0,
         }
     }
 
-    pub fn server_kind(&self) -> ServerKind {
-        self.server.as_ref().map_or(ServerKind::None, Server::kind)
-    }
-
-    /// Single write path for `server`. The status mirror tracks the new
-    /// server's variant — but `set_status(Connecting)` may immediately
-    /// overwrite to surface the post-creds-submit transient.
-    pub fn set_server(&mut self, new: Option<Server>) {
-        let status = match new {
-            Some(Server::Captive { .. }) => NetStatus::Captive,
-            Some(Server::Host { .. }) => NetStatus::Host,
-            None => NetStatus::Captive,
+    /// Drop the previous server (releasing its resources) and install the new
+    /// one. Mirrors the variant into `Shared::status` so cross-thread readers
+    /// see the same mode the main thread does.
+    pub fn replace_server(&mut self, new: Server) {
+        let status = match &new {
+            Server::Captive { .. } => NetStatus::Captive,
+            Server::Host { .. } => NetStatus::Host,
         };
         self.set_status(status);
-        self.server = new;
+        self.server = Some(new);
     }
 
     pub fn set_status(&self, status: NetStatus) {
         self.shared.status.store(status as u8, Ordering::Relaxed);
+    }
+
+    pub fn reset_reconnect_failures(&mut self) {
+        self.reconnect_failures = 0;
+    }
+
+    /// Increment and return the new count. Saturates so a permanently-down
+    /// link can't wrap around and re-enter the grace window.
+    pub fn bump_reconnect_failures(&mut self) -> u32 {
+        self.reconnect_failures = self.reconnect_failures.saturating_add(1);
+        self.reconnect_failures
+    }
+
+    /// Idempotent: keep the active server as Host. If we're already there,
+    /// just clear any leftover `Connecting` status from a grace-window blip.
+    /// Otherwise build the new server and swap it in.
+    pub fn ensure_host(&mut self, build: impl FnOnce() -> EspHttpServer<'static>) {
+        if matches!(self.server, Some(Server::Host { .. })) {
+            self.set_status(NetStatus::Host);
+        } else {
+            info!("WiFi connected, starting main server");
+            self.replace_server(Server::Host { http: build() });
+        }
+    }
+
+    /// Idempotent: keep the active server as Captive, building it if needed.
+    pub fn ensure_captive(
+        &mut self,
+        build: impl FnOnce() -> (EspHttpServer<'static>, DnsHandle),
+    ) {
+        if !matches!(self.server, Some(Server::Captive { .. })) {
+            warn!("WiFi disconnected, starting captive portal");
+            let (http, dns) = build();
+            self.replace_server(Server::Captive { http, dns });
+        }
     }
 }
 

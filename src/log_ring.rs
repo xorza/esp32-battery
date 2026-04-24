@@ -17,7 +17,10 @@ use std::ffi::c_char;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use esp_idf_hal::io::Write;
+use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::sys;
+use esp_idf_svc::sys::EspError;
 
 unsafe extern "C" {
     fn vsnprintf(s: *mut c_char, n: usize, fmt: *const c_char, args: sys::va_list) -> i32;
@@ -94,7 +97,10 @@ static PREV_VPRINTF: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 pub fn init() {
     *RING.lock().unwrap() = Some(Ring::new());
     let prev = unsafe { sys::esp_log_set_vprintf(Some(vprintf_hook)) };
-    PREV_VPRINTF.store(prev.map_or(std::ptr::null_mut(), |f| f as *mut ()), Ordering::Relaxed);
+    PREV_VPRINTF.store(
+        prev.map_or(std::ptr::null_mut(), |f| f as *mut ()),
+        Ordering::Relaxed,
+    );
 }
 
 /// Copy the current ring contents into a fresh Vec (oldest byte first).
@@ -103,6 +109,27 @@ pub fn snapshot() -> Vec<u8> {
         .ok()
         .and_then(|g| g.as_ref().map(Ring::snapshot))
         .unwrap_or_default()
+}
+
+pub fn register(server: &mut EspHttpServer<'static>) {
+    server
+        .fn_handler("/api/log", esp_idf_svc::http::Method::Get, |req| {
+            let body = snapshot();
+            let mut resp = req
+                .into_response(
+                    200,
+                    None,
+                    &[
+                        ("Content-Type", "text/plain; charset=utf-8"),
+                        ("Cache-Control", "no-store"),
+                        ("Connection", "close"),
+                    ],
+                )
+                .map_err(|e| e.0)?;
+            resp.write_all(&body).map_err(|e| e.0)?;
+            Ok::<(), EspError>(())
+        })
+        .unwrap();
 }
 
 unsafe extern "C" fn vprintf_hook(fmt: *const c_char, args: sys::va_list) -> i32 {

@@ -21,7 +21,7 @@ const SERVER_CERT: X509<'static> =
     X509::pem_until_nul(include_bytes!("../../certs/selfsigned.crt"));
 const SERVER_KEY: X509<'static> = X509::pem_until_nul(include_bytes!("../../certs/selfsigned.key"));
 
-fn create_server(
+pub(crate) fn create_server(
     stack_size: usize,
     wildcard: bool,
     max_sockets: usize,
@@ -55,7 +55,7 @@ fn create_server(
     .unwrap()
 }
 
-fn serve_static(
+pub(crate) fn serve_static(
     server: &mut EspHttpServer<'static>,
     path: &str,
     content_type: &'static str,
@@ -86,7 +86,7 @@ fn serve_static(
         .unwrap();
 }
 
-fn serve_common_assets(server: &mut EspHttpServer<'static>) {
+pub(crate) fn serve_common_assets(server: &mut EspHttpServer<'static>) {
     serve_static(
         server,
         "/style.css",
@@ -105,17 +105,8 @@ fn serve_common_assets(server: &mut EspHttpServer<'static>) {
     );
 }
 
-fn get_rssi() -> i32 {
-    let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
-    if unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) } == 0 {
-        ap_info.rssi as i32
-    } else {
-        0
-    }
-}
-
 /// Send a `Connection: close` plaintext response with the given status and body.
-fn text_response(
+pub(crate) fn text_response(
     req: Request<&mut EspHttpConnection>,
     status: u16,
     body: &[u8],
