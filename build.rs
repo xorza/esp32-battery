@@ -2,8 +2,8 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 
 const WEB_ASSETS: &[&str] = &[
     "src/index.html",
@@ -42,23 +42,27 @@ fn write_ota_key() {
     println!("cargo:rerun-if-changed={}", env_path.display());
     println!("cargo:rerun-if-env-changed=OTA_KEY");
 
-    let hex = std::env::var("OTA_KEY").ok().or_else(|| {
-        let contents = fs::read_to_string(&env_path).ok()?;
-        contents.lines().find_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let (k, v) = line.split_once('=')?;
-            (k.trim() == "OTA_KEY").then(|| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+    let hex = std::env::var("OTA_KEY")
+        .ok()
+        .or_else(|| {
+            let contents = fs::read_to_string(&env_path).ok()?;
+            contents.lines().find_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let (k, v) = line.split_once('=')?;
+                (k.trim() == "OTA_KEY")
+                    .then(|| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+            })
         })
-    }).expect("OTA_KEY not set (env var or .env file)");
+        .expect("OTA_KEY not set (env var or .env file)");
 
     assert_eq!(hex.len(), 64, "OTA_KEY must be 64 hex chars (32 bytes)");
     let mut bytes = [0u8; 32];
     for i in 0..32 {
-        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .expect("OTA_KEY must be valid hex");
+        bytes[i] =
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("OTA_KEY must be valid hex");
     }
 
     let out_path = Path::new(&out_dir).join("ota_key.bin");

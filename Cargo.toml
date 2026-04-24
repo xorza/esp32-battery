@@ -22,6 +22,7 @@ default = ["esp32c6", "lcd"]
 esp32c3 = []
 esp32c6 = []
 lcd = ["mipidsi", "embedded-graphics"]
+ina-fake = []
 
 [dependencies]
 esp32-battery-logic = { path = "logic" }

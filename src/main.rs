@@ -10,6 +10,7 @@ mod nvs_creds;
 mod ota;
 mod platform;
 mod wifi;
+mod xy;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -90,6 +91,8 @@ fn main() {
 
     let sensor_data = esp32_battery_logic::data::SensorData::new(esp_platform);
     let state = AppState::new(ntp_synced, sensor_data);
+
+    xy::start(board.xy, state.clone());
 
     ina::start_measurement_thread(board.i2c.init_bus(), state.clone());
 

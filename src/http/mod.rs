@@ -8,14 +8,17 @@ mod main_server;
 use std::time::Duration;
 
 use esp_idf_hal::io::Write;
-use esp_idf_svc::http::server::{Configuration as HttpConfig, EspHttpConnection, EspHttpServer, Request};
+use esp_idf_svc::http::server::{
+    Configuration as HttpConfig, EspHttpConnection, EspHttpServer, Request,
+};
 use esp_idf_svc::sys::EspError;
 use esp_idf_svc::tls::X509;
 
 pub use captive::start as start_captive;
 pub use main_server::start as start_main;
 
-const SERVER_CERT: X509<'static> = X509::pem_until_nul(include_bytes!("../../certs/selfsigned.crt"));
+const SERVER_CERT: X509<'static> =
+    X509::pem_until_nul(include_bytes!("../../certs/selfsigned.crt"));
 const SERVER_KEY: X509<'static> = X509::pem_until_nul(include_bytes!("../../certs/selfsigned.key"));
 
 fn create_server(

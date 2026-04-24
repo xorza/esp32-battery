@@ -9,11 +9,14 @@ use esp32_battery_logic::data::Ina228Reading;
 use crate::AppState;
 
 const I2C_SPEED_HZ: u32 = 400_000;
+const BATTERY_INA_ADDR: u8 = 0x40;
 
 const SHUNT_RESISTANCE_OHM: f32 = 0.002;
 const MAX_CURRENT_A: f32 = 15.0;
 const SAMPLES_PER_UPDATE: u32 = 10;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(feature = "ina-fake")]
 const FAKE_READING: Ina228Reading = Ina228Reading {
     voltage: 0.0,
     current: 0.0,
@@ -64,7 +67,7 @@ fn init_ina(dev: I2cDev, addr: u8) -> Option<ina228::Ina228<I2cDev>> {
     if ina.reset().is_ok() && ina.calibrate(MAX_CURRENT_A, SHUNT_RESISTANCE_OHM).is_ok() {
         Some(ina)
     } else {
-        log::warn!("INA228 at 0x{:02x} not found, using fake data", addr);
+        log::warn!("INA228 at 0x{:02x} not found", addr);
         None
     }
 }
@@ -82,21 +85,21 @@ fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Option<Ina228Reading> {
     })
 }
 
-pub fn start_measurement_thread(
-    i2c_bus: &'static I2cBusDriver<'static>,
-    state: Arc<AppState>,
-) {
+pub fn start_measurement_thread(i2c_bus: &'static I2cBusDriver<'static>, state: Arc<AppState>) {
     thread::Builder::new()
         .stack_size(4096)
         .spawn(move || {
             let dev_config = DeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
 
-            let mut battery_ina = I2cDriver::new(i2c_bus, 0x40, &dev_config)
+            let mut battery_ina = I2cDriver::new(i2c_bus, BATTERY_INA_ADDR, &dev_config)
                 .ok()
-                .and_then(|dev| init_ina(dev, 0x40));
-            let mut ps_ina = I2cDriver::new(i2c_bus, 0x41, &dev_config)
-                .ok()
-                .and_then(|dev| init_ina(dev, 0x41));
+                .and_then(|dev| init_ina(dev, BATTERY_INA_ADDR));
+
+            #[cfg(not(feature = "ina-fake"))]
+            assert!(
+                battery_ina.is_some(),
+                "battery INA228 at 0x{BATTERY_INA_ADDR:02x} did not initialize — enable `ina-fake` to run without sensor"
+            );
 
             // Track the battery charge register's swing since boot. Seeded on the first
             // valid reading (not f64::MIN/MAX) so a single spurious sample can't poison
@@ -105,7 +108,6 @@ pub fn start_measurement_thread(
 
             loop {
                 let mut bat_acc = ReadingAccum::default();
-                let mut ps_acc = ReadingAccum::default();
                 let mut count: u32 = 0;
                 let mut read_total: u32 = 0;
                 let mut read_failures: u32 = 0;
@@ -113,14 +115,11 @@ pub fn start_measurement_thread(
                 while count < SAMPLES_PER_UPDATE {
                     thread::sleep(SAMPLE_INTERVAL);
 
-                    // Both must succeed — if either fails, discard the pair and retry.
-                    let bat_r = battery_ina.as_mut().map_or(Some(FAKE_READING), read_ina);
-                    let ps_r = ps_ina.as_mut().map_or(Some(FAKE_READING), read_ina);
+                    let bat_r = read_battery(battery_ina.as_mut());
                     read_total += 1;
 
-                    if let (Some(bat_r), Some(ps_r)) = (bat_r, ps_r) {
+                    if let Some(bat_r) = bat_r {
                         bat_acc.add(&bat_r);
-                        ps_acc.add(&ps_r);
                         count += 1;
                     } else {
                         read_failures += 1;
@@ -133,9 +132,11 @@ pub fn start_measurement_thread(
                 charge_bounds = Some((min_c, max_c));
                 let charge_range = max_c - min_c;
 
+                let ps = *state.ps_latest.lock().unwrap();
+
                 state.sensor_data.lock().unwrap().update(
                     bat_acc.average(SAMPLES_PER_UPDATE),
-                    ps_acc.average(SAMPLES_PER_UPDATE),
+                    ps,
                     read_total,
                     read_failures,
                     charge_range,
@@ -143,4 +144,17 @@ pub fn start_measurement_thread(
             }
         })
         .unwrap();
+}
+
+#[cfg(feature = "ina-fake")]
+fn read_battery(ina: Option<&mut ina228::Ina228<I2cDev>>) -> Option<Ina228Reading> {
+    match ina {
+        Some(ina) => read_ina(ina),
+        None => Some(FAKE_READING),
+    }
+}
+
+#[cfg(not(feature = "ina-fake"))]
+fn read_battery(ina: Option<&mut ina228::Ina228<I2cDev>>) -> Option<Ina228Reading> {
+    read_ina(ina.expect("battery INA required when ina-fake feature is disabled"))
 }

@@ -47,6 +47,11 @@ AI coding rules for Rust projects:
 - Avoid editing root `README.md` unless asked; update `NOTES-AI.md` instead.
 - Add `README.md` to folders that benefit from human-readable docs (crates, examples, benchmarks, complex modules).
 
+## Flashing / Serial monitor
+
+- Flash: `MCU=esp32c6 ./flash.sh` — uses `espflash flash --monitor --non-interactive`, so boot logs stream to stdout without needing a TTY. Interrupt with Ctrl-C or a `timeout` wrapper.
+- Monitor only (no flash): `espflash monitor --non-interactive --port /dev/ttyACM0`.
+
 ## Optimization Workflow
 
 - Before optimizing, always run or create a relevant benchmark and save the baseline results.

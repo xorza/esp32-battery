@@ -263,9 +263,7 @@ fn draw_graph(
     let t0 = history[0].0 as f32;
     let t1 = history[n - 1].0 as f32;
     let t_range = (t1 - t0).max(1.0);
-    let time_to_x = |t: u32| -> i32 {
-        ((t as f32 - t0) / t_range * (GRAPH_W as f32 - 1.0)) as i32
-    };
+    let time_to_x = |t: u32| -> i32 { ((t as f32 - t0) / t_range * (GRAPH_W as f32 - 1.0)) as i32 };
 
     // Power-offline shading (drawn first so grid/labels render on top)
     // Build a per-column flag array, then fill once.

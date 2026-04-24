@@ -1,4 +1,4 @@
-const FORMAT_VERSION: u32 = 5;
+const FORMAT_VERSION: u32 = 6;
 const HEADER_SIZE: usize = 4 + 4 + 4; // version + interval + count
 const SAMPLE_SIZE: usize = 4 + 4 * 4 + 8; // u32 + 4×f32 + f64(max_charge) = 28 bytes
 const POWER_ONLINE_THRESHOLD: f32 = 0.1;
@@ -31,6 +31,14 @@ pub struct Ina228Reading {
     pub current: f32,
     pub power: f32,
     pub charge: f64,
+}
+
+/// Power-supply reading sourced from the XY7025 Modbus client (no charge register).
+#[derive(Clone, Copy, Default)]
+pub struct PsReading {
+    pub voltage: f32,
+    pub current: f32,
+    pub power: f32,
 }
 
 /// A single timestamped data point for charting (both sensors).
@@ -84,7 +92,7 @@ impl SampleAccum {
 /// exponentially growing time coverage in fixed memory (~4 KB).
 pub struct SensorData<P: Platform> {
     pub battery_reading: Ina228Reading,
-    pub ps_reading: Ina228Reading,
+    pub ps_reading: PsReading,
     pub read_total: u32,
     pub read_failures: u32,
     pub power_online: f32,
@@ -164,7 +172,7 @@ impl<P: Platform> SensorData<P> {
     pub fn new(platform: P) -> Self {
         Self {
             battery_reading: Ina228Reading::default(),
-            ps_reading: Ina228Reading::default(),
+            ps_reading: PsReading::default(),
             read_total: 0,
             read_failures: 0,
             power_online: 0.0,
@@ -181,8 +189,8 @@ impl<P: Platform> SensorData<P> {
 
     pub fn update(
         &mut self,
-        s1: Ina228Reading,
-        s2: Ina228Reading,
+        bat: Ina228Reading,
+        ps: PsReading,
         read_total: u32,
         read_failures: u32,
         max_charge: f64,
@@ -207,22 +215,22 @@ impl<P: Platform> SensorData<P> {
             self.last_save_s = time_s;
         }
 
-        let power_online = if s2.current.abs() > POWER_ONLINE_THRESHOLD {
+        let power_online = if ps.current.abs() > POWER_ONLINE_THRESHOLD {
             1.0
         } else {
             0.0
         };
         let sample = Sample {
             time_s,
-            voltage: (s1.voltage + s2.voltage) / 2.0,
-            battery_current: s1.current,
-            ps_current: s2.current,
+            voltage: bat.voltage,
+            battery_current: bat.current,
+            ps_current: ps.current,
             power_online,
             max_charge,
         };
 
-        self.battery_reading = s1;
-        self.ps_reading = s2;
+        self.battery_reading = bat;
+        self.ps_reading = ps;
         self.power_online = power_online;
 
         self.acc.add(&sample);
@@ -412,7 +420,7 @@ mod tests {
         (time, SensorData::new(platform))
     }
 
-    fn reading(voltage: f32, current: f32) -> Ina228Reading {
+    fn bat_reading(voltage: f32, current: f32) -> Ina228Reading {
         Ina228Reading {
             voltage,
             current,
@@ -430,16 +438,24 @@ mod tests {
         }
     }
 
-    /// Shorthand: update with two readings, no errors, no charge.
-    fn update(sd: &mut SensorData<TestPlatform>, s1: Ina228Reading, s2: Ina228Reading) {
-        sd.update(s1, s2, 0, 0, 0.0);
+    fn ps_reading(voltage: f32, current: f32) -> PsReading {
+        PsReading {
+            voltage,
+            current,
+            power: voltage * current,
+        }
+    }
+
+    /// Shorthand: update with battery + PS readings, no errors, no charge.
+    fn update(sd: &mut SensorData<TestPlatform>, bat: Ina228Reading, p: PsReading) {
+        sd.update(bat, p, 0, 0, 0.0);
     }
 
     /// Push n uniform samples (v=13, c1=1, c2=2). Returns the next time_s value.
     fn fill(sd: &mut SensorData<TestPlatform>, n: u32, start_t: u32, time: &Clock) -> u32 {
         for i in 0..n {
             time.set(start_t + i);
-            update(sd, reading(13.0, 1.0), reading(13.0, 2.0));
+            update(sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         }
         start_t + n
     }
@@ -457,7 +473,7 @@ mod tests {
     fn single_update() {
         let (time, mut sd) = new_sd();
         time.set(100);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
 
         assert_eq!(sd.history.len(), 1);
         let s = &sd.history[0];
@@ -469,18 +485,18 @@ mod tests {
     }
 
     #[test]
-    fn voltage_is_average_of_both_sensors() {
+    fn voltage_from_battery_only() {
         let (_time, mut sd) = new_sd();
-        // voltage = avg(12.0, 14.0) = 13.0
-        update(&mut sd, reading(12.0, 1.0), reading(14.0, 2.0));
-        assert!((sd.history[0].voltage - 13.0).abs() < 0.001);
+        // Voltage now comes solely from the battery INA — PS voltage is ignored.
+        update(&mut sd, bat_reading(12.0, 1.0), ps_reading(14.0, 2.0));
+        assert!((sd.history[0].voltage - 12.0).abs() < 0.001);
     }
 
     #[test]
     fn last_readings_updated() {
         let (time, mut sd) = new_sd();
         time.set(10);
-        update(&mut sd, reading(13.0, 1.5), reading(13.1, 2.5));
+        update(&mut sd, bat_reading(13.0, 1.5), ps_reading(13.1, 2.5));
         assert!((sd.battery_reading.current - 1.5).abs() < 0.001);
         assert!((sd.ps_reading.current - 2.5).abs() < 0.001);
     }
@@ -490,7 +506,7 @@ mod tests {
         let (time, mut sd) = new_sd();
         for i in 0..10u32 {
             time.set(i);
-            update(&mut sd, reading(13.0, i as f32), reading(13.0, 0.0));
+            update(&mut sd, bat_reading(13.0, i as f32), ps_reading(13.0, 0.0));
         }
         let h = sd.history();
         assert_eq!(h.len(), 10);
@@ -513,7 +529,7 @@ mod tests {
             }
         }
         let mut sd = SensorData::new(NoTimePlatform);
-        sd.update(reading(13.0, 1.0), reading(13.0, 2.0), 0, 0, 0.0);
+        sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 0, 0, 0.0);
         assert!(sd.history.is_empty());
         assert!(!sd.loaded);
     }
@@ -528,36 +544,36 @@ mod tests {
     // --- Charge tracking ---
 
     #[test]
-    fn charge_stored_on_last_reading() {
+    fn charge_stored_on_last_bat_reading() {
         let (_time, mut sd) = new_sd();
         sd.update(
             reading_with_charge(13.0, 1.0, 1.234),
-            reading_with_charge(13.0, 2.0, 5.678),
+            ps_reading(13.0, 2.0),
             0,
             0,
             0.0,
         );
         assert!((sd.battery_reading.charge - 1.234).abs() < 0.0001);
-        assert!((sd.ps_reading.charge - 5.678).abs() < 0.0001);
     }
 
     #[test]
     fn max_charge_tracked() {
         let (time, mut sd) = new_sd();
-        let s = reading(13.0, 0.0);
+        let bat = bat_reading(13.0, 0.0);
+        let p = ps_reading(13.0, 0.0);
 
         // max_charge=5.0 → stored on sample
-        sd.update(s, s, 0, 0, 5.0);
+        sd.update(bat, p, 0, 0, 5.0);
         assert!((sd.history[0].max_charge - 5.0).abs() < 0.0001);
 
         // max_charge=10.0 → new max
         time.set(1);
-        sd.update(s, s, 0, 0, 10.0);
+        sd.update(bat, p, 0, 0, 10.0);
         assert!((sd.history[1].max_charge - 10.0).abs() < 0.0001);
 
         // max_charge=3.0 → stored as-is on this sample
         time.set(2);
-        sd.update(s, s, 0, 0, 3.0);
+        sd.update(bat, p, 0, 0, 3.0);
         assert!((sd.history[2].max_charge - 3.0).abs() < 0.0001);
         // Overall max across history is still 10.0
         let max = sd.history.iter().map(|s| s.max_charge).fold(0.0_f64, f64::max);
@@ -570,22 +586,22 @@ mod tests {
     fn power_online_threshold() {
         // Above threshold: s2.current = 2.0 > 0.01 → 1.0
         let (_time, mut sd) = new_sd();
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert!((sd.history[0].power_online - 1.0).abs() < 0.001);
 
         // Below threshold: s2.current = 0.005 < 0.01 → 0.0
         let (_time, mut sd) = new_sd();
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 0.005));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 0.005));
         assert!(sd.history[0].power_online.abs() < 0.001);
 
         // Exactly zero: → 0.0
         let (_time, mut sd) = new_sd();
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 0.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 0.0));
         assert!(sd.history[0].power_online.abs() < 0.001);
 
         // Negative current: s2.current = -0.5 → abs > threshold → 1.0
         let (_time, mut sd) = new_sd();
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, -0.5));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, -0.5));
         assert!((sd.history[0].power_online - 1.0).abs() < 0.001);
     }
 
@@ -596,7 +612,7 @@ mod tests {
         for i in 0..(CAP as u32 + 1) {
             time.set(i);
             let c2 = if i % 2 == 0 { 2.0 } else { 0.0 };
-            update(&mut sd, reading(13.0, 1.0), reading(13.0, c2));
+            update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, c2));
         }
         assert_eq!(sd.interval, 2);
         // Each compacted pair averages one online (1.0) and one offline (0.0) → 0.5
@@ -608,9 +624,9 @@ mod tests {
     #[test]
     fn power_online_roundtrips_through_persistence() {
         let (time, mut sd) = new_sd();
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0)); // online
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0)); // online
         time.set(1);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 0.0)); // offline
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 0.0)); // offline
         let len = sd.write();
 
         let (_time2, mut sd2) = new_sd();
@@ -646,9 +662,9 @@ mod tests {
         for i in 0..(CAP as u32 + 1) {
             time.set(i * 10);
             if i % 2 == 0 {
-                update(&mut sd, reading(12.0, 1.0), reading(12.0, 2.0));
+                update(&mut sd, bat_reading(12.0, 1.0), ps_reading(12.0, 2.0));
             } else {
-                update(&mut sd, reading(14.0, 3.0), reading(14.0, 4.0));
+                update(&mut sd, bat_reading(14.0, 3.0), ps_reading(14.0, 4.0));
             }
         }
         assert_eq!(sd.history.len(), HALF + 1);
@@ -675,12 +691,12 @@ mod tests {
 
         // Next raw update: acc_count=1, not yet interval=2
         time.set(t);
-        update(&mut sd, reading(13.0, 5.0), reading(13.0, 0.0));
+        update(&mut sd, bat_reading(13.0, 5.0), ps_reading(13.0, 0.0));
         assert_eq!(sd.history.len(), HALF + 1); // not yet pushed
 
         // Second raw update: acc_count=2 >= interval=2, push averaged
         time.set(t + 1);
-        update(&mut sd, reading(13.0, 7.0), reading(13.0, 0.0));
+        update(&mut sd, bat_reading(13.0, 7.0), ps_reading(13.0, 0.0));
         assert_eq!(sd.history.len(), HALF + 2);
         // Averaged: battery_current = (5+7)/2 = 6
         let last = sd.history.last().unwrap();
@@ -827,7 +843,7 @@ mod tests {
         let (time, mut sd) = new_sd();
         for i in 0..10u32 {
             time.set(1000 + i);
-            sd.update(reading(13.0, 1.0), reading(13.0, 2.0), 0, 0, 42.0);
+            sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 0, 0, 42.0);
         }
         let len = sd.write();
 
@@ -862,12 +878,12 @@ mod tests {
         // With interval=2, first raw update should NOT push a new sample
         let base_len = sd2.history.len();
         time2.set(5000);
-        update(&mut sd2, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert_eq!(sd2.history.len(), base_len);
 
         // Second raw update pushes averaged sample
         time2.set(5001);
-        update(&mut sd2, reading(13.0, 3.0), reading(13.0, 4.0));
+        update(&mut sd2, bat_reading(13.0, 3.0), ps_reading(13.0, 4.0));
         assert_eq!(sd2.history.len(), base_len + 1);
         // battery_current = (1+3)/2 = 2.0
         assert!((sd2.history.last().unwrap().battery_current - 2.0).abs() < 0.01);
@@ -877,10 +893,10 @@ mod tests {
     fn save_does_not_panic_on_time_jump_backward() {
         let (time, mut sd) = new_sd();
         time.set(2000);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         // Time jumps backward (NTP correction)
         time.set(1500);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         // Should not panic — saturating_sub yields 0, no save triggered
     }
 
@@ -899,12 +915,12 @@ mod tests {
         let (time, mut sd) = new_sd();
         for i in 0..10u32 {
             time.set(1000 + i);
-            sd.update(reading(13.0, 1.0), reading(13.0, 2.0), 0, 0, 5.0);
+            sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 0, 0, 5.0);
         }
 
         let (time2, mut sd2) = sd_with_blob(&mut sd);
         time2.set(1009);
-        update(&mut sd2, reading(14.0, 3.0), reading(14.0, 4.0));
+        update(&mut sd2, bat_reading(14.0, 3.0), ps_reading(14.0, 4.0));
 
         // 10 restored + 1 new = 11
         assert_eq!(sd2.history.len(), 11);
@@ -927,7 +943,7 @@ mod tests {
 
         let (time2, mut sd2) = sd_with_blob(&mut sd);
         time2.set(5000);
-        update(&mut sd2, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
 
         assert_eq!(sd2.history.len(), 101);
         assert_eq!(sd2.history[0].time_s, 1000);
@@ -941,7 +957,7 @@ mod tests {
         let mut sd = SensorData::new(platform);
 
         time.set(1000);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
 
         assert_eq!(sd.history.len(), 1);
         assert_eq!(sd.history[0].time_s, 1000);
@@ -952,7 +968,7 @@ mod tests {
     fn loads_only_once() {
         let (time, mut sd) = new_sd();
         time.set(1000);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert_eq!(sd.history.len(), 1);
 
         // Store a blob after the first update — should NOT be loaded again
@@ -962,7 +978,7 @@ mod tests {
         sd.platform.save_blob(&sd_src.buf[..len]);
 
         time.set(1001);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert_eq!(sd.history.len(), 2); // not 10+2
     }
 
@@ -970,7 +986,7 @@ mod tests {
     fn no_blob_skips_load_gracefully() {
         let (time, mut sd) = new_sd();
         time.set(1000);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert_eq!(sd.history.len(), 1);
         assert!(sd.loaded);
     }
@@ -981,15 +997,15 @@ mod tests {
     fn saves_after_interval() {
         let (time, mut sd) = new_sd();
         time.set(1000);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert!(!sd.platform.has_blob());
 
         time.set(1000 + SAVE_INTERVAL_S - 1);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert!(!sd.platform.has_blob());
 
         time.set(1000 + SAVE_INTERVAL_S);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert!(sd.platform.take_blob().unwrap().len() > HEADER_SIZE);
     }
 
@@ -1001,15 +1017,15 @@ mod tests {
         let (time2, mut sd2) = sd_with_blob(&mut sd);
         // Load happens at t=1009 → last_save_s = 1009
         time2.set(1009);
-        update(&mut sd2, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         sd2.platform.clear_blob();
 
         time2.set(1009 + SAVE_INTERVAL_S - 1);
-        update(&mut sd2, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert!(!sd2.platform.has_blob());
 
         time2.set(1009 + SAVE_INTERVAL_S);
-        update(&mut sd2, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert!(sd2.platform.has_blob());
     }
 
@@ -1018,12 +1034,12 @@ mod tests {
         let (time, mut sd) = new_sd();
         fill(&mut sd, 100, 1000, &time);
         time.set(1100);
-        update(&mut sd, reading(12.0, 1.0), reading(12.0, 2.0));
+        update(&mut sd, bat_reading(12.0, 1.0), ps_reading(12.0, 2.0));
         time.set(1101);
-        update(&mut sd, reading(14.0, 3.0), reading(14.0, 4.0));
+        update(&mut sd, bat_reading(14.0, 3.0), ps_reading(14.0, 4.0));
         // Trigger save
         time.set(1000 + SAVE_INTERVAL_S);
-        update(&mut sd, reading(15.0, 9.0), reading(15.0, 0.0));
+        update(&mut sd, bat_reading(15.0, 9.0), ps_reading(15.0, 0.0));
         let blob = sd.platform.take_blob().unwrap();
 
         let (_time2, mut sd2) = new_sd();
@@ -1041,20 +1057,20 @@ mod tests {
     fn saves_repeatedly() {
         let (time, mut sd) = new_sd();
         time.set(1000);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
 
         let t1 = 1000 + SAVE_INTERVAL_S;
         time.set(t1);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         let blob1 = sd.platform.take_blob().unwrap();
         sd.platform.clear_blob();
 
         time.set(t1 + SAVE_INTERVAL_S / 2);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert!(!sd.platform.has_blob());
 
         time.set(t1 + SAVE_INTERVAL_S);
-        update(&mut sd, reading(13.0, 1.0), reading(13.0, 2.0));
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         assert!(sd.platform.take_blob().unwrap().len() > blob1.len());
     }
 
@@ -1065,12 +1081,12 @@ mod tests {
 
         let (time2, mut sd2) = sd_with_blob(&mut sd);
         time2.set(1099);
-        update(&mut sd2, reading(14.0, 7.0), reading(14.0, 8.0));
+        update(&mut sd2, bat_reading(14.0, 7.0), ps_reading(14.0, 8.0));
         assert_eq!(sd2.history.len(), 101);
 
         let trigger_t = 1099 + SAVE_INTERVAL_S;
         time2.set(trigger_t);
-        update(&mut sd2, reading(13.0, 9.0), reading(13.0, 2.0));
+        update(&mut sd2, bat_reading(13.0, 9.0), ps_reading(13.0, 2.0));
         let blob = sd2.platform.take_blob().unwrap();
 
         let (_time3, mut sd3) = new_sd();
@@ -1089,12 +1105,12 @@ mod tests {
     fn read_stats_accumulate() {
         let (time, mut sd) = new_sd();
         time.set(100);
-        sd.update(reading(13.0, 1.0), reading(13.0, 2.0), 10, 2, 0.0);
+        sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 10, 2, 0.0);
         assert_eq!(sd.read_total, 10);
         assert_eq!(sd.read_failures, 2);
 
         time.set(101);
-        sd.update(reading(13.0, 1.0), reading(13.0, 2.0), 10, 3, 0.0);
+        sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 10, 3, 0.0);
         assert_eq!(sd.read_total, 20);
         assert_eq!(sd.read_failures, 5);
     }
@@ -1138,7 +1154,7 @@ mod tests {
         let base_t = 100_000;
         for i in 0..MAX_INTERVAL {
             time.set(base_t + i);
-            update(&mut sd, reading(13.0, 5.0), reading(13.0, 3.0));
+            update(&mut sd, bat_reading(13.0, 5.0), ps_reading(13.0, 3.0));
         }
 
         // Dropped oldest, pushed new — still at CAP.

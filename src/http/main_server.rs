@@ -40,23 +40,13 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
                 let bat = store.battery_reading;
                 let ps = store.ps_reading;
                 let history = store.history();
-                // When PS is offline its sensor may be absent or reading zero; averaging
-                // would halve the reported voltage. Use battery voltage alone in that case.
-                let voltage = if store.power_online >= 0.5 {
-                    (bat.voltage + ps.voltage) / 2.0
-                } else {
-                    bat.voltage
-                };
-                let max_charge = history
-                    .iter()
-                    .map(|s| s.max_charge)
-                    .fold(0.0_f64, f64::max);
+                let max_charge = history.iter().map(|s| s.max_charge).fold(0.0_f64, f64::max);
                 let history_rows: Vec<HistoryRow> = history.iter().map(HistoryRow::from).collect();
 
                 ApiResponse {
                     uptime: crate::uptime_s(),
                     rssi: get_rssi(),
-                    voltage,
+                    voltage: bat.voltage,
                     read_err: [store.read_failures, store.read_total],
                     charge: bat.charge,
                     max_charge,
@@ -67,6 +57,7 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
                         power: bat.power,
                     },
                     ps: PsReading {
+                        voltage: ps.voltage,
                         current: ps.current,
                         power: ps.power,
                     },

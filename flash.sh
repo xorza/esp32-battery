@@ -17,6 +17,7 @@ cargo "$ALIAS"
 espflash flash \
     --erase-data-parts ota \
     --monitor \
+    --non-interactive \
     --partition-table "$PARTITIONS" \
     --port /dev/ttyACM0 \
     "$ELF"

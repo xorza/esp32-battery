@@ -132,7 +132,8 @@ pub fn register(server: &mut EspHttpServer<'static>) {
             match handle_upload(&mut req) {
                 Ok(total) => {
                     info!("OTA: received {} bytes, signature valid", total);
-                    let len = serde_json_core::to_slice(&OkResponse { ok: true }, &mut buf).unwrap();
+                    let len =
+                        serde_json_core::to_slice(&OkResponse { ok: true }, &mut buf).unwrap();
                     let _ = reply(req, 200, &buf[..len]);
                     crate::reboot_after("OTA: rebooting now");
                 }

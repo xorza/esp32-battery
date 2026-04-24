@@ -16,6 +16,7 @@ pub struct BatteryReading {
 
 #[derive(Serialize)]
 pub struct PsReading {
+    pub voltage: f32,
     pub current: f32,
     pub power: f32,
 }

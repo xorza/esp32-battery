@@ -4,6 +4,7 @@ use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::i2c::{I2cBusDriver, config::BusConfig};
 use esp_idf_hal::modem::Modem;
 use esp_idf_hal::peripherals::Peripherals;
+use esp_idf_hal::uart::UART1;
 
 #[cfg(feature = "lcd")]
 use esp_idf_hal::gpio::AnyOutputPin;
@@ -41,9 +42,16 @@ pub struct LcdPins {
     pub ledc_channel: CHANNEL0<'static>,
 }
 
+pub struct XyPins {
+    pub uart: UART1<'static>,
+    pub tx: AnyIOPin<'static>,
+    pub rx: AnyIOPin<'static>,
+}
+
 pub struct Board {
     pub modem: Modem<'static>,
     pub i2c: I2cPins,
+    pub xy: XyPins,
     #[cfg(feature = "lcd")]
     pub lcd: LcdPins,
 }
@@ -61,8 +69,21 @@ impl Board {
         #[cfg(feature = "esp32c6")]
         let i2c = I2cPins {
             i2c: p.i2c0,
-            sda: p.pins.gpio20.into(),
-            scl: p.pins.gpio23.into(),
+            sda: p.pins.gpio23.into(),
+            scl: p.pins.gpio20.into(),
+        };
+
+        #[cfg(feature = "esp32c3")]
+        let xy = XyPins {
+            uart: p.uart1,
+            tx: p.pins.gpio4.into(),
+            rx: p.pins.gpio5.into(),
+        };
+        #[cfg(feature = "esp32c6")]
+        let xy = XyPins {
+            uart: p.uart1,
+            tx: p.pins.gpio16.into(),
+            rx: p.pins.gpio17.into(),
         };
 
         #[cfg(feature = "lcd")]
@@ -81,6 +102,7 @@ impl Board {
         Self {
             modem: p.modem,
             i2c,
+            xy,
             #[cfg(feature = "lcd")]
             lcd,
         }
