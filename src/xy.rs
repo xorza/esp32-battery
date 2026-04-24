@@ -258,7 +258,7 @@ impl std::fmt::Display for XyError {
 /// Default voltage/current setpoints applied on boot. Output is kept OFF until
 /// enabled manually (charging strategy is not yet implemented).
 const BOOT_V_SET: f32 = 13.6;
-const BOOT_I_SET: f32 = 1.0;
+const BOOT_I_SET: f32 = 10.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 pub fn start(pins: XyPins, state: Arc<AppState>) {
@@ -269,12 +269,10 @@ pub fn start(pins: XyPins, state: Arc<AppState>) {
             let xy = Xy::new(pins);
             thread::sleep(Duration::from_millis(100));
 
-            // Always start with output disabled for safety. Setpoints are applied so the
-            // first manual enable immediately delivers at the intended target.
-            // Inter-command silence is handled inside write_holding.
             xy.set_output(false);
             xy.set_voltage(BOOT_V_SET);
             xy.set_current_limit(BOOT_I_SET);
+            xy.set_output(true);
 
             loop {
                 match xy.read_status() {
@@ -285,10 +283,6 @@ pub fn start(pins: XyPins, state: Arc<AppState>) {
                             power: s.p_out,
                         };
                         state.sensor_data.lock().unwrap().update_ps(reading);
-                        info!(
-                            "XY: V_in={:.2} set V={:.2} I={:.2} | out V={:.2} I={:.2} P={:.2}",
-                            s.v_in, s.v_set, s.i_set, s.v_out, s.i_out, s.p_out
-                        );
                     }
                     Err(e) => warn!("XY read_status: {e}"),
                 }
