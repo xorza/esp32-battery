@@ -23,7 +23,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
 
-pub use app_state::{AppState, NetStatus, Server, uptime_s};
+pub use app_state::{AppState, uptime_s};
 
 use crate::nvs_creds::WifiCredentials;
 
@@ -46,8 +46,7 @@ fn drain_pending_creds(
     let new = state.shared.pending_creds.lock().unwrap().take()?;
     info!("Applying credentials submitted via captive portal");
     wifi.lock().unwrap().start_sta(&new);
-    state.set_status(NetStatus::Connecting);
-    state.reset_reconnect_failures();
+    state.on_creds_applied();
     Some(new)
 }
 
@@ -133,7 +132,7 @@ fn main() {
 
     if let Some(ref creds) = creds {
         wifi.lock().unwrap().start_sta(creds);
-        state.set_status(NetStatus::Connecting);
+        state.on_creds_applied();
     }
 
     loop {
@@ -147,20 +146,14 @@ fn main() {
 
         let connected = tick_wifi(&wifi);
         if connected {
-            state.reset_reconnect_failures();
             let shared = state.shared.clone();
-            state.ensure_host(|| http::start_main(shared, nvs.clone()));
-        } else if creds.is_none() || state.bump_reconnect_failures() >= CAPTIVE_AFTER_FAILURES {
+            state.on_tick_connected(|| http::start_main(shared, nvs.clone()));
+        } else {
             let shared = state.shared.clone();
-            state.ensure_captive(|| {
+            state.on_tick_disconnected(creds.is_some(), CAPTIVE_AFTER_FAILURES, || {
                 wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
                 http::start_captive(shared, nvs.clone(), wifi.clone())
             });
-        } else {
-            // Grace window: keep whatever server is currently mounted
-            // (None at boot, Host on a brief blip) and surface the
-            // transient to the LCD.
-            state.set_status(NetStatus::Connecting);
         }
     }
 }

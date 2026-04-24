@@ -16,28 +16,9 @@ use crate::dns::DnsHandle;
 use crate::history_store::HistoryStore;
 use crate::nvs_creds::WifiCredentials;
 
-/// HTTP server held for `Drop`. Two shapes — captive portal pairs HTTP with
-/// a DNS hijack so the device's own SSID resolves; host mode is HTTPS only.
-/// `EspHttpServer` is `!Send`, which is why this lives in `AppState` (main
-/// thread only) rather than `Shared`.
-pub enum Server {
-    Captive {
-        #[allow(dead_code)]
-        http: EspHttpServer<'static>,
-        #[allow(dead_code)]
-        dns: DnsHandle,
-    },
-    Host {
-        #[allow(dead_code)]
-        http: EspHttpServer<'static>,
-    },
-}
-
 /// Cross-thread net status — what readers (LCD, etc.) should display.
-/// `Connecting` is a transient: STA has been started (boot with creds, or
-/// captive `/save` submission) but hasn't associated yet, OR was previously
-/// Host and dropped the link but is still inside the reconnect grace window.
-/// The currently-mounted server may not match the status during `Connecting`.
+/// Derived from `NetPhase` at every transition; lives in `Shared` because
+/// `NetPhase` contains `!Send` servers and stays on the main thread.
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NetStatus {
@@ -53,6 +34,43 @@ impl NetStatus {
             1 => NetStatus::Connecting,
             2 => NetStatus::Host,
             _ => unreachable!("NetStatus byte out of range"),
+        }
+    }
+}
+
+/// Single source of truth for network phase + mounted HTTP server. Lives on
+/// the main thread — `EspHttpServer` is `!Send`.
+///
+/// `Connecting` carries an optional leftover Host server so a brief WiFi
+/// blip doesn't tear down the dashboard; the server is reused on
+/// reassociation, or dropped once the grace window expires and we fall back
+/// to `Captive`.
+pub enum NetPhase {
+    /// Bootstrap: no server mounted, STA not yet configured.
+    Idle,
+    Connecting {
+        ticks: u32,
+        #[allow(dead_code)] // held for Drop during the grace window
+        host_server: Option<EspHttpServer<'static>>,
+    },
+    Host {
+        #[allow(dead_code)]
+        server: EspHttpServer<'static>,
+    },
+    Captive {
+        #[allow(dead_code)]
+        server: EspHttpServer<'static>,
+        #[allow(dead_code)]
+        dns: DnsHandle,
+    },
+}
+
+impl NetPhase {
+    fn status(&self) -> NetStatus {
+        match self {
+            NetPhase::Idle | NetPhase::Connecting { .. } => NetStatus::Connecting,
+            NetPhase::Host { .. } => NetStatus::Host,
+            NetPhase::Captive { .. } => NetStatus::Captive,
         }
     }
 }
@@ -75,8 +93,7 @@ impl Shared {
 pub struct AppState {
     pub shared: Arc<Shared>,
     pub history_store: HistoryStore,
-    server: Option<Server>,
-    reconnect_failures: u32,
+    phase: NetPhase,
 }
 
 impl AppState {
@@ -85,63 +102,107 @@ impl AppState {
             shared: Arc::new(Shared {
                 sensor_data: Mutex::new(sensor_data),
                 pending_creds: Mutex::new(None),
-                status: AtomicU8::new(NetStatus::Captive as u8),
+                status: AtomicU8::new(NetStatus::Connecting as u8),
             }),
             history_store,
-            server: None,
-            reconnect_failures: 0,
+            phase: NetPhase::Idle,
         }
     }
 
-    /// Drop the previous server (releasing its resources) and install the new
-    /// one. Mirrors the variant into `Shared::status` so cross-thread readers
-    /// see the same mode the main thread does.
-    pub fn replace_server(&mut self, new: Server) {
-        let status = match &new {
-            Server::Captive { .. } => NetStatus::Captive,
-            Server::Host { .. } => NetStatus::Host,
+    fn set_phase(&mut self, phase: NetPhase) {
+        self.shared
+            .status
+            .store(phase.status() as u8, Ordering::Relaxed);
+        self.phase = phase;
+    }
+
+    /// New credentials applied to the WiFi hardware (boot load, or captive
+    /// `/save`). Drops any live server and enters `Connecting` so the
+    /// supervisor begins the grace count from zero.
+    pub fn on_creds_applied(&mut self) {
+        self.set_phase(NetPhase::Connecting {
+            ticks: 0,
+            host_server: None,
+        });
+    }
+
+    /// Supervisor tick: WiFi reports associated. Idempotent in `Host`;
+    /// reuses the leftover server from a grace-window `Connecting` so a
+    /// brief blip doesn't rebuild HTTPS state.
+    pub fn on_tick_connected(&mut self, build_host: impl FnOnce() -> EspHttpServer<'static>) {
+        if matches!(self.phase, NetPhase::Host { .. }) {
+            return;
+        }
+        let current = std::mem::replace(&mut self.phase, NetPhase::Idle);
+        let server = match current {
+            NetPhase::Connecting {
+                host_server: Some(s),
+                ..
+            } => {
+                info!("WiFi reassociated within grace window, reusing main server");
+                s
+            }
+            _ => {
+                info!("WiFi connected, starting main server");
+                build_host()
+            }
         };
-        self.set_status(status);
-        self.server = Some(new);
+        self.set_phase(NetPhase::Host { server });
     }
 
-    pub fn set_status(&self, status: NetStatus) {
-        self.shared.status.store(status as u8, Ordering::Relaxed);
-    }
-
-    pub fn reset_reconnect_failures(&mut self) {
-        self.reconnect_failures = 0;
-    }
-
-    /// Increment and return the new count. Saturates so a permanently-down
-    /// link can't wrap around and re-enter the grace window.
-    pub fn bump_reconnect_failures(&mut self) -> u32 {
-        self.reconnect_failures = self.reconnect_failures.saturating_add(1);
-        self.reconnect_failures
-    }
-
-    /// Idempotent: keep the active server as Host. If we're already there,
-    /// just clear any leftover `Connecting` status from a grace-window blip.
-    /// Otherwise build the new server and swap it in.
-    pub fn ensure_host(&mut self, build: impl FnOnce() -> EspHttpServer<'static>) {
-        if matches!(self.server, Some(Server::Host { .. })) {
-            self.set_status(NetStatus::Host);
-        } else {
-            info!("WiFi connected, starting main server");
-            self.replace_server(Server::Host { http: build() });
-        }
-    }
-
-    /// Idempotent: keep the active server as Captive, building it if needed.
-    pub fn ensure_captive(
+    /// Supervisor tick: WiFi is not associated. Drives the transitions
+    /// between Host (via Connecting grace) and Captive.
+    ///
+    /// - No creds: mount captive (or stay in it).
+    /// - `Host` → `Connecting { ticks: 1, host_server: Some(..) }`.
+    /// - `Connecting`: bump ticks; fall through to Captive once `grace_ticks`
+    ///   is reached, dropping the leftover server.
+    /// - `Idle` / unhandled: mount captive.
+    pub fn on_tick_disconnected(
         &mut self,
-        build: impl FnOnce() -> (EspHttpServer<'static>, DnsHandle),
+        has_creds: bool,
+        grace_ticks: u32,
+        build_captive: impl FnOnce() -> (EspHttpServer<'static>, DnsHandle),
     ) {
-        if !matches!(self.server, Some(Server::Captive { .. })) {
-            warn!("WiFi disconnected, starting captive portal");
-            let (http, dns) = build();
-            self.replace_server(Server::Captive { http, dns });
+        if !has_creds {
+            if !matches!(self.phase, NetPhase::Captive { .. }) {
+                self.mount_captive(build_captive);
+            }
+            return;
         }
+        let current = std::mem::replace(&mut self.phase, NetPhase::Idle);
+        match current {
+            NetPhase::Host { server } => {
+                self.set_phase(NetPhase::Connecting {
+                    ticks: 1,
+                    host_server: Some(server),
+                });
+            }
+            NetPhase::Connecting { ticks, host_server } => {
+                let next = ticks.saturating_add(1);
+                if next >= grace_ticks {
+                    drop(host_server);
+                    self.mount_captive(build_captive);
+                } else {
+                    self.set_phase(NetPhase::Connecting {
+                        ticks: next,
+                        host_server,
+                    });
+                }
+            }
+            NetPhase::Captive { server, dns } => {
+                self.set_phase(NetPhase::Captive { server, dns });
+            }
+            NetPhase::Idle => {
+                self.mount_captive(build_captive);
+            }
+        }
+    }
+
+    fn mount_captive(&mut self, build: impl FnOnce() -> (EspHttpServer<'static>, DnsHandle)) {
+        warn!("WiFi disconnected, starting captive portal");
+        let (server, dns) = build();
+        self.set_phase(NetPhase::Captive { server, dns });
     }
 }
 
