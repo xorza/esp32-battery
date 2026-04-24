@@ -23,7 +23,7 @@ use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
 
-use crate::app_state::Shared;
+use crate::app_state::{NetStatus, Shared};
 use crate::board::LcdPins;
 
 // --- SPI / DMA ---
@@ -407,6 +407,13 @@ fn draw_captive_portal(gb: &mut GraphBuf) {
         .unwrap();
 }
 
+fn draw_connecting(gb: &mut GraphBuf) {
+    let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
+    Text::new("Connecting...", Point::new(20, 60), title)
+        .draw(gb)
+        .unwrap();
+}
+
 // --- Main thread ---
 
 pub fn start(pins: LcdPins, shared: Arc<Shared>) {
@@ -470,7 +477,7 @@ pub fn start(pins: LcdPins, shared: Arc<Shared>) {
 
             let mut fb = FieldBuf::new();
             let mut gb = GraphBuf::new();
-            let mut prev_captive = false;
+            let mut prev_status = NetStatus::Host;
 
             loop {
                 thread::sleep(REFRESH_INTERVAL);
@@ -556,15 +563,16 @@ pub fn start(pins: LcdPins, shared: Arc<Shared>) {
                 .unwrap();
                 fb.blit_rows(&mut display, Point::new(UPTIME_X, 0), 12);
 
-                // Graph / Captive portal
-                let is_captive = shared.is_captive();
-                if !(is_captive && prev_captive) {
-                    prev_captive = is_captive;
+                // Graph / Captive portal / Connecting
+                let status = shared.status();
+                let need_redraw = status != prev_status || status == NetStatus::Host;
+                if need_redraw {
+                    prev_status = status;
                     gb.clear();
-                    if is_captive {
-                        draw_captive_portal(&mut gb);
-                    } else {
-                        draw_graph(&mut gb, &history, interval, &mut buf);
+                    match status {
+                        NetStatus::Captive => draw_captive_portal(&mut gb),
+                        NetStatus::Connecting => draw_connecting(&mut gb),
+                        NetStatus::Host => draw_graph(&mut gb, &history, interval, &mut buf),
                     }
                     gb.blit(&mut display, Point::new(0, GRAPH_Y));
                 }

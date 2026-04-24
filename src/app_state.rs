@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use esp_idf_svc::http::server::EspHttpServer;
 
@@ -50,21 +50,44 @@ pub enum ServerKind {
     Host,
 }
 
+/// Cross-thread network status — what readers (LCD, etc.) should display.
+/// `Connecting` is a transient between Captive (user submitted creds) and
+/// Host (STA actually came up). The captive HTTP server is still running
+/// during `Connecting` so the user can resubmit if STA never connects.
+#[derive(Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NetStatus {
+    Captive = 0,
+    Connecting = 1,
+    Host = 2,
+}
+
+impl NetStatus {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => NetStatus::Captive,
+            1 => NetStatus::Connecting,
+            2 => NetStatus::Host,
+            _ => unreachable!("NetStatus byte out of range"),
+        }
+    }
+}
+
 /// Cross-thread subset. Cloned (as `Arc<Shared>`) into every worker thread.
 pub struct Shared {
     pub sensor_data: Mutex<SensorData<EspClock>>,
     /// Set by the captive `/save` handler when fresh credentials land.
     /// Drained by the main loop, which then drives the live STA reconnect.
     pub pending_creds: Mutex<Option<WifiCredentials>>,
-    /// Send-projection of `AppState::server`'s variant. Written only via
-    /// `AppState::set_server`; the field is private so no other code can
-    /// desync the mirror.
-    captive_active: AtomicBool,
+    /// Cross-thread net status. Written only via `AppState::set_server`
+    /// and `AppState::set_status`; the field is private so callers can't
+    /// desync from the actual server.
+    status: AtomicU8,
 }
 
 impl Shared {
-    pub fn is_captive(&self) -> bool {
-        self.captive_active.load(Ordering::Relaxed)
+    pub fn status(&self) -> NetStatus {
+        NetStatus::from_u8(self.status.load(Ordering::Relaxed))
     }
 }
 
@@ -82,7 +105,7 @@ impl AppState {
             shared: Arc::new(Shared {
                 sensor_data: Mutex::new(sensor_data),
                 pending_creds: Mutex::new(None),
-                captive_active: AtomicBool::new(false),
+                status: AtomicU8::new(NetStatus::Captive as u8),
             }),
             history_store,
             server: None,
@@ -93,11 +116,21 @@ impl AppState {
         self.server.as_ref().map_or(ServerKind::None, Server::kind)
     }
 
-    /// Single write path for `server` and the cross-thread mirror.
+    /// Single write path for `server`. The status mirror tracks the new
+    /// server's variant — but `set_status(Connecting)` may immediately
+    /// overwrite to surface the post-creds-submit transient.
     pub fn set_server(&mut self, new: Option<Server>) {
-        let captive = matches!(new, Some(Server::Captive { .. }));
-        self.shared.captive_active.store(captive, Ordering::Relaxed);
+        let status = match new {
+            Some(Server::Captive { .. }) => NetStatus::Captive,
+            Some(Server::Host { .. }) => NetStatus::Host,
+            None => NetStatus::Captive,
+        };
+        self.set_status(status);
         self.server = new;
+    }
+
+    pub fn set_status(&self, status: NetStatus) {
+        self.shared.status.store(status as u8, Ordering::Relaxed);
     }
 }
 

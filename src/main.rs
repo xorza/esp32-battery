@@ -21,7 +21,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
 
-pub use app_state::{AppState, Server, ServerKind, uptime_s};
+pub use app_state::{AppState, NetStatus, Server, ServerKind, uptime_s};
 
 fn start_sntp(clock: platform::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
     info!("Starting NTP sync");
@@ -99,6 +99,7 @@ fn main() {
 
     if let Some(ref creds) = creds {
         wifi.lock().unwrap().start_sta(creds);
+        state.set_status(NetStatus::Connecting);
     }
 
     loop {
@@ -116,6 +117,7 @@ fn main() {
             info!("Applying credentials submitted via captive portal");
             wifi.lock().unwrap().start_sta(&new_creds);
             creds = Some(new_creds);
+            state.set_status(NetStatus::Connecting);
         }
 
         let connected = {
