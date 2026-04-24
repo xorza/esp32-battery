@@ -119,7 +119,7 @@ pub fn start(shared: Arc<Shared>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServer
         .fn_handler("/wifi-reset", esp_idf_svc::http::Method::Post, move |req| {
             crate::nvs_creds::clear(&nvs);
             text_response(req, 200, b"WiFi credentials cleared. Rebooting...")?;
-            crate::platform::reboot_after("Rebooting after WiFi reset");
+            crate::reboot::reboot_after("Rebooting after WiFi reset");
             Ok::<(), EspError>(())
         })
         .unwrap();

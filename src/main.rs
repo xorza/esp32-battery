@@ -1,7 +1,9 @@
 mod api;
 mod app_state;
 mod board;
+mod clock;
 mod dns;
+mod history_store;
 mod http;
 mod ina;
 #[cfg(feature = "lcd")]
@@ -9,7 +11,7 @@ mod lcd;
 mod log_ring;
 mod nvs_creds;
 mod ota;
-mod platform;
+mod reboot;
 mod wifi;
 mod xy;
 
@@ -23,7 +25,7 @@ use log::{info, warn};
 
 pub use app_state::{AppState, NetStatus, Server, ServerKind, uptime_s};
 
-fn start_sntp(clock: platform::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
+fn start_sntp(clock: clock::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
     info!("Starting NTP sync");
     esp_idf_svc::sntp::EspSntp::new_with_callback(
         &esp_idf_svc::sntp::SntpConf::default(),
@@ -33,7 +35,7 @@ fn start_sntp(clock: platform::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> 
             // epoch is within the plausibility window — otherwise a bogus
             // value reaches SensorData and poisons history.
             let secs = synced_at.as_secs();
-            if platform::VALID_EPOCH_S.contains(&secs) {
+            if clock::VALID_EPOCH_S.contains(&secs) {
                 info!("NTP synced: epoch={secs}");
                 clock.mark_synced();
             } else {
@@ -65,8 +67,8 @@ fn main() {
     let nvs = Arc::new(nvs_creds::open(nvs_partition.clone()));
     let mut creds = nvs_creds::load(&nvs);
 
-    let clock = platform::EspClock::new();
-    let history_store = platform::HistoryStore::new(nvs_partition.clone());
+    let clock = clock::EspClock::new();
+    let history_store = history_store::HistoryStore::new(nvs_partition.clone());
 
     let wifi = Arc::new(Mutex::new(wifi::Wifi::new(
         board.modem,

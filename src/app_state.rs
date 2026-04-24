@@ -12,7 +12,8 @@ use esp32_battery_logic::data::SensorData;
 
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
-use crate::platform::{EspClock, HistoryStore};
+use crate::clock::EspClock;
+use crate::history_store::HistoryStore;
 
 /// HTTP server held for `Drop`. Two shapes — captive portal pairs HTTP with
 /// a DNS hijack so the device's own SSID resolves; host mode is HTTPS only.

@@ -135,7 +135,7 @@ pub fn register(server: &mut EspHttpServer<'static>) {
                     let len =
                         serde_json_core::to_slice(&OkResponse { ok: true }, &mut buf).unwrap();
                     let _ = reply(req, 200, &buf[..len]);
-                    crate::platform::reboot_after("OTA: rebooting now");
+                    crate::reboot::reboot_after("OTA: rebooting now");
                 }
                 Err(msg) => {
                     warn!("OTA: {}", msg);
