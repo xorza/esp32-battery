@@ -48,15 +48,6 @@ impl ReadingAccum {
     }
 }
 
-fn retry<T, E>(mut f: impl FnMut() -> Result<T, E>) -> Option<T> {
-    for _ in 0..3 {
-        if let Ok(v) = f() {
-            return Some(v);
-        }
-    }
-    None
-}
-
 type I2cDev = I2cDriver<'static, &'static I2cBusDriver<'static>>;
 
 fn init_ina(dev: I2cDev, addr: u8) -> Option<ina228::Ina228<I2cDev>> {
@@ -69,15 +60,16 @@ fn init_ina(dev: I2cDev, addr: u8) -> Option<ina228::Ina228<I2cDev>> {
     }
 }
 
-fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Option<Ina228Reading> {
-    let voltage = retry(|| ina.bus_voltage())?;
-    let current = retry(|| ina.current())?;
-    let power = retry(|| ina.power())?;
-    Some(Ina228Reading {
+fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Ina228Reading {
+    let voltage = ina.bus_voltage().expect("");
+    let current = ina.current().expect("");
+    let power = ina.power().expect("");
+
+    Ina228Reading {
         voltage,
         current,
         power,
-    })
+    }
 }
 
 pub fn start(pins: I2cPins, shared: Arc<Shared>) {
@@ -108,10 +100,9 @@ pub fn start(pins: I2cPins, shared: Arc<Shared>) {
                 while count < SAMPLES_PER_UPDATE {
                     thread::sleep(SAMPLE_INTERVAL);
 
-                    if let Some(bat_r) = read_battery(&mut battery_ina) {
-                        bat_acc.add(&bat_r);
-                        count += 1;
-                    }
+                    let bat_r = read_battery(&mut battery_ina);
+                    bat_acc.add(&bat_r);
+                    count += 1;
                 }
 
                 shared
@@ -125,14 +116,14 @@ pub fn start(pins: I2cPins, shared: Arc<Shared>) {
 }
 
 #[cfg(feature = "ina-fake")]
-fn read_battery(ina: &mut Option<ina228::Ina228<I2cDev>>) -> Option<Ina228Reading> {
+fn read_battery(ina: &mut Option<ina228::Ina228<I2cDev>>) -> Ina228Reading {
     match ina {
         Some(ina) => read_ina(ina),
-        None => Some(FAKE_READING),
+        None => FAKE_READING,
     }
 }
 
 #[cfg(not(feature = "ina-fake"))]
-fn read_battery(ina: &mut ina228::Ina228<I2cDev>) -> Option<Ina228Reading> {
+fn read_battery(ina: &mut ina228::Ina228<I2cDev>) -> Ina228Reading {
     read_ina(ina)
 }

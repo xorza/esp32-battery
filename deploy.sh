@@ -29,8 +29,18 @@ if [ "${#OTA_KEY}" -ne 64 ]; then
     exit 1
 fi
 
+EXTRA_FEATURES=()
+[[ "${INA_FAKE:-0}" == "1" ]] && EXTRA_FEATURES+=("ina-fake")
+[[ "${XY_FAKE:-0}"  == "1" ]] && EXTRA_FEATURES+=("xy-fake")
+
 echo "Building release for $CHIP..."
-cargo "$ALIAS"
+if (( ${#EXTRA_FEATURES[@]} > 0 )); then
+    JOINED="$(IFS=, ; echo "${EXTRA_FEATURES[*]}")"
+    echo "Building with extra features: $JOINED"
+    cargo "$ALIAS" --features "$JOINED"
+else
+    cargo "$ALIAS"
+fi
 
 echo "Creating binary image..."
 espflash save-image --chip "$CHIP" "$ELF" "$BIN"
