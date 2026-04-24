@@ -26,6 +26,9 @@ const FN_WRITE_HOLDING: u8 = 0x06;
 const REG_V_SET: u16 = 0x0000;
 const REG_I_SET: u16 = 0x0001;
 const REG_OUTPUT_EN: u16 = 0x0012;
+const REG_S_LVP: u16 = 0x0052;
+const REG_S_OVP: u16 = 0x0053;
+const REG_S_OCP: u16 = 0x0054;
 const BAUD: u32 = 115200;
 const RESPONSE_TIMEOUT_MS: u64 = 500;
 /// Silence enforced after every write so the XY has time to process the
@@ -201,6 +204,29 @@ impl<'d> Xy<'d> {
         }
     }
 
+    /// Program the three hard trip thresholds in one call. OVP/OCP catch
+    /// control-loop failures beyond what CV/CC regulation can; LVP refuses
+    /// to charge a deeply-discharged or shorted pack. On any Modbus error
+    /// the output is forced OFF so we never run with unknown protection.
+    ///
+    /// All three are V/A × 100 on XY7025 (verified empirically). LVP has a
+    /// firmware-enforced floor of 10 V — values below are silently clamped
+    /// upward by the XY itself.
+    pub fn set_protection(&self, ovp_volts: f32, ocp_amps: f32, lvp_volts: f32) {
+        let writes = [
+            (REG_S_OVP, (ovp_volts * 100.0).round() as u16, "OVP"),
+            (REG_S_OCP, (ocp_amps * 100.0).round() as u16, "OCP"),
+            (REG_S_LVP, (lvp_volts * 100.0).round() as u16, "LVP"),
+        ];
+        for (reg, val, name) in writes {
+            if let Err(e) = self.write_holding(reg, val) {
+                self.set_output(false);
+                error!("XY set {name} failed: {e} — disabling output");
+                return;
+            }
+        }
+    }
+
     /// Output-enable is safety-critical: we can never leave the device in an
     /// ambiguous state. Panics on failure → watchdog reset via the panic hook.
     pub fn set_output(&self, on: bool) {
@@ -260,6 +286,12 @@ impl std::fmt::Display for XyError {
 /// enabled manually (charging strategy is not yet implemented).
 const BOOT_V_SET: f32 = 13.6;
 const BOOT_I_SET: f32 = 10.0;
+/// Hard trip thresholds (OVP / OCP / LVP). These only fire if CV/CC regulation
+/// fails or the pack is badly out of spec — headroom above normal setpoints.
+const BOOT_OVP: f32 = 15.0; // V — safe ceiling above the CV target
+const BOOT_OCP: f32 = 16.0; // A — well above any normal CC current
+const BOOT_LVP: f32 = 10.0; // V — refuses to charge a deeply-dead / shorted pack
+
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 pub fn start(pins: XyPins, state: Arc<AppState>) {
@@ -271,6 +303,7 @@ pub fn start(pins: XyPins, state: Arc<AppState>) {
             thread::sleep(Duration::from_millis(100));
 
             xy.set_output(false);
+            xy.set_protection(BOOT_OVP, BOOT_OCP, BOOT_LVP);
             xy.set_voltage(BOOT_V_SET);
             xy.set_current_limit(BOOT_I_SET);
             xy.set_output(true);
