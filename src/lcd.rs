@@ -42,6 +42,22 @@ const COLOR_BAT_CURRENT: Rgb565 = Rgb565::new(0, 57, 31); // cyan, matches #00e5
 const COLOR_PSU_CURRENT: Rgb565 = Rgb565::new(31, 38, 0); // orange, matches #ff9800
 const COLOR_POWER: Rgb565 = Rgb565::new(31, 20, 0);
 const COLOR_GRID: Rgb565 = Rgb565::new(4, 8, 4);
+const COLOR_CHARGING: Rgb565 = Rgb565::new(6, 55, 10); // green
+const COLOR_DISCHARGING: Rgb565 = Rgb565::new(31, 28, 0); // orange
+const COLOR_IDLE: Rgb565 = Rgb565::new(18, 36, 18); // light gray-green
+/// Dead-band below which the battery is considered idle (|I| < 50 mA).
+const BATTERY_IDLE_THRESHOLD_A: f32 = 0.05;
+
+/// Sign convention: negative current = charging, positive = discharging.
+fn battery_current_color(current: f32) -> Rgb565 {
+    if current.abs() < BATTERY_IDLE_THRESHOLD_A {
+        COLOR_IDLE
+    } else if current < 0.0 {
+        COLOR_CHARGING
+    } else {
+        COLOR_DISCHARGING
+    }
+}
 
 // --- Layout ---
 
@@ -509,7 +525,7 @@ pub fn start_lcd_thread(pins: LcdPins, state: Arc<AppState>) {
                     &mut fb,
                     &buf,
                     Point::new(COL_LEFT, ROW2_VALUE_Y),
-                    COLOR_BAT_CURRENT,
+                    battery_current_color(r1.current),
                 );
 
                 buf.clear();
