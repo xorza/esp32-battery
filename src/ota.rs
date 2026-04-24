@@ -24,9 +24,20 @@ struct ErrorResponse<'a> {
     error: &'a str,
 }
 
-const OTA_KEY: &[u8; 32] = include_bytes!(concat!(env!("OUT_DIR"), "/ota_key.bin"));
+const OTA_KEY_HEX: &str = env!("OTA_KEY");
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn decode_key() -> [u8; 32] {
+    let b = OTA_KEY_HEX.as_bytes();
+    assert_eq!(b.len(), 64, "OTA_KEY must be 64 hex chars");
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&OTA_KEY_HEX[i * 2..i * 2 + 2], 16)
+            .expect("OTA_KEY must be valid hex");
+    }
+    out
+}
 
 fn reply(
     req: esp_idf_svc::http::server::Request<&mut EspHttpConnection>,
@@ -71,7 +82,7 @@ fn handle_upload(
     let mut expected_hmac = [0u8; 32];
     read_exact(req, &mut expected_hmac)?;
 
-    let mut mac = HmacSha256::new_from_slice(OTA_KEY).expect("HMAC key length must be valid");
+    let mut mac = HmacSha256::new_from_slice(&decode_key()).expect("HMAC key length must be valid");
 
     let mut ota = EspOta::new().map_err(|e| {
         warn!("OTA: init failed: {:?}", e);
