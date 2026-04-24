@@ -22,11 +22,10 @@ const _: () = assert!(
 );
 const SAVE_INTERVAL_S: u32 = 600;
 
-pub trait Platform {
+/// Source of wall-clock time. Separated from persistence so callers can drive
+/// NVS I/O outside the `SensorData` mutex.
+pub trait Clock {
     fn epoch_s(&self) -> Option<u32>;
-    fn save_blob(&self, data: &[u8]);
-    /// Load persisted blob into `buf`. Returns the number of bytes written, or None if no blob.
-    fn load_blob(&self, buf: &mut [u8]) -> Option<usize>;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -89,7 +88,7 @@ impl SampleAccum {
 /// Stores up to `HISTORY_CAPACITY` samples. When full, pairs are averaged
 /// (halving the count) and the sampling interval doubles. This gives
 /// exponentially growing time coverage in fixed memory (~4 KB).
-pub struct SensorData<P: Platform> {
+pub struct SensorData<C: Clock> {
     /// Latest reading from each side. `None` only until the first real reading
     /// from that sensor — then always `Some` so HTTP/LCD can snapshot live values.
     pub battery_reading: Option<Ina228Reading>,
@@ -105,8 +104,13 @@ pub struct SensorData<P: Platform> {
     interval: u32,
     acc: SampleAccum,
     acc_count: u32,
-    platform: P,
-    loaded: bool,
+    clock: C,
+    /// Has the save-interval elapsed since the last `take_save_payload` call?
+    /// Set by `try_commit`; cleared when the caller drains the payload.
+    save_pending: bool,
+    /// False until the first successful commit. The first commit anchors
+    /// `last_save_s` so we don't immediately save a just-loaded blob.
+    anchored: bool,
     last_save_s: u32,
     buf: Box<[u8; MAX_BLOB_SIZE]>,
 }
@@ -161,8 +165,8 @@ impl BufReader<'_> {
     }
 }
 
-impl<P: Platform> SensorData<P> {
-    pub fn new(platform: P) -> Self {
+impl<C: Clock> SensorData<C> {
+    pub fn new(clock: C) -> Self {
         Self {
             battery_reading: None,
             ps_reading: None,
@@ -172,30 +176,31 @@ impl<P: Platform> SensorData<P> {
             interval: 1,
             acc: SampleAccum::default(),
             acc_count: 0,
-            platform,
-            loaded: false,
+            clock,
+            save_pending: false,
+            anchored: false,
             last_save_s: 0,
             buf: Box::new([0u8; MAX_BLOB_SIZE]),
         }
     }
 
     /// Called by the INA thread once per cycle. Publishes the latest reading
-    /// and attempts a history commit.
+    /// and runs `try_commit` — the commit only fires once both sides have
+    /// produced a fresh reading.
     pub fn update_battery(&mut self, bat: Ina228Reading) {
         self.battery_reading = Some(bat);
         self.battery_updated = true;
         self.try_commit();
     }
 
-    /// Called by the XY thread once per poll. Publishes the latest reading
-    /// and attempts a history commit.
+    /// Called by the XY thread once per poll. Same shape as `update_battery`.
     pub fn update_ps(&mut self, ps: PsReading) {
         self.ps_reading = Some(ps);
         self.ps_updated = true;
         self.try_commit();
     }
 
-    /// `1.0` when the latest PS reading shows measurable current, `0.0` otherwise.
+    /// `1.0` when the latest PS reading shows measurable voltage, `0.0` otherwise.
     /// Returns `0.0` before the first PS reading arrives.
     pub fn power_online(&self) -> f32 {
         match self.ps_reading {
@@ -204,9 +209,42 @@ impl<P: Platform> SensorData<P> {
         }
     }
 
+    /// Restore history from a previously-saved blob. Call at startup before
+    /// the first `try_commit`. Returns false if the blob is malformed.
+    pub fn load_from_bytes(&mut self, bytes: &[u8]) -> bool {
+        let n = bytes.len().min(self.buf.len());
+        self.buf[..n].copy_from_slice(&bytes[..n]);
+        let ok = self.read(n);
+        if ok {
+            log::info!("Loaded {} samples from blob", self.history.len());
+        } else {
+            log::warn!("Failed to parse history blob ({n} bytes)");
+        }
+        ok
+    }
+
+    /// Drain the pending save payload, if any. Returns `Some(bytes)` when
+    /// `SAVE_INTERVAL_S` has elapsed since the previous drain. Caller performs
+    /// the actual NVS write outside the `SensorData` lock.
+    pub fn take_save_payload(&mut self) -> Option<Vec<u8>> {
+        if !self.save_pending {
+            return None;
+        }
+        self.save_pending = false;
+        let len = self.write();
+        log::info!(
+            "Emitting save payload: {} samples ({len} bytes)",
+            self.history.len()
+        );
+        Some(self.buf[..len].to_vec())
+    }
+
     /// Commit one history sample when both sides have a reading that has been
     /// updated since the last commit. Clears the updated flags (but keeps the
     /// readings themselves) so HTTP/LCD still see live values between commits.
+    /// Sets `save_pending` when a save-interval has elapsed; the actual write
+    /// is deferred to the caller via `take_save_payload` to keep NVS I/O out
+    /// of the data mutex.
     fn try_commit(&mut self) {
         if !(self.battery_updated && self.ps_updated) {
             return;
@@ -214,21 +252,16 @@ impl<P: Platform> SensorData<P> {
         let (Some(bat), Some(ps)) = (self.battery_reading, self.ps_reading) else {
             return;
         };
-        let Some(time_s) = self.platform.epoch_s() else {
+        let Some(time_s) = self.clock.epoch_s() else {
             return;
         };
         self.battery_updated = false;
         self.ps_updated = false;
 
-        if !self.loaded {
-            self.loaded = true;
-            if let Some(len) = self.platform.load_blob(&mut *self.buf) {
-                if self.read(len) {
-                    log::info!("Loaded {} samples from NVS", self.history.len());
-                } else {
-                    log::warn!("Failed to read history from NVS ({} bytes)", len);
-                }
-            }
+        // First commit anchors the save timer so we don't immediately dump a
+        // just-loaded blob back to flash.
+        if !self.anchored {
+            self.anchored = true;
             self.last_save_s = time_s;
         }
 
@@ -266,20 +299,9 @@ impl<P: Platform> SensorData<P> {
             assert!(self.history.push(averaged).is_ok(), "history overflow");
         }
 
-        // NOTE: save_blob runs while the SensorData mutex is held by the caller,
-        // stalling other readers for ~50–100 ms every SAVE_INTERVAL_S (10 min).
-        // Moving the save outside the lock would require removing `platform` from
-        // SensorData — a large refactor touching every test. The stall is rare
-        // and brief enough that the current design is accepted.
         if time_s.saturating_sub(self.last_save_s) >= SAVE_INTERVAL_S {
             self.last_save_s = time_s;
-            let len = self.write();
-            log::info!(
-                "Saved {} samples to NVS ({} bytes)",
-                self.history.len(),
-                len
-            );
-            self.platform.save_blob(&self.buf[..len]);
+            self.save_pending = true;
         }
     }
 
@@ -378,65 +400,25 @@ impl<P: Platform> SensorData<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
     use std::rc::Rc;
 
     const CAP: usize = HISTORY_CAPACITY;
     const HALF: usize = CAP / 2;
 
-    type Clock = Rc<Cell<u32>>;
+    type TestClock = Rc<Cell<u32>>;
 
-    struct TestPlatform {
-        time: Clock,
-        blob: RefCell<Option<Vec<u8>>>,
-    }
-
-    impl TestPlatform {
-        fn new() -> (Clock, Self) {
-            let time = Rc::new(Cell::new(0u32));
-            (
-                Rc::clone(&time),
-                Self {
-                    time,
-                    blob: RefCell::new(None),
-                },
-            )
-        }
-
-        fn has_blob(&self) -> bool {
-            self.blob.borrow().is_some()
-        }
-
-        fn take_blob(&self) -> Option<Vec<u8>> {
-            self.blob.borrow().clone()
-        }
-
-        fn clear_blob(&self) {
-            *self.blob.borrow_mut() = None;
-        }
-    }
-
-    impl Platform for TestPlatform {
+    /// `Clock` impl over `Rc<Cell<u32>>` so tests can tick time deterministically.
+    struct TestClockSrc(TestClock);
+    impl Clock for TestClockSrc {
         fn epoch_s(&self) -> Option<u32> {
-            Some(self.time.get())
-        }
-
-        fn save_blob(&self, data: &[u8]) {
-            *self.blob.borrow_mut() = Some(data.to_vec());
-        }
-
-        fn load_blob(&self, buf: &mut [u8]) -> Option<usize> {
-            let blob = self.blob.borrow();
-            let data = blob.as_ref()?;
-            let len = data.len();
-            buf[..len].copy_from_slice(data);
-            Some(len)
+            Some(self.0.get())
         }
     }
 
-    fn new_sd() -> (Clock, SensorData<TestPlatform>) {
-        let (time, platform) = TestPlatform::new();
-        (time, SensorData::new(platform))
+    fn new_sd() -> (TestClock, SensorData<TestClockSrc>) {
+        let time = Rc::new(Cell::new(0u32));
+        (time.clone(), SensorData::new(TestClockSrc(time)))
     }
 
     fn bat_reading(voltage: f32, current: f32) -> Ina228Reading {
@@ -455,14 +437,15 @@ mod tests {
         }
     }
 
-    /// Shorthand: update with battery + PS readings.
-    fn update(sd: &mut SensorData<TestPlatform>, bat: Ina228Reading, p: PsReading) {
+    /// Shorthand: publish battery + PS readings and commit.
+    fn update(sd: &mut SensorData<TestClockSrc>, bat: Ina228Reading, p: PsReading) {
         sd.update_ps(p);
         sd.update_battery(bat);
+        sd.try_commit();
     }
 
     /// Push n uniform samples (v=13, c1=1, c2=2). Returns the next time_s value.
-    fn fill(sd: &mut SensorData<TestPlatform>, n: u32, start_t: u32, time: &Clock) -> u32 {
+    fn fill(sd: &mut SensorData<TestClockSrc>, n: u32, start_t: u32, time: &TestClock) -> u32 {
         for i in 0..n {
             time.set(start_t + i);
             update(sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
@@ -520,13 +503,16 @@ mod tests {
         let (time, mut sd) = new_sd();
         time.set(1);
         sd.update_ps(ps_reading(13.0, 2.0));
-        sd.update_battery(bat_reading(13.0, 1.0)); // first commit
+        sd.update_battery(bat_reading(13.0, 1.0));
+        sd.try_commit(); // first commit
         assert_eq!(sd.history.len(), 1);
         // A second update_ps without a new update_battery must NOT commit.
         time.set(2);
         sd.update_ps(ps_reading(13.0, 2.0));
+        sd.try_commit();
         assert_eq!(sd.history.len(), 1);
-        sd.update_battery(bat_reading(13.0, 1.0)); // second commit
+        sd.update_battery(bat_reading(13.0, 1.0));
+        sd.try_commit(); // second commit
         assert_eq!(sd.history.len(), 2);
     }
 
@@ -547,21 +533,18 @@ mod tests {
 
     #[test]
     fn update_skipped_when_no_time() {
-        struct NoTimePlatform;
-        impl Platform for NoTimePlatform {
+        struct NoClock;
+        impl Clock for NoClock {
             fn epoch_s(&self) -> Option<u32> {
                 None
             }
-            fn save_blob(&self, _: &[u8]) {}
-            fn load_blob(&self, _: &mut [u8]) -> Option<usize> {
-                None
-            }
         }
-        let mut sd = SensorData::new(NoTimePlatform);
+        let mut sd = SensorData::new(NoClock);
         sd.update_ps(ps_reading(13.0, 2.0));
         sd.update_battery(bat_reading(13.0, 1.5));
+        sd.try_commit();
         assert!(sd.history.is_empty());
-        assert!(!sd.loaded);
+        assert!(!sd.anchored);
         // Latest readings must still be visible to HTTP/LCD before NTP sync.
         assert!((sd.battery_reading.unwrap().current - 1.5).abs() < 0.001);
         assert!((sd.ps_reading.unwrap().current - 2.0).abs() < 0.001);
@@ -885,46 +868,37 @@ mod tests {
         assert_eq!(sd.history.len(), 2);
     }
 
-#[test]
+    #[test]
     fn no_commit_before_ntp_sync() {
-        // epoch_s() returning None gates history commits AND saves entirely.
-        struct NoTimePlatform {
-            saved: std::cell::RefCell<Option<Vec<u8>>>,
-        }
-        impl Platform for NoTimePlatform {
+        // epoch_s() returning None gates history commits AND save_pending entirely.
+        struct NoClock;
+        impl Clock for NoClock {
             fn epoch_s(&self) -> Option<u32> {
                 None
             }
-            fn save_blob(&self, data: &[u8]) {
-                *self.saved.borrow_mut() = Some(data.to_vec());
-            }
-            fn load_blob(&self, _: &mut [u8]) -> Option<usize> {
-                None
-            }
         }
-        let platform = NoTimePlatform {
-            saved: std::cell::RefCell::new(None),
-        };
-        let mut sd = SensorData::new(platform);
+        let mut sd = SensorData::new(NoClock);
         for _ in 0..100 {
             sd.update_ps(ps_reading(13.0, 2.0));
             sd.update_battery(bat_reading(13.0, 1.0));
+            sd.try_commit();
         }
         assert!(sd.history.is_empty(), "no samples before NTP sync");
         assert!(
-            sd.platform.saved.borrow().is_none(),
-            "no NVS save before NTP sync"
+            sd.take_save_payload().is_none(),
+            "no save payload before NTP sync"
         );
     }
 
     // --- Auto-load on first update ---
 
-    /// Helper: create a SensorData with a pre-stored blob from `sd`.
-    fn sd_with_blob(sd: &mut SensorData<TestPlatform>) -> (Clock, SensorData<TestPlatform>) {
+    /// Helper: serialize `sd` and load it into a fresh `SensorData`.
+    fn sd_with_blob(sd: &mut SensorData<TestClockSrc>) -> (TestClock, SensorData<TestClockSrc>) {
         let len = sd.write();
-        let (time, platform) = TestPlatform::new();
-        platform.save_blob(&sd.buf[..len]);
-        (time, SensorData::new(platform))
+        let blob: Vec<u8> = sd.buf[..len].to_vec();
+        let (time, mut fresh) = new_sd();
+        assert!(fresh.load_from_bytes(&blob));
+        (time, fresh)
     }
 
     #[test]
@@ -964,82 +938,48 @@ mod tests {
     }
 
     #[test]
-    fn load_with_corrupt_blob_skips_gracefully() {
-        let (time, platform) = TestPlatform::new();
-        platform.save_blob(&[0xFF; 10]);
-        let mut sd = SensorData::new(platform);
-
-        time.set(1000);
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-
-        assert_eq!(sd.history.len(), 1);
-        assert_eq!(sd.history[0].time_s, 1000);
-        assert!(sd.loaded);
-    }
-
-    #[test]
-    fn loads_only_once() {
-        let (time, mut sd) = new_sd();
-        time.set(1000);
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert_eq!(sd.history.len(), 1);
-
-        // Store a blob after the first update — should NOT be loaded again
-        let (time_src, mut sd_src) = new_sd();
-        fill(&mut sd_src, 10, 500, &time_src);
-        let len = sd_src.write();
-        sd.platform.save_blob(&sd_src.buf[..len]);
-
-        time.set(1001);
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert_eq!(sd.history.len(), 2); // not 10+2
-    }
-
-    #[test]
-    fn no_blob_skips_load_gracefully() {
-        let (time, mut sd) = new_sd();
-        time.set(1000);
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert_eq!(sd.history.len(), 1);
-        assert!(sd.loaded);
+    fn load_rejects_corrupt_blob() {
+        let (_time, mut sd) = new_sd();
+        assert!(!sd.load_from_bytes(&[0xFF; 10]));
+        assert!(sd.history.is_empty());
     }
 
     // --- Periodic save ---
 
     #[test]
-    fn saves_after_interval() {
+    fn save_payload_fires_after_interval() {
         let (time, mut sd) = new_sd();
         time.set(1000);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert!(!sd.platform.has_blob());
+        assert!(sd.take_save_payload().is_none());
 
         time.set(1000 + SAVE_INTERVAL_S - 1);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert!(!sd.platform.has_blob());
+        assert!(sd.take_save_payload().is_none());
 
         time.set(1000 + SAVE_INTERVAL_S);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert!(sd.platform.take_blob().unwrap().len() > HEADER_SIZE);
+        assert!(sd.take_save_payload().unwrap().len() > HEADER_SIZE);
     }
 
     #[test]
-    fn save_timer_anchors_to_load_time() {
+    fn save_timer_anchors_to_first_commit() {
         let (time, mut sd) = new_sd();
         fill(&mut sd, 10, 1000, &time);
 
         let (time2, mut sd2) = sd_with_blob(&mut sd);
-        // Load happens at t=1009 → last_save_s = 1009
-        time2.set(1009);
+        // First commit at t=1010 anchors last_save_s — no immediate save.
+        time2.set(1010);
         update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        sd2.platform.clear_blob();
+        assert!(sd2.take_save_payload().is_none());
 
-        time2.set(1009 + SAVE_INTERVAL_S - 1);
+        time2.set(1010 + SAVE_INTERVAL_S - 1);
         update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert!(!sd2.platform.has_blob());
+        assert!(sd2.take_save_payload().is_none());
 
-        time2.set(1009 + SAVE_INTERVAL_S);
+        time2.set(1010 + SAVE_INTERVAL_S);
         update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert!(sd2.platform.has_blob());
+        assert!(sd2.take_save_payload().is_some());
     }
 
     #[test]
@@ -1050,14 +990,12 @@ mod tests {
         update(&mut sd, bat_reading(12.0, 1.0), ps_reading(12.0, 2.0));
         time.set(1101);
         update(&mut sd, bat_reading(14.0, 3.0), ps_reading(14.0, 4.0));
-        // Trigger save
         time.set(1000 + SAVE_INTERVAL_S);
         update(&mut sd, bat_reading(15.0, 9.0), ps_reading(15.0, 0.0));
-        let blob = sd.platform.take_blob().unwrap();
+        let blob = sd.take_save_payload().unwrap();
 
         let (_time2, mut sd2) = new_sd();
-        sd2.buf[..blob.len()].copy_from_slice(&blob);
-        assert!(sd2.read(blob.len()));
+        assert!(sd2.load_from_bytes(&blob));
         assert_eq!(sd2.history.len(), 103);
         assert!((sd2.history[100].voltage - 12.0).abs() < 0.001);
         assert!((sd2.history[100].battery_current - 1.0).abs() < 0.001);
@@ -1067,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_repeatedly() {
+    fn save_payload_fires_repeatedly() {
         let (time, mut sd) = new_sd();
         time.set(1000);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
@@ -1075,16 +1013,15 @@ mod tests {
         let t1 = 1000 + SAVE_INTERVAL_S;
         time.set(t1);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        let blob1 = sd.platform.take_blob().unwrap();
-        sd.platform.clear_blob();
+        let blob1 = sd.take_save_payload().unwrap();
 
         time.set(t1 + SAVE_INTERVAL_S / 2);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert!(!sd.platform.has_blob());
+        assert!(sd.take_save_payload().is_none());
 
         time.set(t1 + SAVE_INTERVAL_S);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert!(sd.platform.take_blob().unwrap().len() > blob1.len());
+        assert!(sd.take_save_payload().unwrap().len() > blob1.len());
     }
 
     #[test]
@@ -1101,11 +1038,10 @@ mod tests {
         let trigger_t = 1100 + SAVE_INTERVAL_S;
         time2.set(trigger_t);
         update(&mut sd2, bat_reading(13.0, 9.0), ps_reading(13.0, 2.0));
-        let blob = sd2.platform.take_blob().unwrap();
+        let blob = sd2.take_save_payload().unwrap();
 
         let (_time3, mut sd3) = new_sd();
-        sd3.buf[..blob.len()].copy_from_slice(&blob);
-        assert!(sd3.read(blob.len()));
+        assert!(sd3.load_from_bytes(&blob));
         assert_eq!(sd3.history.len(), 102);
         assert!((sd3.history[0].battery_current - 1.0).abs() < 0.001);
         assert!((sd3.history[100].battery_current - 7.0).abs() < 0.001);
@@ -1116,7 +1052,7 @@ mod tests {
     // --- Max interval cap ---
 
     /// Directly push samples into history, bypassing the accumulator.
-    fn push_samples(sd: &mut SensorData<TestPlatform>, n: usize, start_t: u32) {
+    fn push_samples(sd: &mut SensorData<TestClockSrc>, n: usize, start_t: u32) {
         for i in 0..n {
             assert!(
                 sd.history

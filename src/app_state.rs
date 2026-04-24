@@ -1,27 +1,26 @@
-//! Shared application state. One `Arc<AppState>` is cloned into every thread —
-//! replaces the prior module-level `static AtomicBool` globals.
+//! Shared application state. One `Arc<AppState>` is cloned into every thread.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use esp32_battery_logic::data::SensorData;
 
-use crate::platform::EspPlatform;
+use crate::platform::{EspClock, HistoryStore};
 
 pub struct AppState {
-    pub sensor_data: Mutex<SensorData<EspPlatform>>,
+    pub sensor_data: Mutex<SensorData<EspClock>>,
+    /// NVS persistence. Saves happen from producer threads outside the
+    /// `sensor_data` lock, so readers never stall on flash I/O.
+    pub history_store: HistoryStore,
     captive_portal_active: AtomicBool,
-    /// Set by the SNTP callback once system time has been synchronized.
-    /// Shared with `EspPlatform` so `epoch_s()` returns `None` until sync.
-    pub ntp_synced: Arc<AtomicBool>,
 }
 
 impl AppState {
-    pub fn new(ntp_synced: Arc<AtomicBool>, sensor_data: SensorData<EspPlatform>) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(sensor_data: SensorData<EspClock>, history_store: HistoryStore) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
             sensor_data: Mutex::new(sensor_data),
+            history_store,
             captive_portal_active: AtomicBool::new(false),
-            ntp_synced,
         })
     }
 

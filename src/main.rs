@@ -13,7 +13,6 @@ mod platform;
 mod wifi;
 mod xy;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -37,19 +36,15 @@ pub fn reboot_after(msg: &'static str) {
 
 #[allow(dead_code)]
 enum Server<'a> {
-    /// Main HTTPS dashboard + SNTP client. The SNTP lifetime is bound to Server::Main
-    /// so there is never more than one SNTP client running (two would race on the
-    /// system clock). Any transition out of Main drops the variant, which drops SNTP.
-    Main(
-        esp_idf_svc::http::server::EspHttpServer<'a>,
-        esp_idf_svc::sntp::EspSntp<'static>,
-    ),
-    /// Captive portal HTTP + DNS. No SNTP here — time sync is not needed for setup.
+    /// Main HTTPS dashboard. SNTP is owned separately (module-level) and
+    /// survives STA-up/STA-down cycles.
+    Main(esp_idf_svc::http::server::EspHttpServer<'a>),
+    /// Captive portal HTTP + DNS.
     Captive(esp_idf_svc::http::server::EspHttpServer<'a>, dns::DnsHandle),
     None,
 }
 
-fn start_sntp(flag: Arc<AtomicBool>) -> esp_idf_svc::sntp::EspSntp<'static> {
+fn start_sntp(clock: platform::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
     info!("Starting NTP sync");
     esp_idf_svc::sntp::EspSntp::new_with_callback(
         &esp_idf_svc::sntp::SntpConf::default(),
@@ -61,7 +56,7 @@ fn start_sntp(flag: Arc<AtomicBool>) -> esp_idf_svc::sntp::EspSntp<'static> {
             let secs = synced_at.as_secs();
             if platform::VALID_EPOCH_S.contains(&secs) {
                 info!("NTP synced: epoch={secs}");
-                flag.store(true, Ordering::Relaxed);
+                clock.mark_synced();
             } else {
                 warn!("NTP sync ignored: implausible epoch={secs}");
             }
@@ -91,8 +86,8 @@ fn main() {
     let nvs = Arc::new(nvs_creds::open(nvs_partition.clone()));
     let creds = nvs_creds::load(&nvs);
 
-    let ntp_synced = Arc::new(AtomicBool::new(false));
-    let esp_platform = platform::EspPlatform::new(nvs_partition.clone(), ntp_synced.clone());
+    let clock = platform::EspClock::new();
+    let history_store = platform::HistoryStore::new(nvs_partition.clone());
 
     let wifi = Arc::new(Mutex::new(wifi::Wifi::new(
         board.modem,
@@ -100,8 +95,21 @@ fn main() {
         nvs_partition,
     )));
 
-    let sensor_data = esp32_battery_logic::data::SensorData::new(esp_platform);
-    let state = AppState::new(ntp_synced, sensor_data);
+    // Load persisted history at boot so the first commit doesn't dump a stale
+    // blob and the dashboard has data before the first live commit lands.
+    let mut sensor_data = esp32_battery_logic::data::SensorData::new(clock.clone());
+    let mut load_buf = vec![0u8; esp32_battery_logic::data::HISTORY_CAPACITY * 32 + 64];
+    if let Some(len) = history_store.load(&mut load_buf)
+        && !sensor_data.load_from_bytes(&load_buf[..len])
+    {
+        warn!("history blob in NVS is corrupt or from an older version — discarding");
+    }
+
+    let state = AppState::new(sensor_data, history_store);
+
+    // SNTP runs once for the whole lifetime — the client handles WiFi flaps
+    // internally, so there's no reason to tear it down and restart.
+    let _sntp = start_sntp(clock.clone());
 
     xy::start(board.xy, state.clone());
 
@@ -119,6 +127,14 @@ fn main() {
     loop {
         thread::sleep(Duration::from_secs(1));
 
+        // Persist history if a save is due. The payload is taken under the
+        // sensor_data lock, then written to flash outside it so sensor
+        // threads don't stall on the 50–100 ms NVS erase/write.
+        let save_payload = state.sensor_data.lock().unwrap().take_save_payload();
+        if let Some(bytes) = save_payload {
+            state.history_store.save(&bytes);
+        }
+
         let connected = {
             let mut wf = wifi.lock().unwrap();
             wf.try_reconnect();
@@ -131,10 +147,8 @@ fn main() {
             (Server::None, true) => {
                 info!("WiFi connected, starting main server");
                 state.set_captive(false);
-                // server was None here — no prior SNTP to conflict with.
                 let http = http::start_main(state.clone(), nvs.clone());
-                let sntp = start_sntp(state.ntp_synced.clone());
-                server = Server::Main(http, sntp);
+                server = Server::Main(http);
             }
 
             (Server::Captive(..), true) => {
@@ -147,8 +161,6 @@ fn main() {
 
             (_, false) => {
                 warn!("WiFi disconnected, starting captive portal");
-                // Drop the old Main (which owns SNTP) and any old Captive first,
-                // before reconfiguring WiFi and starting the new captive HTTP.
                 drop(std::mem::replace(&mut server, Server::None));
                 wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
                 let (s, d) = http::start_captive(nvs.clone(), wifi.clone());
