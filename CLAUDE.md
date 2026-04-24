@@ -50,7 +50,7 @@ AI coding rules for Rust projects:
 
 ## Flashing / Serial monitor
 
-- Flash: `MCU=esp32c6 ./flash.sh` — uses `espflash flash --monitor --non-interactive`, so boot logs stream to stdout without needing a TTY. Interrupt with Ctrl-C or a `timeout` wrapper.
+- Flash: `MCU=esp32c6 ./flash.sh` — uses `espflash flash --monitor --non-interactive`, so boot logs stream to stdout without needing a TTY. Always wrap in `timeout 30` — that's enough to flash + see initial boot output. Never use the default 2-minute Bash timeout, and never the 5–10 min upper bound. If the flash itself fails, it fails fast; long timeouts only burn wall time waiting on a successful boot's monitor stream.
 - Monitor only (no flash): `espflash monitor --non-interactive --port /dev/ttyACM0`.
 
 ## Optimization Workflow

@@ -6,7 +6,7 @@ use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::BusConfig, config::Devic
 
 use esp32_battery_logic::data::Ina228Reading;
 
-use crate::AppState;
+use crate::app_state::Shared;
 use crate::board::I2cPins;
 
 const I2C_SPEED_HZ: u32 = 400_000;
@@ -80,7 +80,7 @@ fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Option<Ina228Reading> {
     })
 }
 
-pub fn start(pins: I2cPins, state: Arc<AppState>) {
+pub fn start(pins: I2cPins, shared: Arc<Shared>) {
     thread::Builder::new()
         .name("ina".into())
         .stack_size(4096)
@@ -114,7 +114,7 @@ pub fn start(pins: I2cPins, state: Arc<AppState>) {
                     }
                 }
 
-                state
+                shared
                     .sensor_data
                     .lock()
                     .unwrap()

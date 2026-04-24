@@ -23,6 +23,7 @@ esp32c3 = []
 esp32c6 = []
 lcd = ["mipidsi", "embedded-graphics"]
 ina-fake = []
+xy-fake = []
 
 [dependencies]
 esp32-battery-logic = { path = "logic" }

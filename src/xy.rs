@@ -17,7 +17,7 @@ use log::{error, warn};
 
 use esp32_battery_logic::data::PsReading;
 
-use crate::AppState;
+use crate::app_state::Shared;
 use crate::board::XyPins;
 
 const SLAVE: u8 = 0x01;
@@ -294,7 +294,15 @@ const BOOT_LVP: f32 = 10.0; // V — refuses to charge a deeply-dead / shorted p
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-pub fn start(pins: XyPins, state: Arc<AppState>) {
+#[cfg(feature = "xy-fake")]
+const FAKE_READING: PsReading = PsReading {
+    voltage: BOOT_V_SET,
+    current: 0.0,
+    power: 0.0,
+};
+
+#[cfg(not(feature = "xy-fake"))]
+pub fn start(pins: XyPins, shared: Arc<Shared>) {
     thread::Builder::new()
         .name("xy".into())
         .stack_size(4096)
@@ -316,10 +324,26 @@ pub fn start(pins: XyPins, state: Arc<AppState>) {
                             current: s.i_out,
                             power: s.p_out,
                         };
-                        state.sensor_data.lock().unwrap().update_ps(reading);
+                        shared.sensor_data.lock().unwrap().update_ps(reading);
                     }
                     Err(e) => warn!("XY read_status: {e}"),
                 }
+                thread::sleep(POLL_INTERVAL);
+            }
+        })
+        .unwrap();
+}
+
+#[cfg(feature = "xy-fake")]
+pub fn start(pins: XyPins, shared: Arc<Shared>) {
+    drop(pins);
+    thread::Builder::new()
+        .name("xy".into())
+        .stack_size(4096)
+        .spawn(move || {
+            log::info!("XY: fake mode — no UART, canned readings");
+            loop {
+                shared.sensor_data.lock().unwrap().update_ps(FAKE_READING);
                 thread::sleep(POLL_INTERVAL);
             }
         })

@@ -11,13 +11,13 @@ use log::{debug, warn};
 
 use esp32_battery_logic::battery;
 
-use crate::AppState;
 use crate::api::{ApiResponse, BatteryReading, HeapInfo, HistoryRow, PsReading, RESPONSE_BUF_SIZE};
+use crate::app_state::Shared;
 use crate::log_ring;
 
 use super::{create_server, get_rssi, serve_common_assets, serve_static, text_response};
 
-pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServer<'static> {
+pub fn start(shared: Arc<Shared>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServer<'static> {
     let mut server = create_server(10240, false, 4, Some(Duration::from_secs(0)), true);
 
     serve_common_assets(&mut server);
@@ -37,7 +37,7 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
             // Snapshot sensor state, release the lock, then serialize.
             // Keeps the measurement thread unblocked during JSON serialization.
             let response = {
-                let store = state.sensor_data.lock().unwrap();
+                let store = shared.sensor_data.lock().unwrap();
                 let bat = store.battery_reading.unwrap_or_default();
                 let ps = store.ps_reading.unwrap_or_default();
                 let power_online = store.power_online();

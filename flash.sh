@@ -12,7 +12,17 @@ esac
 
 ELF="$DIR/target/$TARGET/release/esp32-battery"
 
-cargo "$ALIAS"
+EXTRA_FEATURES=()
+[[ "${INA_FAKE:-0}" == "1" ]] && EXTRA_FEATURES+=("ina-fake")
+[[ "${XY_FAKE:-0}"  == "1" ]] && EXTRA_FEATURES+=("xy-fake")
+
+if (( ${#EXTRA_FEATURES[@]} > 0 )); then
+    JOINED="$(IFS=, ; echo "${EXTRA_FEATURES[*]}")"
+    echo "Building with extra features: $JOINED"
+    cargo "$ALIAS" --features "$JOINED"
+else
+    cargo "$ALIAS"
+fi
 
 espflash flash \
     --erase-data-parts ota \

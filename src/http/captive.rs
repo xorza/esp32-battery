@@ -11,7 +11,7 @@ use log::info;
 
 use esp32_battery_logic::form;
 
-use crate::AppState;
+use crate::app_state::Shared;
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 use crate::wifi::Wifi;
@@ -22,7 +22,7 @@ use super::{create_server, serve_common_assets, serve_static, text_response};
 const SCAN_BUF_SIZE: usize = 1024;
 
 pub fn start(
-    state: Arc<AppState>,
+    shared: Arc<Shared>,
     nvs: Arc<EspNvs<NvsDefault>>,
     wifi: Arc<Mutex<Wifi<'static>>>,
 ) -> (EspHttpServer<'static>, DnsHandle) {
@@ -94,7 +94,7 @@ pub fn start(
             }
 
             crate::nvs_creds::save(&nvs, ssid, password);
-            *state.pending_creds.lock().unwrap() = Some(WifiCredentials {
+            *shared.pending_creds.lock().unwrap() = Some(WifiCredentials {
                 ssid: ssid.to_string(),
                 password: password.to_string(),
             });

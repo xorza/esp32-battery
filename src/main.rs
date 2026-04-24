@@ -18,20 +18,10 @@ use std::thread;
 use std::time::Duration;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
 
-pub use app_state::{AppState, uptime_s};
-
-/// HTTP server + optional captive-portal DNS hijack. Held purely for `Drop`.
-/// `AppState::is_captive` is the source of truth for which kind is running.
-struct ActiveServer {
-    #[allow(dead_code)]
-    http: EspHttpServer<'static>,
-    #[allow(dead_code)]
-    dns: Option<dns::DnsHandle>,
-}
+pub use app_state::{AppState, Server, ServerKind, uptime_s};
 
 fn start_sntp(clock: platform::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
     info!("Starting NTP sync");
@@ -94,24 +84,22 @@ fn main() {
         warn!("history blob in NVS is corrupt or from an older version — discarding");
     }
 
-    let state = AppState::new(sensor_data, history_store);
+    let mut state = AppState::new(sensor_data, history_store);
 
     // SNTP runs once for the whole lifetime — the client handles WiFi flaps
     // internally, so there's no reason to tear it down and restart.
     let _sntp = start_sntp(clock.clone());
 
-    xy::start(board.xy, state.clone());
+    xy::start(board.xy, state.shared.clone());
 
-    ina::start(board.i2c, state.clone());
+    ina::start(board.i2c, state.shared.clone());
 
     #[cfg(feature = "lcd")]
-    lcd::start(board.lcd, state.clone());
+    lcd::start(board.lcd, state.shared.clone());
 
     if let Some(ref creds) = creds {
         wifi.lock().unwrap().start_sta(creds);
     }
-
-    let mut server: Option<ActiveServer> = None;
 
     loop {
         thread::sleep(Duration::from_secs(1));
@@ -119,12 +107,12 @@ fn main() {
         // Persist history if a save is due. The payload is taken under the
         // sensor_data lock, then written to flash outside it so sensor
         // threads don't stall on the 50–100 ms NVS erase/write.
-        let save_payload = state.sensor_data.lock().unwrap().take_save_payload();
+        let save_payload = state.shared.sensor_data.lock().unwrap().take_save_payload();
         if let Some(bytes) = save_payload {
             state.history_store.save(&bytes);
         }
 
-        if let Some(new_creds) = state.pending_creds.lock().unwrap().take() {
+        if let Some(new_creds) = state.shared.pending_creds.lock().unwrap().take() {
             info!("Applying credentials submitted via captive portal");
             wifi.lock().unwrap().start_sta(&new_creds);
             creds = Some(new_creds);
@@ -136,20 +124,23 @@ fn main() {
             wf.is_connected()
         };
 
-        let want_captive = !connected;
-        if server.is_none() || state.is_captive() != want_captive {
-            drop(server.take());
-            server = Some(if want_captive {
-                warn!("WiFi disconnected, starting captive portal");
-                wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
-                let (http, dns) = http::start_captive(state.clone(), nvs.clone(), wifi.clone());
-                state.set_captive(true);
-                ActiveServer { http, dns: Some(dns) }
-            } else {
-                info!("WiFi connected, starting main server");
-                state.set_captive(false);
-                ActiveServer { http: http::start_main(state.clone(), nvs.clone()), dns: None }
-            });
+        let wanted = if connected { ServerKind::Host } else { ServerKind::Captive };
+        if state.server_kind() != wanted {
+            let new = match wanted {
+                ServerKind::Captive => {
+                    warn!("WiFi disconnected, starting captive portal");
+                    wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
+                    let (http, dns) =
+                        http::start_captive(state.shared.clone(), nvs.clone(), wifi.clone());
+                    Server::Captive { http, dns }
+                }
+                ServerKind::Host => {
+                    info!("WiFi connected, starting main server");
+                    Server::Host { http: http::start_main(state.shared.clone(), nvs.clone()) }
+                }
+                ServerKind::None => unreachable!("wanted is computed as Captive or Host"),
+            };
+            state.set_server(Some(new));
         }
     }
 }

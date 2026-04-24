@@ -23,7 +23,7 @@ use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
 
-use crate::AppState;
+use crate::app_state::Shared;
 use crate::board::LcdPins;
 
 // --- SPI / DMA ---
@@ -409,7 +409,7 @@ fn draw_captive_portal(gb: &mut GraphBuf) {
 
 // --- Main thread ---
 
-pub fn start(pins: LcdPins, state: Arc<AppState>) {
+pub fn start(pins: LcdPins, shared: Arc<Shared>) {
     thread::Builder::new()
         .stack_size(16384)
         .spawn(move || {
@@ -476,7 +476,7 @@ pub fn start(pins: LcdPins, state: Arc<AppState>) {
                 thread::sleep(REFRESH_INTERVAL);
 
                 let (r1, r2, uptime_s, history, interval) = {
-                    let sd = state.sensor_data.lock().unwrap();
+                    let sd = shared.sensor_data.lock().unwrap();
                     let hist: heapless::Vec<(u32, f32, f32, f32, f32), HISTORY_CAPACITY> = sd
                         .history()
                         .iter()
@@ -557,7 +557,7 @@ pub fn start(pins: LcdPins, state: Arc<AppState>) {
                 fb.blit_rows(&mut display, Point::new(UPTIME_X, 0), 12);
 
                 // Graph / Captive portal
-                let is_captive = state.is_captive();
+                let is_captive = shared.is_captive();
                 if !(is_captive && prev_captive) {
                     prev_captive = is_captive;
                     gb.clear();
