@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use esp_idf_hal::uart::{UartDriver, config::Config};
 use esp_idf_hal::units::Hertz;
-use log::{info, warn};
+use log::{error, info, warn};
 
 use esp32_battery_logic::data::PsReading;
 
@@ -28,6 +28,10 @@ const REG_I_SET: u16 = 0x0001;
 const REG_OUTPUT_EN: u16 = 0x0012;
 const BAUD: u32 = 115200;
 const RESPONSE_TIMEOUT_MS: u64 = 500;
+/// Silence enforced after every write so the XY has time to process the
+/// previous command and re-arm its Modbus listener. Spec floor at 115200 baud
+/// is 1.75 ms, but cheap Chinese slaves like the XY7025 empirically want more.
+const POST_WRITE_GAP: Duration = Duration::from_millis(10);
 
 pub fn crc16_modbus(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
@@ -124,14 +128,19 @@ impl<'d> Xy<'d> {
     }
 
     /// Modbus fn 0x06 write, with one retry on short/failed response.
+    /// Always sleeps `POST_WRITE_GAP` on return so back-to-back writes satisfy
+    /// the XY's inter-frame silence requirement without callers handling it.
     pub fn write_holding(&self, addr: u16, value: u16) -> Result<(), XyError> {
-        match self.write_holding_once(addr, value) {
+        let result = match self.write_holding_once(addr, value) {
             Ok(()) => Ok(()),
             Err(_) => {
+                warn!("write_holding: first attempt failed, retrying");
                 thread::sleep(Duration::from_millis(80));
                 self.write_holding_once(addr, value)
             }
-        }
+        };
+        thread::sleep(POST_WRITE_GAP);
+        result
     }
 
     fn write_holding_once(&self, addr: u16, value: u16) -> Result<(), XyError> {
@@ -173,18 +182,31 @@ impl<'d> Xy<'d> {
         Ok(())
     }
 
-    pub fn set_voltage(&self, volts: f32) -> Result<(), XyError> {
+    /// Setting CV on the XY. On failure the output is forced OFF for safety —
+    /// the caller gets a stale setpoint but never an unintended voltage.
+    pub fn set_voltage(&self, volts: f32) {
         let v = (volts * 100.0).round() as u16;
-        self.write_holding(REG_V_SET, v)
+        if let Err(e) = self.write_holding(REG_V_SET, v) {
+            self.set_output(false);
+            error!("XY set_voltage({volts:.2} V) failed: {e} — disabling output");
+        }
     }
 
-    pub fn set_current_limit(&self, amps: f32) -> Result<(), XyError> {
+    /// Setting CC limit on the XY. On failure the output is forced OFF for safety.
+    pub fn set_current_limit(&self, amps: f32) {
         let i = (amps * 100.0).round() as u16;
-        self.write_holding(REG_I_SET, i)
+        if let Err(e) = self.write_holding(REG_I_SET, i) {
+            self.set_output(false);
+            error!("XY set_current_limit({amps:.2} A) failed: {e} — disabling output");
+        }
     }
 
-    pub fn set_output(&self, on: bool) -> Result<(), XyError> {
-        self.write_holding(REG_OUTPUT_EN, if on { 1 } else { 0 })
+    /// Output-enable is safety-critical: we can never leave the device in an
+    /// ambiguous state. Panics on failure → watchdog reset via the panic hook.
+    pub fn set_output(&self, on: bool) {
+        if let Err(e) = self.write_holding(REG_OUTPUT_EN, if on { 1 } else { 0 }) {
+            panic!("XY set_output({on}) failed: {e} — triggering reset");
+        }
     }
 
     pub fn read_status(&self) -> Result<XyStatus, XyError> {
@@ -238,7 +260,6 @@ impl std::fmt::Display for XyError {
 const BOOT_V_SET: f32 = 13.6;
 const BOOT_I_SET: f32 = 1.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
-const COMMAND_GAP: Duration = Duration::from_millis(150);
 
 pub fn start(pins: XyPins, state: Arc<AppState>) {
     thread::Builder::new()
@@ -249,19 +270,11 @@ pub fn start(pins: XyPins, state: Arc<AppState>) {
             thread::sleep(Duration::from_millis(100));
 
             // Always start with output disabled for safety. Setpoints are applied so the
-            // first manual enable immediately charges at the intended target.
-            if let Err(e) = xy.set_output(false) {
-                warn!("XY set_output(off): {e}");
-            }
-            thread::sleep(COMMAND_GAP);
-            if let Err(e) = xy.set_voltage(BOOT_V_SET) {
-                warn!("XY set_voltage: {e}");
-            }
-            thread::sleep(COMMAND_GAP);
-            if let Err(e) = xy.set_current_limit(BOOT_I_SET) {
-                warn!("XY set_current_limit: {e}");
-            }
-            thread::sleep(COMMAND_GAP);
+            // first manual enable immediately delivers at the intended target.
+            // Inter-command silence is handled inside write_holding.
+            xy.set_output(false);
+            xy.set_voltage(BOOT_V_SET);
+            xy.set_current_limit(BOOT_I_SET);
 
             loop {
                 match xy.read_status() {
