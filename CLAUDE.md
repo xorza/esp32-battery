@@ -15,6 +15,7 @@ AI coding rules for Rust projects:
 - Remove unused code. If kept intentionally, add a comment explaining why and silence linter warnings.
 - Keep public API clean and consistent.
 - Never use `#[cfg(test)]` on functions in production code. If tests need convenience helpers, define them in the test module itself.
+- Comments only when needed to explain *why* (non-obvious constraint, surprising choice, workaround). Never restate what the code does. Keep them short — one line where possible. Don't write multi-paragraph doc comments.
 
 ## Verification
 

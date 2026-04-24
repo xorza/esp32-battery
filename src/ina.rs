@@ -2,11 +2,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::DeviceConfig};
+use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::BusConfig, config::DeviceConfig};
 
 use esp32_battery_logic::data::Ina228Reading;
 
 use crate::AppState;
+use crate::board::I2cPins;
 
 const I2C_SPEED_HZ: u32 = 400_000;
 const BATTERY_INA_ADDR: u8 = 0x40;
@@ -79,11 +80,15 @@ fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Option<Ina228Reading> {
     })
 }
 
-pub fn start_measurement_thread(i2c_bus: &'static I2cBusDriver<'static>, state: Arc<AppState>) {
+pub fn start(pins: I2cPins, state: Arc<AppState>) {
     thread::Builder::new()
         .name("ina".into())
         .stack_size(4096)
         .spawn(move || {
+            // Bus is leaked for `'static` — it lives for the whole process lifetime.
+            let i2c_bus: &'static I2cBusDriver<'static> = Box::leak(Box::new(
+                I2cBusDriver::new(pins.i2c, pins.sda, pins.scl, &BusConfig::new()).unwrap(),
+            ));
             let dev_config = DeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
             let ina = I2cDriver::new(i2c_bus, BATTERY_INA_ADDR, &dev_config)
                 .ok()

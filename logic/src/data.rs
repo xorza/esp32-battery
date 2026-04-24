@@ -6,9 +6,10 @@ const SAMPLE_SIZE: usize = 4 + 4 * 4; // u32 + 4×f32 = 20 bytes
 /// registers as online. ~2 V covers noise/leakage while staying well below
 /// any real rail.
 const POWER_ONLINE_VOLTAGE_THRESHOLD: f32 = 2.0;
-const MAX_BLOB_SIZE: usize = 4096;
-/// Max samples that fit in MAX_BLOB_SIZE. 204 × 1024s ≈ 58 hours of history.
-pub const HISTORY_CAPACITY: usize = (MAX_BLOB_SIZE - HEADER_SIZE) / SAMPLE_SIZE / 2 * 2;
+/// Upper bound on the serialized history blob — also the in-memory scratch size.
+pub const SERIALIZED_MAX_BYTES: usize = 4096;
+/// Max samples that fit in SERIALIZED_MAX_BYTES. 204 × 1024s ≈ 58 hours of history.
+pub const HISTORY_CAPACITY: usize = (SERIALIZED_MAX_BYTES - HEADER_SIZE) / SAMPLE_SIZE / 2 * 2;
 // Once interval reaches this, drop old samples instead of compacting further.
 // 204 samples × 1024s ≈ 58h (covers 24h with margin).
 const MAX_INTERVAL: u32 = 1024;
@@ -17,8 +18,8 @@ const _: () = assert!(
     "HISTORY_CAPACITY must be even"
 );
 const _: () = assert!(
-    HEADER_SIZE + HISTORY_CAPACITY * SAMPLE_SIZE <= MAX_BLOB_SIZE,
-    "serialized history must fit in MAX_BLOB_SIZE"
+    HEADER_SIZE + HISTORY_CAPACITY * SAMPLE_SIZE <= SERIALIZED_MAX_BYTES,
+    "serialized history must fit in SERIALIZED_MAX_BYTES"
 );
 const SAVE_INTERVAL_S: u32 = 600;
 
@@ -112,7 +113,7 @@ pub struct SensorData<C: Clock> {
     /// `last_save_s` so we don't immediately save a just-loaded blob.
     anchored: bool,
     last_save_s: u32,
-    buf: Box<[u8; MAX_BLOB_SIZE]>,
+    buf: Box<[u8; SERIALIZED_MAX_BYTES]>,
 }
 
 struct BufWriter<'a> {
@@ -180,7 +181,7 @@ impl<C: Clock> SensorData<C> {
             save_pending: false,
             anchored: false,
             last_save_s: 0,
-            buf: Box::new([0u8; MAX_BLOB_SIZE]),
+            buf: Box::new([0u8; SERIALIZED_MAX_BYTES]),
         }
     }
 

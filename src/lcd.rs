@@ -409,7 +409,7 @@ fn draw_captive_portal(gb: &mut GraphBuf) {
 
 // --- Main thread ---
 
-pub fn start_lcd_thread(pins: LcdPins, state: Arc<AppState>) {
+pub fn start(pins: LcdPins, state: Arc<AppState>) {
     thread::Builder::new()
         .stack_size(16384)
         .spawn(move || {

@@ -92,7 +92,7 @@ pub fn start(
 
             crate::nvs_creds::save(&nvs, ssid, password);
             text_response(req, 200, b"OK")?;
-            crate::reboot_after("Rebooting after WiFi setup");
+            crate::platform::reboot_after("Rebooting after WiFi setup");
             Ok::<(), EspError>(())
         })
         .unwrap();

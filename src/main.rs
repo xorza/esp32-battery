@@ -18,30 +18,26 @@ use std::thread;
 use std::time::Duration;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
 
 pub use app_state::{AppState, uptime_s};
 
-pub fn reboot_after(msg: &'static str) {
-    thread::Builder::new()
-        .stack_size(4096)
-        .spawn(move || {
-            thread::sleep(Duration::from_secs(2));
-            info!("{}", msg);
-            esp_idf_svc::hal::reset::restart();
-        })
-        .unwrap();
+/// HTTP server currently bound to the network interface. Held purely for
+/// `Drop` — the server runs on its own task. `dns` is `Some` iff the captive
+/// portal is active; tearing it down stops the DNS hijack alongside HTTP.
+struct ActiveServer {
+    #[allow(dead_code)]
+    http: EspHttpServer<'static>,
+    #[allow(dead_code)]
+    dns: Option<dns::DnsHandle>,
 }
 
-#[allow(dead_code)]
-enum Server<'a> {
-    /// Main HTTPS dashboard. SNTP is owned separately (module-level) and
-    /// survives STA-up/STA-down cycles.
-    Main(esp_idf_svc::http::server::EspHttpServer<'a>),
-    /// Captive portal HTTP + DNS.
-    Captive(esp_idf_svc::http::server::EspHttpServer<'a>, dns::DnsHandle),
-    None,
+impl ActiveServer {
+    fn is_captive(&self) -> bool {
+        self.dns.is_some()
+    }
 }
 
 fn start_sntp(clock: platform::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
@@ -98,7 +94,7 @@ fn main() {
     // Load persisted history at boot so the first commit doesn't dump a stale
     // blob and the dashboard has data before the first live commit lands.
     let mut sensor_data = esp32_battery_logic::data::SensorData::new(clock.clone());
-    let mut load_buf = vec![0u8; esp32_battery_logic::data::HISTORY_CAPACITY * 32 + 64];
+    let mut load_buf = vec![0u8; esp32_battery_logic::data::SERIALIZED_MAX_BYTES];
     if let Some(len) = history_store.load(&mut load_buf)
         && !sensor_data.load_from_bytes(&load_buf[..len])
     {
@@ -113,16 +109,16 @@ fn main() {
 
     xy::start(board.xy, state.clone());
 
-    ina::start_measurement_thread(board.i2c.init_bus(), state.clone());
+    ina::start(board.i2c, state.clone());
 
     #[cfg(feature = "lcd")]
-    lcd::start_lcd_thread(board.lcd, state.clone());
+    lcd::start(board.lcd, state.clone());
 
     if let Some(ref creds) = creds {
         wifi.lock().unwrap().start_sta(creds);
     }
 
-    let mut server = Server::None;
+    let mut server: Option<ActiveServer> = None;
 
     loop {
         thread::sleep(Duration::from_secs(1));
@@ -141,30 +137,31 @@ fn main() {
             wf.is_connected()
         };
 
-        match (&server, connected) {
-            (Server::Main(..), true) | (Server::Captive(..), false) => {}
+        let have_main = server.as_ref().is_some_and(|s| !s.is_captive());
+        let have_captive = server.as_ref().is_some_and(ActiveServer::is_captive);
 
-            (Server::None, true) => {
+        match connected {
+            true if have_main => {}
+            false if have_captive => {}
+
+            true => {
                 info!("WiFi connected, starting main server");
                 state.set_captive(false);
+                // Drop captive (if any) before binding port 443.
+                drop(server.take());
                 let http = http::start_main(state.clone(), nvs.clone());
-                server = Server::Main(http);
+                server = Some(ActiveServer { http, dns: None });
             }
 
-            (Server::Captive(..), true) => {
-                info!("WiFi reconnected, switching to STA-only");
-                state.set_captive(false);
-                server = Server::None;
-                let creds = creds.as_ref().expect("connected requires credentials");
-                wifi.lock().unwrap().start_sta(creds);
-            }
-
-            (_, false) => {
+            false => {
                 warn!("WiFi disconnected, starting captive portal");
-                drop(std::mem::replace(&mut server, Server::None));
+                drop(server.take());
                 wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
-                let (s, d) = http::start_captive(nvs.clone(), wifi.clone());
-                server = Server::Captive(s, d);
+                let (http, dns) = http::start_captive(nvs.clone(), wifi.clone());
+                server = Some(ActiveServer {
+                    http,
+                    dns: Some(dns),
+                });
                 state.set_captive(true);
             }
         }
