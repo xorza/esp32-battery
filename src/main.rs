@@ -23,8 +23,11 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
 
+use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
+
 pub use app_state::{AppState, uptime_s};
 
+use crate::clock::EspClock;
 use crate::nvs_creds::WifiCredentials;
 
 /// Number of consecutive 1 Hz ticks with `is_connected() == false` before we
@@ -32,13 +35,22 @@ use crate::nvs_creds::WifiCredentials;
 /// initial DHCP/DNS at boot and brief link blips without flapping the SSID.
 const CAPTIVE_AFTER_FAILURES: u32 = 15;
 
-fn tick_and_persist(state: &AppState) {
+fn tick_and_persist(state: &AppState, clock: &EspClock, scheduler: &mut SaveScheduler) {
+    let now = clock.epoch_s();
+    // Tick the data store and (if the save timer fires) serialize under one
+    // lock — keeps NVS I/O out of the critical section but avoids a two-lock
+    // dance + stale-state window between them.
     let payload = {
         let mut sd = state.shared.sensor_data.lock().unwrap();
-        sd.tick();
-        sd.take_save_payload()
+        sd.tick(now);
+        if scheduler.tick(now) {
+            Some(sd.serialize())
+        } else {
+            None
+        }
     };
     if let Some(bytes) = payload {
+        log::info!("Emitting save payload: {} bytes", bytes.len());
         state.history_store.save(&bytes);
     }
 }
@@ -113,7 +125,7 @@ fn main() {
 
     // Load persisted history at boot so the first commit doesn't dump a stale
     // blob and the dashboard has data before the first live commit lands.
-    let mut sensor_data = esp32_battery_logic::data::SensorData::new(clock.clone());
+    let mut sensor_data = esp32_battery_logic::data::SensorData::new();
     let mut load_buf = vec![0u8; esp32_battery_logic::data::SERIALIZED_MAX_BYTES];
     if let Some(len) = history_store.load(&mut load_buf)
         && !sensor_data.load_from_bytes(&load_buf[..len])
@@ -122,6 +134,7 @@ fn main() {
     }
 
     let mut state = AppState::new(sensor_data, history_store);
+    let mut save_scheduler = SaveScheduler::new(DEFAULT_SAVE_INTERVAL_S);
 
     // SNTP runs once for the whole lifetime — the client handles WiFi flaps
     // internally, so there's no reason to tear it down and restart.
@@ -142,7 +155,7 @@ fn main() {
     loop {
         thread::sleep(Duration::from_secs(1));
 
-        tick_and_persist(&state);
+        tick_and_persist(&state, &clock, &mut save_scheduler);
 
         if let Some(new) = drain_pending_creds(&mut state, &wifi) {
             creds = Some(new);

@@ -3,8 +3,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use esp32_battery_logic::data::Clock;
-
 /// Plausibility bounds on the system clock. The SNTP callback fires even when
 /// the system time hasn't actually been set to something sensible (e.g. a
 /// poisoned reply, a captive-portal NTP spoof, or a pre-sync tick), and once
@@ -28,10 +26,8 @@ impl EspClock {
     pub fn mark_synced(&self) {
         self.ntp_synced.store(true, Ordering::Relaxed);
     }
-}
 
-impl Clock for EspClock {
-    fn epoch_s(&self) -> Option<u32> {
+    pub fn epoch_s(&self) -> Option<u32> {
         if !self.ntp_synced.load(Ordering::Relaxed) {
             return None;
         }

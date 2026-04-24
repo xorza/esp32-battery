@@ -11,7 +11,6 @@ use log::{info, warn};
 
 use esp32_battery_logic::data::SensorData;
 
-use crate::clock::EspClock;
 use crate::dns::DnsHandle;
 use crate::history_store::HistoryStore;
 use crate::nvs_creds::WifiCredentials;
@@ -77,7 +76,7 @@ impl NetPhase {
 
 /// Cross-thread subset. Cloned (as `Arc<Shared>`) into every worker thread.
 pub struct Shared {
-    pub sensor_data: Mutex<SensorData<EspClock>>,
+    pub sensor_data: Mutex<SensorData>,
     /// Set by the captive `/save` handler when fresh credentials land.
     /// Drained by the main loop, which then drives the live STA reconnect.
     pub pending_creds: Mutex<Option<WifiCredentials>>,
@@ -97,7 +96,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(sensor_data: SensorData<EspClock>, history_store: HistoryStore) -> Self {
+    pub fn new(sensor_data: SensorData, history_store: HistoryStore) -> Self {
         Self {
             shared: Arc::new(Shared {
                 sensor_data: Mutex::new(sensor_data),
