@@ -137,33 +137,28 @@ fn main() {
             wf.is_connected()
         };
 
-        let have_main = server.as_ref().is_some_and(|s| !s.is_captive());
-        let have_captive = server.as_ref().is_some_and(ActiveServer::is_captive);
+        let want_captive = !connected;
+        let have_captive = server.as_ref().map(ActiveServer::is_captive);
 
-        match connected {
-            true if have_main => {}
-            false if have_captive => {}
-
-            true => {
-                info!("WiFi connected, starting main server");
-                state.set_captive(false);
-                // Drop captive (if any) before binding port 443.
-                drop(server.take());
-                let http = http::start_main(state.clone(), nvs.clone());
-                server = Some(ActiveServer { http, dns: None });
-            }
-
-            false => {
+        if have_captive != Some(want_captive) {
+            drop(server.take());
+            server = Some(if want_captive {
                 warn!("WiFi disconnected, starting captive portal");
-                drop(server.take());
                 wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
                 let (http, dns) = http::start_captive(nvs.clone(), wifi.clone());
-                server = Some(ActiveServer {
+                state.set_captive(true);
+                ActiveServer {
                     http,
                     dns: Some(dns),
-                });
-                state.set_captive(true);
-            }
+                }
+            } else {
+                info!("WiFi connected, starting main server");
+                state.set_captive(false);
+                ActiveServer {
+                    http: http::start_main(state.clone(), nvs.clone()),
+                    dns: None,
+                }
+            });
         }
     }
 }
