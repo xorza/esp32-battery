@@ -521,7 +521,9 @@ pub fn start_lcd_thread(pins: LcdPins, state: Arc<AppState>) {
                 );
 
                 buf.clear();
-                let _ = write!(buf, "{:.3} A", r1.current);
+                // Sign is conveyed by color (green=charging, orange=discharging);
+                // show magnitude only.
+                let _ = write!(buf, "{:.3} A", r1.current.abs());
                 draw_value(
                     &mut display,
                     &mut fb,
