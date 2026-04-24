@@ -5,14 +5,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use esp32_battery_logic::data::SensorData;
 
+use crate::nvs_creds::WifiCredentials;
 use crate::platform::{EspClock, HistoryStore};
 
 pub struct AppState {
     pub sensor_data: Mutex<SensorData<EspClock>>,
-    /// NVS persistence. Saves happen from producer threads outside the
-    /// `sensor_data` lock, so readers never stall on flash I/O.
     pub history_store: HistoryStore,
     captive_portal_active: AtomicBool,
+    /// Set by the captive portal `/save` handler when fresh credentials land.
+    /// Drained by the main loop, which then drives the live STA reconnect.
+    pub pending_creds: Mutex<Option<WifiCredentials>>,
 }
 
 impl AppState {
@@ -21,6 +23,7 @@ impl AppState {
             sensor_data: Mutex::new(sensor_data),
             history_store,
             captive_portal_active: AtomicBool::new(false),
+            pending_creds: Mutex::new(None),
         })
     }
 

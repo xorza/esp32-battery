@@ -24,20 +24,13 @@ use log::{info, warn};
 
 pub use app_state::{AppState, uptime_s};
 
-/// HTTP server currently bound to the network interface. Held purely for
-/// `Drop` — the server runs on its own task. `dns` is `Some` iff the captive
-/// portal is active; tearing it down stops the DNS hijack alongside HTTP.
+/// HTTP server + optional captive-portal DNS hijack. Held purely for `Drop`.
+/// `AppState::is_captive` is the source of truth for which kind is running.
 struct ActiveServer {
     #[allow(dead_code)]
     http: EspHttpServer<'static>,
     #[allow(dead_code)]
     dns: Option<dns::DnsHandle>,
-}
-
-impl ActiveServer {
-    fn is_captive(&self) -> bool {
-        self.dns.is_some()
-    }
 }
 
 fn start_sntp(clock: platform::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
@@ -80,7 +73,7 @@ fn main() {
     let nvs_partition = EspDefaultNvsPartition::take().unwrap();
 
     let nvs = Arc::new(nvs_creds::open(nvs_partition.clone()));
-    let creds = nvs_creds::load(&nvs);
+    let mut creds = nvs_creds::load(&nvs);
 
     let clock = platform::EspClock::new();
     let history_store = platform::HistoryStore::new(nvs_partition.clone());
@@ -131,6 +124,12 @@ fn main() {
             state.history_store.save(&bytes);
         }
 
+        if let Some(new_creds) = state.pending_creds.lock().unwrap().take() {
+            info!("Applying credentials submitted via captive portal");
+            wifi.lock().unwrap().start_sta(&new_creds);
+            creds = Some(new_creds);
+        }
+
         let connected = {
             let mut wf = wifi.lock().unwrap();
             wf.try_reconnect();
@@ -138,26 +137,18 @@ fn main() {
         };
 
         let want_captive = !connected;
-        let have_captive = server.as_ref().map(ActiveServer::is_captive);
-
-        if have_captive != Some(want_captive) {
+        if server.is_none() || state.is_captive() != want_captive {
             drop(server.take());
             server = Some(if want_captive {
                 warn!("WiFi disconnected, starting captive portal");
                 wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
-                let (http, dns) = http::start_captive(nvs.clone(), wifi.clone());
+                let (http, dns) = http::start_captive(state.clone(), nvs.clone(), wifi.clone());
                 state.set_captive(true);
-                ActiveServer {
-                    http,
-                    dns: Some(dns),
-                }
+                ActiveServer { http, dns: Some(dns) }
             } else {
                 info!("WiFi connected, starting main server");
                 state.set_captive(false);
-                ActiveServer {
-                    http: http::start_main(state.clone(), nvs.clone()),
-                    dns: None,
-                }
+                ActiveServer { http: http::start_main(state.clone(), nvs.clone()), dns: None }
             });
         }
     }
