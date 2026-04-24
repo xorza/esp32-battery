@@ -10,8 +10,10 @@ use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::sys::EspError;
 use log::{debug, warn};
 use serde::Serialize;
+use serde::ser::SerializeSeq;
 
 use esp32_battery_logic::battery;
+use esp32_battery_logic::data::Sample;
 
 use crate::app_state::Shared;
 use crate::http::text_response;
@@ -30,19 +32,25 @@ pub struct PsReading {
     pub power: f32,
 }
 
-/// Serializes as a JSON array `[time_s, voltage, bat_current, ps_current, power_online]`.
-#[derive(Serialize)]
-pub struct HistoryRow(pub u32, pub f32, pub f32, pub f32, pub f32);
+/// Serializes a borrowed slice of history samples as a JSON array of 5-tuples
+/// `[time_s, voltage, bat_current, ps_current, power_online]`. The wrapper
+/// lets us build the `ApiResponse` + serialize it without first cloning the
+/// history into an owned `Vec<HistoryRow>`.
+pub struct HistoryView<'a>(pub &'a [Sample]);
 
-impl From<&esp32_battery_logic::data::Sample> for HistoryRow {
-    fn from(s: &esp32_battery_logic::data::Sample) -> Self {
-        Self(
-            s.time_s,
-            s.voltage,
-            s.battery_current,
-            s.ps_current,
-            s.power_online,
-        )
+impl Serialize for HistoryView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.0.len()))?;
+        for sample in self.0 {
+            seq.serialize_element(&(
+                sample.time_s,
+                sample.voltage,
+                sample.battery_current,
+                sample.ps_current,
+                sample.power_online,
+            ))?;
+        }
+        seq.end()
     }
 }
 
@@ -66,7 +74,7 @@ impl HeapInfo {
 }
 
 #[derive(Serialize)]
-pub struct ApiResponse {
+pub struct ApiResponse<'a> {
     pub uptime: u32,
     pub rssi: i32,
     pub voltage: f32,
@@ -74,7 +82,7 @@ pub struct ApiResponse {
     pub heap: HeapInfo,
     pub battery: BatteryReading,
     pub ps: PsReading,
-    pub history: Vec<HistoryRow>,
+    pub history: HistoryView<'a>,
 }
 
 /// Response buffer. Typical size is ~5 KiB (144 rows × ~30 chars). Bad sensor readings
@@ -96,34 +104,31 @@ pub fn register(server: &mut EspHttpServer<'static>, shared: Arc<Shared>) {
 
     server
         .fn_handler("/api", esp_idf_svc::http::Method::Get, move |req| {
-            // Snapshot sensor state, release the lock, then serialize.
-            // Keeps the measurement thread unblocked during JSON serialization.
-            let response = {
-                let store = shared.sensor_data.lock().unwrap();
-                let bat = store.battery_reading().unwrap_or_default();
-                let ps = store.ps_reading().unwrap_or_default();
-                let power_online = store.power_online();
-                let history_rows: Vec<HistoryRow> =
-                    store.history().iter().map(HistoryRow::from).collect();
-
-                ApiResponse {
-                    uptime: crate::uptime_s(),
-                    rssi: get_rssi(),
-                    voltage: bat.voltage,
-                    power_online,
-                    heap: HeapInfo::new(),
-                    battery: BatteryReading {
-                        soc: battery::ocv_soc(bat.voltage),
-                        current: bat.current,
-                        power: bat.power,
-                    },
-                    ps: PsReading {
-                        voltage: ps.voltage,
-                        current: ps.current,
-                        power: ps.power,
-                    },
-                    history: history_rows,
-                }
+            // Hold the sensor-data lock through JSON serialization — the
+            // history is borrowed, not cloned. Measurement-thread latency
+            // is bounded by serialization time (~1 ms for ~200 samples) and
+            // the JSON buffer lives outside the lock so no alloc happens
+            // here.
+            let store = shared.sensor_data.lock().unwrap();
+            let bat = store.battery_reading().unwrap_or_default();
+            let ps = store.ps_reading().unwrap_or_default();
+            let response = ApiResponse {
+                uptime: crate::uptime_s(),
+                rssi: get_rssi(),
+                voltage: bat.voltage,
+                power_online: store.power_online(),
+                heap: HeapInfo::new(),
+                battery: BatteryReading {
+                    soc: battery::ocv_soc(bat.voltage),
+                    current: bat.current,
+                    power: bat.power,
+                },
+                ps: PsReading {
+                    voltage: ps.voltage,
+                    current: ps.current,
+                    power: ps.power,
+                },
+                history: HistoryView(store.history()),
             };
 
             let mut guard = json_buf.lock().unwrap();
@@ -135,12 +140,12 @@ pub fn register(server: &mut EspHttpServer<'static>, shared: Arc<Shared>) {
                     return text_response(req, 500, b"serialization error");
                 }
             };
+            let history_len = response.history.0.len();
+            drop(store);
 
             debug!(
                 "API: history={} json={}/{}",
-                response.history.len(),
-                len,
-                RESPONSE_BUF_SIZE,
+                history_len, len, RESPONSE_BUF_SIZE,
             );
 
             let mut resp = req
