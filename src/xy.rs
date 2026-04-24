@@ -31,14 +31,16 @@ mod real {
     use log::{error, warn};
 
     use esp32_battery_logic::data::PsReading;
+    use esp32_battery_logic::modbus::{
+        ModbusError, build_read_request, build_write_request, parse_read_response,
+        parse_write_response,
+    };
 
     use super::{BOOT_V_SET, POLL_INTERVAL};
     use crate::app_state::Shared;
     use crate::board::XyPins;
 
     const SLAVE: u8 = 0x01;
-    const FN_READ_HOLDING: u8 = 0x03;
-    const FN_WRITE_HOLDING: u8 = 0x06;
     const REG_V_SET: u16 = 0x0000;
     const REG_I_SET: u16 = 0x0001;
     const REG_OUTPUT_EN: u16 = 0x0012;
@@ -60,27 +62,12 @@ mod real {
     const BOOT_OCP: f32 = 16.0; // A — well above any normal CC current
     const BOOT_LVP: f32 = 10.0; // V — refuses to charge a deeply-dead / shorted pack
 
-    pub fn crc16_modbus(data: &[u8]) -> u16 {
-        let mut crc: u16 = 0xFFFF;
-        for &b in data {
-            crc ^= b as u16;
-            for _ in 0..8 {
-                if crc & 1 != 0 {
-                    crc = (crc >> 1) ^ 0xA001;
-                } else {
-                    crc >>= 1;
-                }
-            }
-        }
-        crc
-    }
-
-    pub struct Xy<'d> {
+    struct Xy<'d> {
         uart: UartDriver<'d>,
     }
 
     impl<'d> Xy<'d> {
-        pub fn new(pins: XyPins) -> Self {
+        fn new(pins: XyPins) -> Self {
             let config = Config::new().baudrate(Hertz(BAUD));
             let uart = UartDriver::new(
                 pins.uart,
@@ -94,65 +81,15 @@ mod real {
             Self { uart }
         }
 
-        pub fn read_holding(&self, addr: u16, count: u16) -> Result<Vec<u16>, XyError> {
+        fn read_holding(&self, addr: u16, count: u16) -> Result<Vec<u16>, ModbusError> {
             assert!(count > 0 && count <= 125);
-
-            let mut req = [0u8; 8];
-            req[0] = SLAVE;
-            req[1] = FN_READ_HOLDING;
-            req[2..4].copy_from_slice(&addr.to_be_bytes());
-            req[4..6].copy_from_slice(&count.to_be_bytes());
-            let crc = crc16_modbus(&req[..6]);
-            req[6] = crc as u8;
-            req[7] = (crc >> 8) as u8;
-
-            self.uart.clear_rx().ok();
-            self.uart.write(&req).map_err(|_| XyError::WriteFailed)?;
-            self.uart.wait_tx_done(100).ok();
-
-            let mut resp = [0u8; 64];
-            let mut n = 0usize;
-            let deadline = Instant::now() + Duration::from_millis(RESPONSE_TIMEOUT_MS);
-            while n < resp.len() && Instant::now() < deadline {
-                match self.uart.read(&mut resp[n..], 2) {
-                    Ok(k) if k > 0 => n += k,
-                    _ if n > 0 => break,
-                    _ => {}
-                }
-            }
-            if n == 0 {
-                return Err(XyError::ReadFailed);
-            }
-
-            if n < 5 {
-                return Err(XyError::ShortResponse(n));
-            }
-            if resp[0] != SLAVE {
-                return Err(XyError::BadSlave(resp[0]));
-            }
-            if resp[1] & 0x80 != 0 {
-                return Err(XyError::ModbusException(resp[2]));
-            }
-            let expected_len = 5 + 2 * count as usize;
-            if resp[1] != FN_READ_HOLDING || resp[2] as usize != 2 * count as usize {
-                return Err(XyError::BadHeader);
-            }
-            if n < expected_len {
-                return Err(XyError::ShortResponse(n));
-            }
-
-            let crc_got = u16::from_le_bytes([resp[expected_len - 2], resp[expected_len - 1]]);
-            let crc_calc = crc16_modbus(&resp[..expected_len - 2]);
-            if crc_got != crc_calc {
-                return Err(XyError::BadCrc);
-            }
-
-            Ok((0..count as usize)
-                .map(|i| u16::from_be_bytes([resp[3 + 2 * i], resp[4 + 2 * i]]))
-                .collect())
+            let req = build_read_request(SLAVE, addr, count);
+            let mut resp = [0u8; 256];
+            let n = self.transact(&req, &mut resp)?;
+            parse_read_response(&resp[..n], SLAVE, count)
         }
 
-        pub fn write_holding(&self, addr: u16, value: u16) -> Result<(), XyError> {
+        fn write_holding(&self, addr: u16, value: u16) -> Result<(), ModbusError> {
             let result = match self.write_holding_once(addr, value) {
                 Ok(()) => Ok(()),
                 Err(_) => {
@@ -165,21 +102,20 @@ mod real {
             result
         }
 
-        fn write_holding_once(&self, addr: u16, value: u16) -> Result<(), XyError> {
-            let mut req = [0u8; 8];
-            req[0] = SLAVE;
-            req[1] = FN_WRITE_HOLDING;
-            req[2..4].copy_from_slice(&addr.to_be_bytes());
-            req[4..6].copy_from_slice(&value.to_be_bytes());
-            let crc = crc16_modbus(&req[..6]);
-            req[6] = crc as u8;
-            req[7] = (crc >> 8) as u8;
+        fn write_holding_once(&self, addr: u16, value: u16) -> Result<(), ModbusError> {
+            let req = build_write_request(SLAVE, addr, value);
+            let mut resp = [0u8; 8];
+            let n = self.transact(&req, &mut resp)?;
+            parse_write_response(&resp[..n], &req)
+        }
 
+        /// UART transaction: write request, collect reply until quiet-deadline.
+        /// Returns the number of response bytes received (>= 1).
+        fn transact(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, ModbusError> {
             self.uart.clear_rx().ok();
-            self.uart.write(&req).map_err(|_| XyError::WriteFailed)?;
+            self.uart.write(req).map_err(|_| ModbusError::WriteFailed)?;
             self.uart.wait_tx_done(100).ok();
 
-            let mut resp = [0u8; 8];
             let mut n = 0usize;
             let deadline = Instant::now() + Duration::from_millis(RESPONSE_TIMEOUT_MS);
             while n < resp.len() && Instant::now() < deadline {
@@ -189,60 +125,32 @@ mod real {
                     _ => {}
                 }
             }
-            if n < 8 {
-                return Err(XyError::ShortResponse(n));
+            if n == 0 {
+                return Err(ModbusError::ReadFailed);
             }
-            if resp[0] != SLAVE {
-                return Err(XyError::BadSlave(resp[0]));
-            }
-            if resp[1] & 0x80 != 0 {
-                return Err(XyError::ModbusException(resp[2]));
-            }
-            if resp != req {
-                return Err(XyError::BadHeader);
-            }
+            Ok(n)
+        }
+
+        fn set_voltage(&self, volts: f32) -> Result<(), ModbusError> {
+            self.write_holding(REG_V_SET, (volts * 100.0).round() as u16)
+        }
+
+        fn set_current_limit(&self, amps: f32) -> Result<(), ModbusError> {
+            self.write_holding(REG_I_SET, (amps * 100.0).round() as u16)
+        }
+
+        fn set_protection(&self, ovp_v: f32, ocp_a: f32, lvp_v: f32) -> Result<(), ModbusError> {
+            self.write_holding(REG_S_OVP, (ovp_v * 100.0).round() as u16)?;
+            self.write_holding(REG_S_OCP, (ocp_a * 100.0).round() as u16)?;
+            self.write_holding(REG_S_LVP, (lvp_v * 100.0).round() as u16)?;
             Ok(())
         }
 
-        pub fn set_voltage(&self, volts: f32) {
-            let v = (volts * 100.0).round() as u16;
-            if let Err(e) = self.write_holding(REG_V_SET, v) {
-                self.set_output(false);
-                error!("XY set_voltage({volts:.2} V) failed: {e} — disabling output");
-            }
+        fn set_output(&self, on: bool) -> Result<(), ModbusError> {
+            self.write_holding(REG_OUTPUT_EN, if on { 1 } else { 0 })
         }
 
-        pub fn set_current_limit(&self, amps: f32) {
-            let i = (amps * 100.0).round() as u16;
-            if let Err(e) = self.write_holding(REG_I_SET, i) {
-                self.set_output(false);
-                error!("XY set_current_limit({amps:.2} A) failed: {e} — disabling output");
-            }
-        }
-
-        pub fn set_protection(&self, ovp_volts: f32, ocp_amps: f32, lvp_volts: f32) {
-            let writes = [
-                (REG_S_OVP, (ovp_volts * 100.0).round() as u16, "OVP"),
-                (REG_S_OCP, (ocp_amps * 100.0).round() as u16, "OCP"),
-                (REG_S_LVP, (lvp_volts * 100.0).round() as u16, "LVP"),
-            ];
-            for (reg, val, name) in writes {
-                if let Err(e) = self.write_holding(reg, val) {
-                    self.set_output(false);
-                    error!("XY set {name} failed: {e} — disabling output");
-                    return;
-                }
-            }
-        }
-
-        /// Output-enable is safety-critical. Panics on failure → watchdog reset.
-        pub fn set_output(&self, on: bool) {
-            if let Err(e) = self.write_holding(REG_OUTPUT_EN, if on { 1 } else { 0 }) {
-                panic!("XY set_output({on}) failed: {e} — triggering reset");
-            }
-        }
-
-        pub fn read_status(&self) -> Result<XyStatus, XyError> {
+        fn read_status(&self) -> Result<XyStatus, ModbusError> {
             let r = self.read_holding(0x0000, 6)?;
             Ok(XyStatus {
                 v_set: r[0] as f32 / 100.0,
@@ -256,37 +164,24 @@ mod real {
     }
 
     #[allow(dead_code)] // v_set/i_set/v_in will be surfaced via HTTP panel
-    pub struct XyStatus {
-        pub v_set: f32,
-        pub i_set: f32,
-        pub v_out: f32,
-        pub i_out: f32,
-        pub p_out: f32,
-        pub v_in: f32,
+    struct XyStatus {
+        v_set: f32,
+        i_set: f32,
+        v_out: f32,
+        i_out: f32,
+        p_out: f32,
+        v_in: f32,
     }
 
-    pub enum XyError {
-        WriteFailed,
-        ReadFailed,
-        ShortResponse(usize),
-        BadSlave(u8),
-        BadHeader,
-        BadCrc,
-        ModbusException(u8),
-    }
-
-    impl std::fmt::Display for XyError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                XyError::WriteFailed => write!(f, "UART write failed"),
-                XyError::ReadFailed => write!(f, "UART read failed"),
-                XyError::ShortResponse(n) => write!(f, "short response ({n} bytes)"),
-                XyError::BadSlave(a) => write!(f, "wrong slave id 0x{a:02X}"),
-                XyError::BadHeader => write!(f, "malformed header"),
-                XyError::BadCrc => write!(f, "CRC mismatch"),
-                XyError::ModbusException(c) => write!(f, "modbus exception 0x{c:02X}"),
-            }
-        }
+    /// Programs protection + setpoints, then enables output. Any failure
+    /// short-circuits — we never enable output with unprogrammed setpoints.
+    fn boot_sequence(xy: &Xy) -> Result<(), ModbusError> {
+        xy.set_output(false)?;
+        xy.set_protection(BOOT_OVP, BOOT_OCP, BOOT_LVP)?;
+        xy.set_voltage(BOOT_V_SET)?;
+        xy.set_current_limit(BOOT_I_SET)?;
+        xy.set_output(true)?;
+        Ok(())
     }
 
     pub fn start(pins: XyPins, shared: Arc<Shared>) {
@@ -297,11 +192,10 @@ mod real {
                 let xy = Xy::new(pins);
                 thread::sleep(Duration::from_millis(100));
 
-                xy.set_output(false);
-                xy.set_protection(BOOT_OVP, BOOT_OCP, BOOT_LVP);
-                xy.set_voltage(BOOT_V_SET);
-                xy.set_current_limit(BOOT_I_SET);
-                xy.set_output(true);
+                if let Err(e) = boot_sequence(&xy) {
+                    error!("XY boot failed: {e} — forcing output OFF, will keep polling");
+                    let _ = xy.set_output(false);
+                }
 
                 loop {
                     match xy.read_status() {
@@ -321,18 +215,7 @@ mod real {
             .unwrap();
     }
 
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn crc_known_vector() {
-            assert_eq!(super::crc16_modbus(&[0x01, 0x03, 0x00, 0x1F, 0x00, 0x01]), 0xC0B5);
-        }
-
-        #[test]
-        fn crc_empty() {
-            assert_eq!(super::crc16_modbus(&[]), 0xFFFF);
-        }
-    }
+    // Modbus frame tests live in esp32_battery_logic::modbus (host-runnable).
 }
 
 #[cfg(feature = "xy-fake")]
