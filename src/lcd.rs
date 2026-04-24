@@ -472,8 +472,8 @@ pub fn start_lcd_thread(pins: LcdPins, state: Arc<AppState>) {
                         .collect();
                     let ivl = sd.interval();
                     (
-                        sd.battery_reading,
-                        sd.ps_reading,
+                        sd.battery_reading.unwrap_or_default(),
+                        sd.ps_reading.unwrap_or_default(),
                         crate::uptime_s(),
                         hist,
                         ivl,

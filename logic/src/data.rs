@@ -3,10 +3,10 @@ const HEADER_SIZE: usize = 4 + 4 + 4; // version + interval + count
 const SAMPLE_SIZE: usize = 4 + 4 * 4; // u32 + 4×f32 = 20 bytes
 const POWER_ONLINE_THRESHOLD: f32 = 0.1;
 const MAX_BLOB_SIZE: usize = 4096;
-/// Max samples that fit in MAX_BLOB_SIZE. 144 × 1024s ≈ 41 hours of history.
+/// Max samples that fit in MAX_BLOB_SIZE. 204 × 1024s ≈ 58 hours of history.
 pub const HISTORY_CAPACITY: usize = (MAX_BLOB_SIZE - HEADER_SIZE) / SAMPLE_SIZE / 2 * 2;
 // Once interval reaches this, drop old samples instead of compacting further.
-// 144 samples × 1024s = 147,456s ≈ 41h (covers 24h with margin).
+// 204 samples × 1024s ≈ 58h (covers 24h with margin).
 const MAX_INTERVAL: u32 = 1024;
 const _: () = assert!(
     HISTORY_CAPACITY.is_multiple_of(2),
@@ -86,9 +86,16 @@ impl SampleAccum {
 /// (halving the count) and the sampling interval doubles. This gives
 /// exponentially growing time coverage in fixed memory (~4 KB).
 pub struct SensorData<P: Platform> {
-    pub battery_reading: Ina228Reading,
-    pub ps_reading: PsReading,
-    pub power_online: f32,
+    /// Latest reading from each side. `None` only until the first real reading
+    /// from that sensor — then always `Some` so HTTP/LCD can snapshot live values.
+    pub battery_reading: Option<Ina228Reading>,
+    pub ps_reading: Option<PsReading>,
+    /// Updated-since-last-commit flags. Each `update_*` sets its flag; a history
+    /// row is committed only once both are set, after which both are cleared.
+    /// Without this we'd commit twice per cycle (once per thread), each time
+    /// pairing a fresh reading with the other side's previous value.
+    battery_updated: bool,
+    ps_updated: bool,
     history: heapless::Vec<Sample, HISTORY_CAPACITY>,
     /// Current sampling interval: how many raw updates per stored sample.
     interval: u32,
@@ -153,9 +160,10 @@ impl BufReader<'_> {
 impl<P: Platform> SensorData<P> {
     pub fn new(platform: P) -> Self {
         Self {
-            battery_reading: Ina228Reading::default(),
-            ps_reading: PsReading::default(),
-            power_online: 0.0,
+            battery_reading: None,
+            ps_reading: None,
+            battery_updated: false,
+            ps_updated: false,
             history: heapless::Vec::new(),
             interval: 1,
             acc: SampleAccum::default(),
@@ -167,28 +175,46 @@ impl<P: Platform> SensorData<P> {
         }
     }
 
-    /// Called by the XY thread whenever it has a fresh PS reading. Updates the
-    /// latest-seen PS value; history commits happen on `update_battery`.
-    pub fn update_ps(&mut self, ps: PsReading) {
-        self.ps_reading = ps;
-        self.power_online = if ps.current.abs() > POWER_ONLINE_THRESHOLD {
-            1.0
-        } else {
-            0.0
-        };
+    /// Called by the INA thread once per cycle. Publishes the latest reading
+    /// and attempts a history commit.
+    pub fn update_battery(&mut self, bat: Ina228Reading) {
+        self.battery_reading = Some(bat);
+        self.battery_updated = true;
+        self.try_commit();
     }
 
-    /// Called by the INA thread each cycle. Pairs the battery average with the
-    /// latest known PS reading, accumulates into the interval-averaged history
-    /// stream, and performs periodic NVS save.
-    pub fn update_battery(&mut self, bat: Ina228Reading) {
-        // Always publish the latest reading — HTTP / LCD snapshots it even before NTP sync.
-        self.battery_reading = bat;
+    /// Called by the XY thread once per poll. Publishes the latest reading
+    /// and attempts a history commit.
+    pub fn update_ps(&mut self, ps: PsReading) {
+        self.ps_reading = Some(ps);
+        self.ps_updated = true;
+        self.try_commit();
+    }
 
-        let time_s = match self.platform.epoch_s() {
-            Some(t) => t,
-            None => return,
+    /// `1.0` when the latest PS reading shows measurable current, `0.0` otherwise.
+    /// Returns `0.0` before the first PS reading arrives.
+    pub fn power_online(&self) -> f32 {
+        match self.ps_reading {
+            Some(ps) if ps.current.abs() > POWER_ONLINE_THRESHOLD => 1.0,
+            _ => 0.0,
+        }
+    }
+
+    /// Commit one history sample when both sides have a reading that has been
+    /// updated since the last commit. Clears the updated flags (but keeps the
+    /// readings themselves) so HTTP/LCD still see live values between commits.
+    fn try_commit(&mut self) {
+        if !(self.battery_updated && self.ps_updated) {
+            return;
+        }
+        let (Some(bat), Some(ps)) = (self.battery_reading, self.ps_reading) else {
+            return;
         };
+        let Some(time_s) = self.platform.epoch_s() else {
+            return;
+        };
+        self.battery_updated = false;
+        self.ps_updated = false;
 
         if !self.loaded {
             self.loaded = true;
@@ -202,13 +228,12 @@ impl<P: Platform> SensorData<P> {
             self.last_save_s = time_s;
         }
 
-        let ps = self.ps_reading;
         let sample = Sample {
             time_s,
             voltage: bat.voltage,
             battery_current: bat.current,
             ps_current: ps.current,
-            power_online: self.power_online,
+            power_online: self.power_online(),
         };
 
         self.acc.add(&sample);
@@ -460,12 +485,31 @@ mod tests {
     }
 
     #[test]
-    fn last_readings_updated() {
+    fn latest_readings_visible_after_commit() {
+        // Readings persist across commits so HTTP/LCD can always snapshot
+        // live values — only the `_updated` flags get cleared.
         let (time, mut sd) = new_sd();
         time.set(10);
         update(&mut sd, bat_reading(13.0, 1.5), ps_reading(13.1, 2.5));
-        assert!((sd.battery_reading.current - 1.5).abs() < 0.001);
-        assert!((sd.ps_reading.current - 2.5).abs() < 0.001);
+        assert!((sd.battery_reading.unwrap().current - 1.5).abs() < 0.001);
+        assert!((sd.ps_reading.unwrap().current - 2.5).abs() < 0.001);
+        assert!(!sd.battery_updated && !sd.ps_updated);
+    }
+
+    #[test]
+    fn only_one_commit_per_pair_of_updates() {
+        // With both sides at 1 Hz we want 1 history row per second, not 2.
+        let (time, mut sd) = new_sd();
+        time.set(1);
+        sd.update_ps(ps_reading(13.0, 2.0));
+        sd.update_battery(bat_reading(13.0, 1.0)); // first commit
+        assert_eq!(sd.history.len(), 1);
+        // A second update_ps without a new update_battery must NOT commit.
+        time.set(2);
+        sd.update_ps(ps_reading(13.0, 2.0));
+        assert_eq!(sd.history.len(), 1);
+        sd.update_battery(bat_reading(13.0, 1.0)); // second commit
+        assert_eq!(sd.history.len(), 2);
     }
 
     #[test]
@@ -501,8 +545,8 @@ mod tests {
         assert!(sd.history.is_empty());
         assert!(!sd.loaded);
         // Latest readings must still be visible to HTTP/LCD before NTP sync.
-        assert!((sd.battery_reading.current - 1.5).abs() < 0.001);
-        assert!((sd.ps_reading.current - 2.0).abs() < 0.001);
+        assert!((sd.battery_reading.unwrap().current - 1.5).abs() < 0.001);
+        assert!((sd.ps_reading.unwrap().current - 2.0).abs() < 0.001);
     }
 
     #[test]

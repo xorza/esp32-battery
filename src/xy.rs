@@ -237,7 +237,7 @@ impl std::fmt::Display for XyError {
 /// enabled manually (charging strategy is not yet implemented).
 const BOOT_V_SET: f32 = 13.6;
 const BOOT_I_SET: f32 = 1.0;
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const COMMAND_GAP: Duration = Duration::from_millis(150);
 
 pub fn start(pins: XyPins, state: Arc<AppState>) {

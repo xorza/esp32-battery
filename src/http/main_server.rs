@@ -37,8 +37,9 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
             // Keeps the measurement thread unblocked during JSON serialization.
             let response = {
                 let store = state.sensor_data.lock().unwrap();
-                let bat = store.battery_reading;
-                let ps = store.ps_reading;
+                let bat = store.battery_reading.unwrap_or_default();
+                let ps = store.ps_reading.unwrap_or_default();
+                let power_online = store.power_online();
                 let history_rows: Vec<HistoryRow> =
                     store.history().iter().map(HistoryRow::from).collect();
 
@@ -46,7 +47,7 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
                     uptime: crate::uptime_s(),
                     rssi: get_rssi(),
                     voltage: bat.voltage,
-                    power_online: store.power_online,
+                    power_online,
                     battery: BatteryReading {
                         soc: battery::ocv_soc(bat.voltage),
                         current: bat.current,

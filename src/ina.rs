@@ -81,6 +81,7 @@ fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Option<Ina228Reading> {
 
 pub fn start_measurement_thread(i2c_bus: &'static I2cBusDriver<'static>, state: Arc<AppState>) {
     thread::Builder::new()
+        .name("ina".into())
         .stack_size(4096)
         .spawn(move || {
             let dev_config = DeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
