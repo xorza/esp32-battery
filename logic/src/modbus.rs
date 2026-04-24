@@ -162,7 +162,11 @@ mod tests {
             for bit in 0..8 {
                 let mut flipped = base;
                 flipped[byte_idx] ^= 1 << bit;
-                assert_ne!(crc16_modbus(&flipped), base_crc, "bit {bit} of byte {byte_idx}");
+                assert_ne!(
+                    crc16_modbus(&flipped),
+                    base_crc,
+                    "bit {bit} of byte {byte_idx}"
+                );
             }
         }
     }

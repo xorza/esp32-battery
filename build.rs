@@ -45,15 +45,18 @@ fn propagate_ota_key() {
     println!("cargo:rerun-if-env-changed=OTA_KEY");
 
     let hex = std::env::var("OTA_KEY").ok().or_else(|| {
-        fs::read_to_string(&env_path).ok()?.lines().find_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let (k, v) = line.split_once('=')?;
-            (k.trim() == "OTA_KEY")
-                .then(|| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-        })
+        fs::read_to_string(&env_path)
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let (k, v) = line.split_once('=')?;
+                (k.trim() == "OTA_KEY")
+                    .then(|| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+            })
     });
     if let Some(hex) = hex {
         println!("cargo:rustc-env=OTA_KEY={hex}");

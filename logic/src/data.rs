@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn write_read_roundtrip_empty() {
-        let (_time, mut sd) = new_sd();
+        let (_time, sd) = new_sd();
         let blob = sd.serialize();
         assert_eq!(blob.len(), HEADER_SIZE);
 
@@ -810,7 +810,11 @@ mod tests {
 
         time.set(1500);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert_eq!(sd.history.len(), 1, "backward-jump sample must not be pushed");
+        assert_eq!(
+            sd.history.len(),
+            1,
+            "backward-jump sample must not be pushed"
+        );
 
         // Equal time_s also rejected (strictly increasing required).
         time.set(2000);
