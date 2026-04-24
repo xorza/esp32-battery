@@ -109,34 +109,9 @@ pub struct SensorData<C: Clock> {
     /// Has the save-interval elapsed since the last `take_save_payload` call?
     /// Set by `try_commit`; cleared when the caller drains the payload.
     save_pending: bool,
-    /// False until the first successful commit. The first commit anchors
-    /// `last_save_s` so we don't immediately save a just-loaded blob.
-    anchored: bool,
-    last_save_s: u32,
-    buf: Box<[u8; SERIALIZED_MAX_BYTES]>,
-}
-
-struct BufWriter<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-}
-
-impl BufWriter<'_> {
-    fn u32(&mut self, v: u32) {
-        self.buf[self.pos..self.pos + 4].copy_from_slice(&v.to_le_bytes());
-        self.pos += 4;
-    }
-    fn f32(&mut self, v: f32) {
-        self.buf[self.pos..self.pos + 4].copy_from_slice(&v.to_le_bytes());
-        self.pos += 4;
-    }
-    fn sample(&mut self, s: &Sample) {
-        self.u32(s.time_s);
-        self.f32(s.voltage);
-        self.f32(s.battery_current);
-        self.f32(s.ps_current);
-        self.f32(s.power_online);
-    }
+    /// `None` until the first successful commit anchors it. Non-anchoring
+    /// ensures we don't immediately re-save a just-loaded blob.
+    last_save_s: Option<u32>,
 }
 
 struct BufReader<'a> {
@@ -179,9 +154,7 @@ impl<C: Clock> SensorData<C> {
             acc_count: 0,
             clock,
             save_pending: false,
-            anchored: false,
-            last_save_s: 0,
-            buf: Box::new([0u8; SERIALIZED_MAX_BYTES]),
+            last_save_s: None,
         }
     }
 
@@ -213,13 +186,11 @@ impl<C: Clock> SensorData<C> {
     /// Restore history from a previously-saved blob. Call at startup before
     /// the first `try_commit`. Returns false if the blob is malformed.
     pub fn load_from_bytes(&mut self, bytes: &[u8]) -> bool {
-        let n = bytes.len().min(self.buf.len());
-        self.buf[..n].copy_from_slice(&bytes[..n]);
-        let ok = self.read(n);
+        let ok = self.deserialize(bytes);
         if ok {
             log::info!("Loaded {} samples from blob", self.history.len());
         } else {
-            log::warn!("Failed to parse history blob ({n} bytes)");
+            log::warn!("Failed to parse history blob ({} bytes)", bytes.len());
         }
         ok
     }
@@ -232,12 +203,13 @@ impl<C: Clock> SensorData<C> {
             return None;
         }
         self.save_pending = false;
-        let len = self.write();
+        let out = self.serialize();
         log::info!(
-            "Emitting save payload: {} samples ({len} bytes)",
-            self.history.len()
+            "Emitting save payload: {} samples ({} bytes)",
+            self.history.len(),
+            out.len()
         );
-        Some(self.buf[..len].to_vec())
+        Some(out)
     }
 
     /// Commit one history sample when both sides have a reading that has been
@@ -261,9 +233,8 @@ impl<C: Clock> SensorData<C> {
 
         // First commit anchors the save timer so we don't immediately dump a
         // just-loaded blob back to flash.
-        if !self.anchored {
-            self.anchored = true;
-            self.last_save_s = time_s;
+        if self.last_save_s.is_none() {
+            self.last_save_s = Some(time_s);
         }
 
         // Enforce monotonic time_s on the history. An NTP step-back (or a clock
@@ -300,8 +271,10 @@ impl<C: Clock> SensorData<C> {
             assert!(self.history.push(averaged).is_ok(), "history overflow");
         }
 
-        if time_s.saturating_sub(self.last_save_s) >= SAVE_INTERVAL_S {
-            self.last_save_s = time_s;
+        if let Some(last) = self.last_save_s
+            && time_s.saturating_sub(last) >= SAVE_INTERVAL_S
+        {
+            self.last_save_s = Some(time_s);
             self.save_pending = true;
         }
     }
@@ -343,33 +316,29 @@ impl<C: Clock> SensorData<C> {
         self.interval
     }
 
-    /// Serialize history + metadata into internal buffer.
-    /// Returns the number of bytes written.
-    fn write(&mut self) -> usize {
-        let mut w = BufWriter {
-            buf: &mut *self.buf,
-            pos: 0,
-        };
-        w.u32(FORMAT_VERSION);
-        w.u32(self.interval);
-        w.u32(self.history.len() as u32);
+    /// Serialize history + metadata into a fresh `Vec`.
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_SIZE + self.history.len() * SAMPLE_SIZE);
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.interval.to_le_bytes());
+        out.extend_from_slice(&(self.history.len() as u32).to_le_bytes());
         for s in &self.history {
-            w.sample(s);
+            out.extend_from_slice(&s.time_s.to_le_bytes());
+            out.extend_from_slice(&s.voltage.to_le_bytes());
+            out.extend_from_slice(&s.battery_current.to_le_bytes());
+            out.extend_from_slice(&s.ps_current.to_le_bytes());
+            out.extend_from_slice(&s.power_online.to_le_bytes());
         }
-        w.pos
+        out
     }
 
-    /// Restore history from internal buffer.
-    /// Returns false if data is invalid.
-    fn read(&mut self, len: usize) -> bool {
-        if len < HEADER_SIZE {
+    /// Restore history from a byte slice. Returns false on malformed input.
+    fn deserialize(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() < HEADER_SIZE {
             return false;
         }
 
-        let mut r = BufReader {
-            buf: &self.buf[..len],
-            pos: 0,
-        };
+        let mut r = BufReader { buf: bytes, pos: 0 };
         let version = r.u32();
         if version != FORMAT_VERSION {
             return false;
@@ -377,7 +346,7 @@ impl<C: Clock> SensorData<C> {
         let interval = r.u32();
         let count = r.u32() as usize;
 
-        if interval == 0 || count == 0 || len < HEADER_SIZE + count * SAMPLE_SIZE {
+        if interval == 0 || count == 0 || bytes.len() < HEADER_SIZE + count * SAMPLE_SIZE {
             return false;
         }
 
@@ -545,7 +514,7 @@ mod tests {
         sd.update_battery(bat_reading(13.0, 1.5));
         sd.try_commit();
         assert!(sd.history.is_empty());
-        assert!(!sd.anchored);
+        assert!(sd.last_save_s.is_none());
         // Latest readings must still be visible to HTTP/LCD before NTP sync.
         assert!((sd.battery_reading.unwrap().current - 1.5).abs() < 0.001);
         assert!((sd.ps_reading.unwrap().current - 2.0).abs() < 0.001);
@@ -600,11 +569,10 @@ mod tests {
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0)); // online
         time.set(1);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(0.0, 0.0)); // offline
-        let len = sd.write();
+        let blob = sd.serialize();
 
         let (_time2, mut sd2) = new_sd();
-        sd2.buf[..len].copy_from_slice(&sd.buf[..len]);
-        assert!(sd2.read(len));
+        assert!(sd2.deserialize(&blob));
         assert!((sd2.history[0].power_online - 1.0).abs() < 0.001);
         assert!(sd2.history[1].power_online.abs() < 0.001);
     }
@@ -711,100 +679,87 @@ mod tests {
     #[test]
     fn write_read_roundtrip_empty() {
         let (_time, mut sd) = new_sd();
-        let len = sd.write();
-        assert_eq!(len, HEADER_SIZE);
+        let blob = sd.serialize();
+        assert_eq!(blob.len(), HEADER_SIZE);
 
         let (_time2, mut sd2) = new_sd();
-        sd2.buf[..len].copy_from_slice(&sd.buf[..len]);
-        assert!(!sd2.read(len));
+        // Empty blob (count=0) is rejected — history must have at least one sample.
+        assert!(!sd2.deserialize(&blob));
     }
 
     #[test]
     fn write_read_roundtrip() {
         let (time, mut sd) = new_sd();
         fill(&mut sd, 10, 1000, &time);
-        let len = sd.write();
-        assert_eq!(len, HEADER_SIZE + 10 * SAMPLE_SIZE);
+        let blob = sd.serialize();
+        assert_eq!(blob.len(), HEADER_SIZE + 10 * SAMPLE_SIZE);
 
         let (_time2, mut sd2) = new_sd();
-        sd2.buf[..len].copy_from_slice(&sd.buf[..len]);
-        assert!(sd2.read(len));
+        assert!(sd2.deserialize(&blob));
         assert_eq!(sd2.history.len(), 10);
         assert_eq!(sd2.interval, 1);
         assert_eq!(sd2.history[0].time_s, 1000);
         assert_eq!(sd2.history[9].time_s, 1009);
     }
 
+    /// Hand-build a header with the given version/interval/count and return the
+    /// padded blob of `total_len` bytes (remaining space zeroed).
+    fn header_blob(version: u32, interval: u32, count: u32, total_len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; total_len];
+        out[0..4].copy_from_slice(&version.to_le_bytes());
+        out[4..8].copy_from_slice(&interval.to_le_bytes());
+        out[8..12].copy_from_slice(&count.to_le_bytes());
+        out
+    }
+
     #[test]
     fn read_rejects_truncated() {
         let (_time, mut sd) = new_sd();
-        sd.buf[..10].copy_from_slice(&[0u8; 10]);
-        assert!(!sd.read(10));
+        assert!(!sd.deserialize(&[0u8; 10]));
     }
 
     #[test]
     fn read_rejects_zero_interval() {
         let (_time, mut sd) = new_sd();
-        sd.buf[0..4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        // interval at offset 4 is already 0
-        assert!(!sd.read(HEADER_SIZE));
+        let blob = header_blob(FORMAT_VERSION, 0, 0, HEADER_SIZE);
+        assert!(!sd.deserialize(&blob));
     }
 
     #[test]
     fn read_rejects_wrong_version() {
         let (_time, mut sd) = new_sd();
-        sd.buf[0..4].copy_from_slice(&99u32.to_le_bytes());
-        assert!(!sd.read(HEADER_SIZE));
+        let blob = header_blob(99, 1, 0, HEADER_SIZE);
+        assert!(!sd.deserialize(&blob));
     }
 
     #[test]
     fn read_rejects_count_without_enough_data() {
         let (_time, mut sd) = new_sd();
-        let mut w = BufWriter {
-            buf: &mut *sd.buf,
-            pos: 0,
-        };
-        w.u32(FORMAT_VERSION);
-        w.u32(1); // interval
-        w.u32(HISTORY_CAPACITY as u32 + 1); // count > capacity but no sample data
-        let len = w.pos;
-        // Rejected because buffer is too short for claimed sample count.
-        assert!(!sd.read(len));
+        // Header claims more samples than the payload carries.
+        let blob = header_blob(FORMAT_VERSION, 1, HISTORY_CAPACITY as u32 + 1, HEADER_SIZE);
+        assert!(!sd.deserialize(&blob));
     }
 
     #[test]
     fn read_rejects_truncated_samples() {
-        // Valid header claiming 10 samples, but only provide space for 5
+        // Valid header claiming 10 samples, but only 5 samples worth of bytes after.
         let (_time, mut sd) = new_sd();
-        let mut w = BufWriter {
-            buf: &mut *sd.buf,
-            pos: 0,
-        };
-        w.u32(FORMAT_VERSION);
-        w.u32(1);
-        w.u32(10); // claims 10 samples
-        let len = HEADER_SIZE + 5 * SAMPLE_SIZE;
-        assert!(!sd.read(len));
+        let blob = header_blob(FORMAT_VERSION, 1, 10, HEADER_SIZE + 5 * SAMPLE_SIZE);
+        assert!(!sd.deserialize(&blob));
     }
 
     #[test]
     fn read_single_sample() {
         let (_time, mut sd) = new_sd();
-        let mut w = BufWriter {
-            buf: &mut *sd.buf,
-            pos: 0,
-        };
-        w.u32(FORMAT_VERSION);
-        w.u32(1); // interval
-        w.u32(1); // count=1
-        w.u32(1000);
-        w.f32(13.0);
-        w.f32(1.0);
-        w.f32(2.0);
-        w.f32(1.0); // power_online
-        let len = w.pos;
+        let mut blob = header_blob(FORMAT_VERSION, 1, 1, HEADER_SIZE + SAMPLE_SIZE);
+        // Sample at offset HEADER_SIZE: time=1000, v=13.0, b_i=1.0, p_i=2.0, online=1.0.
+        blob[12..16].copy_from_slice(&1000u32.to_le_bytes());
+        blob[16..20].copy_from_slice(&13.0f32.to_le_bytes());
+        blob[20..24].copy_from_slice(&1.0f32.to_le_bytes());
+        blob[24..28].copy_from_slice(&2.0f32.to_le_bytes());
+        blob[28..32].copy_from_slice(&1.0f32.to_le_bytes());
 
-        assert!(sd.read(len));
+        assert!(sd.deserialize(&blob));
         assert_eq!(sd.history.len(), 1);
         assert_eq!(sd.history[0].time_s, 1000);
         assert!((sd.history[0].voltage - 13.0).abs() < 0.001);
@@ -822,13 +777,12 @@ mod tests {
         let (time, mut sd) = new_sd();
         fill(&mut sd, CAP as u32 + 1, 0, &time);
         assert_eq!(sd.interval, 2);
-        let len = sd.write();
+        let blob = sd.serialize();
 
         let (time2, mut sd2) = new_sd();
-        sd2.buf[..len].copy_from_slice(&sd.buf[..len]);
         sd2.acc.voltage = 999.0;
         sd2.acc_count = 1;
-        assert!(sd2.read(len));
+        assert!(sd2.deserialize(&blob));
         assert_eq!(sd2.acc_count, 0);
 
         // With interval=2, first raw update should NOT push a new sample
@@ -894,9 +848,8 @@ mod tests {
     // --- Auto-load on first update ---
 
     /// Helper: serialize `sd` and load it into a fresh `SensorData`.
-    fn sd_with_blob(sd: &mut SensorData<TestClockSrc>) -> (TestClock, SensorData<TestClockSrc>) {
-        let len = sd.write();
-        let blob: Vec<u8> = sd.buf[..len].to_vec();
+    fn sd_with_blob(sd: &SensorData<TestClockSrc>) -> (TestClock, SensorData<TestClockSrc>) {
+        let blob = sd.serialize();
         let (time, mut fresh) = new_sd();
         assert!(fresh.load_from_bytes(&blob));
         (time, fresh)
@@ -910,7 +863,7 @@ mod tests {
             update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         }
 
-        let (time2, mut sd2) = sd_with_blob(&mut sd);
+        let (time2, mut sd2) = sd_with_blob(&sd);
         time2.set(1010);
         update(&mut sd2, bat_reading(14.0, 3.0), ps_reading(14.0, 4.0));
 
@@ -929,7 +882,7 @@ mod tests {
         let (time, mut sd) = new_sd();
         fill(&mut sd, 100, 1000, &time);
 
-        let (time2, mut sd2) = sd_with_blob(&mut sd);
+        let (time2, mut sd2) = sd_with_blob(&sd);
         time2.set(5000);
         update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
 
@@ -968,7 +921,7 @@ mod tests {
         let (time, mut sd) = new_sd();
         fill(&mut sd, 10, 1000, &time);
 
-        let (time2, mut sd2) = sd_with_blob(&mut sd);
+        let (time2, mut sd2) = sd_with_blob(&sd);
         // First commit at t=1010 anchors last_save_s — no immediate save.
         time2.set(1010);
         update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
@@ -1030,7 +983,7 @@ mod tests {
         let (time, mut sd) = new_sd();
         fill(&mut sd, 100, 1000, &time);
 
-        let (time2, mut sd2) = sd_with_blob(&mut sd);
+        let (time2, mut sd2) = sd_with_blob(&sd);
         // fill() ended at t=1099, so the next commit must be > 1099.
         time2.set(1100);
         update(&mut sd2, bat_reading(14.0, 7.0), ps_reading(14.0, 8.0));
