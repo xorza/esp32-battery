@@ -1,7 +1,11 @@
 const FORMAT_VERSION: u32 = 6;
 const HEADER_SIZE: usize = 4 + 4 + 4; // version + interval + count
 const SAMPLE_SIZE: usize = 4 + 4 * 4; // u32 + 4×f32 = 20 bytes
-const POWER_ONLINE_THRESHOLD: f32 = 0.1;
+/// Minimum XY output voltage (V) to consider the PS "online". Uses voltage,
+/// not current, so an enabled PSU with no load (fully-charged battery) still
+/// registers as online. ~2 V covers noise/leakage while staying well below
+/// any real rail.
+const POWER_ONLINE_VOLTAGE_THRESHOLD: f32 = 2.0;
 const MAX_BLOB_SIZE: usize = 4096;
 /// Max samples that fit in MAX_BLOB_SIZE. 204 × 1024s ≈ 58 hours of history.
 pub const HISTORY_CAPACITY: usize = (MAX_BLOB_SIZE - HEADER_SIZE) / SAMPLE_SIZE / 2 * 2;
@@ -195,7 +199,7 @@ impl<P: Platform> SensorData<P> {
     /// Returns `0.0` before the first PS reading arrives.
     pub fn power_online(&self) -> f32 {
         match self.ps_reading {
-            Some(ps) if ps.current.abs() > POWER_ONLINE_THRESHOLD => 1.0,
+            Some(ps) if ps.voltage > POWER_ONLINE_VOLTAGE_THRESHOLD => 1.0,
             _ => 0.0,
         }
     }
@@ -574,35 +578,30 @@ mod tests {
 
     #[test]
     fn power_online_threshold() {
-        // Above threshold: s2.current = 2.0 > 0.01 → 1.0
-        let (_time, mut sd) = new_sd();
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        assert!((sd.history[0].power_online - 1.0).abs() < 0.001);
-
-        // Below threshold: s2.current = 0.005 < 0.01 → 0.0
-        let (_time, mut sd) = new_sd();
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 0.005));
-        assert!(sd.history[0].power_online.abs() < 0.001);
-
-        // Exactly zero: → 0.0
+        // Online when PS voltage is above the threshold (load-independent).
         let (_time, mut sd) = new_sd();
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 0.0));
+        assert!((sd.history[0].power_online - 1.0).abs() < 0.001);
+
+        // Below threshold: voltage=1 → offline.
+        let (_time, mut sd) = new_sd();
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(1.0, 2.0));
         assert!(sd.history[0].power_online.abs() < 0.001);
 
-        // Negative current: s2.current = -0.5 → abs > threshold → 1.0
+        // Exactly zero voltage: → offline.
         let (_time, mut sd) = new_sd();
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, -0.5));
-        assert!((sd.history[0].power_online - 1.0).abs() < 0.001);
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(0.0, 0.0));
+        assert!(sd.history[0].power_online.abs() < 0.001);
     }
 
     #[test]
     fn power_online_averaged_during_compaction() {
         let (time, mut sd) = new_sd();
-        // Alternating online/offline: even=online (c2=2.0), odd=offline (c2=0.0)
+        // Alternating online (v=13) / offline (v=0).
         for i in 0..(CAP as u32 + 1) {
             time.set(i);
-            let c2 = if i % 2 == 0 { 2.0 } else { 0.0 };
-            update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, c2));
+            let v = if i % 2 == 0 { 13.0 } else { 0.0 };
+            update(&mut sd, bat_reading(13.0, 1.0), ps_reading(v, 1.0));
         }
         assert_eq!(sd.interval, 2);
         // Each compacted pair averages one online (1.0) and one offline (0.0) → 0.5
@@ -616,7 +615,7 @@ mod tests {
         let (time, mut sd) = new_sd();
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0)); // online
         time.set(1);
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 0.0)); // offline
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(0.0, 0.0)); // offline
         let len = sd.write();
 
         let (_time2, mut sd2) = new_sd();
