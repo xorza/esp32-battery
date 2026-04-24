@@ -39,17 +39,13 @@ pub fn start(state: Arc<AppState>, nvs: Arc<EspNvs<NvsDefault>>) -> EspHttpServe
                 let store = state.sensor_data.lock().unwrap();
                 let bat = store.battery_reading;
                 let ps = store.ps_reading;
-                let history = store.history();
-                let max_charge = history.iter().map(|s| s.max_charge).fold(0.0_f64, f64::max);
-                let history_rows: Vec<HistoryRow> = history.iter().map(HistoryRow::from).collect();
+                let history_rows: Vec<HistoryRow> =
+                    store.history().iter().map(HistoryRow::from).collect();
 
                 ApiResponse {
                     uptime: crate::uptime_s(),
                     rssi: get_rssi(),
                     voltage: bat.voltage,
-                    read_err: [store.read_failures, store.read_total],
-                    charge: bat.charge,
-                    max_charge,
                     power_online: store.power_online,
                     battery: BatteryReading {
                         soc: battery::ocv_soc(bat.voltage),

@@ -4,15 +4,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use esp32_battery_logic::data::{PsReading, SensorData};
+use esp32_battery_logic::data::SensorData;
 
 use crate::platform::EspPlatform;
 
 pub struct AppState {
     pub sensor_data: Mutex<SensorData<EspPlatform>>,
-    /// Latest XY7025 power-supply reading. Updated by the XY thread and sampled by the
-    /// INA thread when committing a new history sample.
-    pub ps_latest: Mutex<PsReading>,
     captive_portal_active: AtomicBool,
     /// Set by the SNTP callback once system time has been synchronized.
     /// Shared with `EspPlatform` so `epoch_s()` returns `None` until sync.
@@ -23,7 +20,6 @@ impl AppState {
     pub fn new(ntp_synced: Arc<AtomicBool>, sensor_data: SensorData<EspPlatform>) -> Arc<Self> {
         Arc::new(Self {
             sensor_data: Mutex::new(sensor_data),
-            ps_latest: Mutex::new(PsReading::default()),
             captive_portal_active: AtomicBool::new(false),
             ntp_synced,
         })

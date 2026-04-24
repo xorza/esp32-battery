@@ -233,7 +233,8 @@ impl std::fmt::Display for XyError {
     }
 }
 
-/// Default charge-setpoint applied on boot. Output is kept OFF until enabled via HTTP.
+/// Default voltage/current setpoints applied on boot. Output is kept OFF until
+/// enabled manually (charging strategy is not yet implemented).
 const BOOT_V_SET: f32 = 13.6;
 const BOOT_I_SET: f32 = 1.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -270,7 +271,7 @@ pub fn start(pins: XyPins, state: Arc<AppState>) {
                             current: s.i_out,
                             power: s.p_out,
                         };
-                        *state.ps_latest.lock().unwrap() = reading;
+                        state.sensor_data.lock().unwrap().update_ps(reading);
                         info!(
                             "XY: V_in={:.2} set V={:.2} I={:.2} | out V={:.2} I={:.2} P={:.2}",
                             s.v_in, s.v_set, s.i_set, s.v_out, s.i_out, s.p_out

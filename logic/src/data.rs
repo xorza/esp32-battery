@@ -1,6 +1,6 @@
 const FORMAT_VERSION: u32 = 6;
 const HEADER_SIZE: usize = 4 + 4 + 4; // version + interval + count
-const SAMPLE_SIZE: usize = 4 + 4 * 4 + 8; // u32 + 4×f32 + f64(max_charge) = 28 bytes
+const SAMPLE_SIZE: usize = 4 + 4 * 4; // u32 + 4×f32 = 20 bytes
 const POWER_ONLINE_THRESHOLD: f32 = 0.1;
 const MAX_BLOB_SIZE: usize = 4096;
 /// Max samples that fit in MAX_BLOB_SIZE. 144 × 1024s ≈ 41 hours of history.
@@ -30,7 +30,6 @@ pub struct Ina228Reading {
     pub voltage: f32,
     pub current: f32,
     pub power: f32,
-    pub charge: f64,
 }
 
 /// Power-supply reading sourced from the XY7025 Modbus client (no charge register).
@@ -50,7 +49,6 @@ pub struct Sample {
     pub ps_current: f32,
     /// 1.0 when power supply is online, 0.0 when offline. Averaged during compaction.
     pub power_online: f32,
-    pub max_charge: f64,
 }
 
 #[derive(Default)]
@@ -59,7 +57,6 @@ struct SampleAccum {
     battery_current: f32,
     ps_current: f32,
     power_online: f32,
-    max_charge: f64,
 }
 
 impl SampleAccum {
@@ -68,7 +65,6 @@ impl SampleAccum {
         self.battery_current += s.battery_current;
         self.ps_current += s.ps_current;
         self.power_online += s.power_online;
-        self.max_charge = self.max_charge.max(s.max_charge);
     }
 
     fn average(&self, n: u32, time_s: u32) -> Sample {
@@ -80,7 +76,6 @@ impl SampleAccum {
             battery_current: self.battery_current / n,
             ps_current: self.ps_current / n,
             power_online: self.power_online / n,
-            max_charge: self.max_charge,
         }
     }
 }
@@ -93,8 +88,6 @@ impl SampleAccum {
 pub struct SensorData<P: Platform> {
     pub battery_reading: Ina228Reading,
     pub ps_reading: PsReading,
-    pub read_total: u32,
-    pub read_failures: u32,
     pub power_online: f32,
     history: heapless::Vec<Sample, HISTORY_CAPACITY>,
     /// Current sampling interval: how many raw updates per stored sample.
@@ -121,17 +114,12 @@ impl BufWriter<'_> {
         self.buf[self.pos..self.pos + 4].copy_from_slice(&v.to_le_bytes());
         self.pos += 4;
     }
-    fn f64(&mut self, v: f64) {
-        self.buf[self.pos..self.pos + 8].copy_from_slice(&v.to_le_bytes());
-        self.pos += 8;
-    }
     fn sample(&mut self, s: &Sample) {
         self.u32(s.time_s);
         self.f32(s.voltage);
         self.f32(s.battery_current);
         self.f32(s.ps_current);
         self.f32(s.power_online);
-        self.f64(s.max_charge);
     }
 }
 
@@ -151,11 +139,6 @@ impl BufReader<'_> {
         self.pos += 4;
         v
     }
-    fn f64(&mut self) -> f64 {
-        let v = f64::from_le_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
-        self.pos += 8;
-        v
-    }
     fn sample(&mut self) -> Sample {
         Sample {
             time_s: self.u32(),
@@ -163,7 +146,6 @@ impl BufReader<'_> {
             battery_current: self.f32(),
             ps_current: self.f32(),
             power_online: self.f32(),
-            max_charge: self.f64(),
         }
     }
 }
@@ -173,8 +155,6 @@ impl<P: Platform> SensorData<P> {
         Self {
             battery_reading: Ina228Reading::default(),
             ps_reading: PsReading::default(),
-            read_total: 0,
-            read_failures: 0,
             power_online: 0.0,
             history: heapless::Vec::new(),
             interval: 1,
@@ -187,16 +167,23 @@ impl<P: Platform> SensorData<P> {
         }
     }
 
-    pub fn update(
-        &mut self,
-        bat: Ina228Reading,
-        ps: PsReading,
-        read_total: u32,
-        read_failures: u32,
-        max_charge: f64,
-    ) {
-        self.read_total += read_total;
-        self.read_failures += read_failures;
+    /// Called by the XY thread whenever it has a fresh PS reading. Updates the
+    /// latest-seen PS value; history commits happen on `update_battery`.
+    pub fn update_ps(&mut self, ps: PsReading) {
+        self.ps_reading = ps;
+        self.power_online = if ps.current.abs() > POWER_ONLINE_THRESHOLD {
+            1.0
+        } else {
+            0.0
+        };
+    }
+
+    /// Called by the INA thread each cycle. Pairs the battery average with the
+    /// latest known PS reading, accumulates into the interval-averaged history
+    /// stream, and performs periodic NVS save.
+    pub fn update_battery(&mut self, bat: Ina228Reading) {
+        // Always publish the latest reading — HTTP / LCD snapshots it even before NTP sync.
+        self.battery_reading = bat;
 
         let time_s = match self.platform.epoch_s() {
             Some(t) => t,
@@ -215,23 +202,14 @@ impl<P: Platform> SensorData<P> {
             self.last_save_s = time_s;
         }
 
-        let power_online = if ps.current.abs() > POWER_ONLINE_THRESHOLD {
-            1.0
-        } else {
-            0.0
-        };
+        let ps = self.ps_reading;
         let sample = Sample {
             time_s,
             voltage: bat.voltage,
             battery_current: bat.current,
             ps_current: ps.current,
-            power_online,
-            max_charge,
+            power_online: self.power_online,
         };
-
-        self.battery_reading = bat;
-        self.ps_reading = ps;
-        self.power_online = power_online;
 
         self.acc.add(&sample);
         self.acc_count += 1;
@@ -282,7 +260,6 @@ impl<P: Platform> SensorData<P> {
                 battery_current: (a.battery_current + b.battery_current) / 2.0,
                 ps_current: (a.ps_current + b.ps_current) / 2.0,
                 power_online: (a.power_online + b.power_online) / 2.0,
-                max_charge: a.max_charge.max(b.max_charge),
             };
         }
         self.history.truncate(half);
@@ -353,7 +330,6 @@ impl<P: Platform> SensorData<P> {
 
         true
     }
-
 }
 
 #[cfg(test)]
@@ -425,16 +401,6 @@ mod tests {
             voltage,
             current,
             power: voltage * current,
-            charge: 0.0,
-        }
-    }
-
-    fn reading_with_charge(voltage: f32, current: f32, charge: f64) -> Ina228Reading {
-        Ina228Reading {
-            voltage,
-            current,
-            power: voltage * current,
-            charge,
         }
     }
 
@@ -446,9 +412,10 @@ mod tests {
         }
     }
 
-    /// Shorthand: update with battery + PS readings, no errors, no charge.
+    /// Shorthand: update with battery + PS readings.
     fn update(sd: &mut SensorData<TestPlatform>, bat: Ina228Reading, p: PsReading) {
-        sd.update(bat, p, 0, 0, 0.0);
+        sd.update_ps(p);
+        sd.update_battery(bat);
     }
 
     /// Push n uniform samples (v=13, c1=1, c2=2). Returns the next time_s value.
@@ -529,9 +496,13 @@ mod tests {
             }
         }
         let mut sd = SensorData::new(NoTimePlatform);
-        sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 0, 0, 0.0);
+        sd.update_ps(ps_reading(13.0, 2.0));
+        sd.update_battery(bat_reading(13.0, 1.5));
         assert!(sd.history.is_empty());
         assert!(!sd.loaded);
+        // Latest readings must still be visible to HTTP/LCD before NTP sync.
+        assert!((sd.battery_reading.current - 1.5).abs() < 0.001);
+        assert!((sd.ps_reading.current - 2.0).abs() < 0.001);
     }
 
     #[test]
@@ -539,45 +510,6 @@ mod tests {
         let (time, mut sd) = new_sd();
         fill(&mut sd, 10, 0, &time);
         assert_eq!(sd.history.len(), 10);
-    }
-
-    // --- Charge tracking ---
-
-    #[test]
-    fn charge_stored_on_last_bat_reading() {
-        let (_time, mut sd) = new_sd();
-        sd.update(
-            reading_with_charge(13.0, 1.0, 1.234),
-            ps_reading(13.0, 2.0),
-            0,
-            0,
-            0.0,
-        );
-        assert!((sd.battery_reading.charge - 1.234).abs() < 0.0001);
-    }
-
-    #[test]
-    fn max_charge_tracked() {
-        let (time, mut sd) = new_sd();
-        let bat = bat_reading(13.0, 0.0);
-        let p = ps_reading(13.0, 0.0);
-
-        // max_charge=5.0 → stored on sample
-        sd.update(bat, p, 0, 0, 5.0);
-        assert!((sd.history[0].max_charge - 5.0).abs() < 0.0001);
-
-        // max_charge=10.0 → new max
-        time.set(1);
-        sd.update(bat, p, 0, 0, 10.0);
-        assert!((sd.history[1].max_charge - 10.0).abs() < 0.0001);
-
-        // max_charge=3.0 → stored as-is on this sample
-        time.set(2);
-        sd.update(bat, p, 0, 0, 3.0);
-        assert!((sd.history[2].max_charge - 3.0).abs() < 0.0001);
-        // Overall max across history is still 10.0
-        let max = sd.history.iter().map(|s| s.max_charge).fold(0.0_f64, f64::max);
-        assert!((max - 10.0).abs() < 0.0001);
     }
 
     // --- Power online tracking ---
@@ -709,10 +641,10 @@ mod tests {
         let (time, mut sd) = new_sd();
         assert_eq!(sd.interval, 1);
 
-        // CAP=144: Compaction 1 at 145 raw updates (interval 1→2).
-        // Compaction 2 at 145+144=289 raw updates (interval 2→4).
-        // Compaction 3 at 289+288=577 raw updates (interval 4→8).
-        fill(&mut sd, 580, 0, &time);
+        // CAP=204: Compaction 1 at 205 raw updates (interval 1→2).
+        // Compaction 2 at 205+204=409 raw updates (interval 2→4).
+        // Compaction 3 at 409+408=817 raw updates (interval 4→8).
+        fill(&mut sd, 820, 0, &time);
         assert_eq!(sd.interval, 8);
     }
 
@@ -829,29 +761,12 @@ mod tests {
         w.f32(1.0);
         w.f32(2.0);
         w.f32(1.0); // power_online
-        w.f64(0.0); // max_charge
         let len = w.pos;
 
         assert!(sd.read(len));
         assert_eq!(sd.history.len(), 1);
         assert_eq!(sd.history[0].time_s, 1000);
         assert!((sd.history[0].voltage - 13.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn read_preserves_charge() {
-        let (time, mut sd) = new_sd();
-        for i in 0..10u32 {
-            time.set(1000 + i);
-            sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 0, 0, 42.0);
-        }
-        let len = sd.write();
-
-        let (_time2, mut sd2) = new_sd();
-        sd2.buf[..len].copy_from_slice(&sd.buf[..len]);
-        assert!(sd2.read(len));
-        let max = sd2.history.iter().map(|s| s.max_charge).fold(0.0_f64, f64::max);
-        assert!((max - 42.0).abs() < 1e-10);
     }
 
     #[test]
@@ -915,7 +830,7 @@ mod tests {
         let (time, mut sd) = new_sd();
         for i in 0..10u32 {
             time.set(1000 + i);
-            sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 0, 0, 5.0);
+            update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
         }
 
         let (time2, mut sd2) = sd_with_blob(&mut sd);
@@ -931,9 +846,6 @@ mod tests {
         assert_eq!(sd2.history[10].time_s, 1009);
         assert!((sd2.history[10].voltage - 14.0).abs() < 0.001);
         assert!((sd2.history[10].battery_current - 3.0).abs() < 0.001);
-        // Charge restored
-        let max = sd2.history.iter().map(|s| s.max_charge).fold(0.0_f64, f64::max);
-        assert!((max - 5.0).abs() < 1e-10);
     }
 
     #[test]
@@ -1099,29 +1011,6 @@ mod tests {
         assert!((sd3.history[101].battery_current - 9.0).abs() < 0.001);
     }
 
-    // --- Read error tracking ---
-
-    #[test]
-    fn read_stats_accumulate() {
-        let (time, mut sd) = new_sd();
-        time.set(100);
-        sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 10, 2, 0.0);
-        assert_eq!(sd.read_total, 10);
-        assert_eq!(sd.read_failures, 2);
-
-        time.set(101);
-        sd.update(bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 10, 3, 0.0);
-        assert_eq!(sd.read_total, 20);
-        assert_eq!(sd.read_failures, 5);
-    }
-
-    #[test]
-    fn read_stats_zero_by_default() {
-        let (_time, sd) = new_sd();
-        assert_eq!(sd.read_total, 0);
-        assert_eq!(sd.read_failures, 0);
-    }
-
     // --- Max interval cap ---
 
     /// Directly push samples into history, bypassing the accumulator.
@@ -1135,7 +1024,6 @@ mod tests {
                         battery_current: 1.0,
                         ps_current: 2.0,
                         power_online: 1.0,
-                        max_charge: 0.0,
                     })
                     .is_ok(),
                 "history overflow"

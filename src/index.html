@@ -34,12 +34,6 @@
                     <div class="metric-value a" id="s1_power">--</div>
                     <div class="metric-label">Power (W)</div>
                 </div>
-                <div class="metric">
-                    <div class="metric-value charge-pos" id="s1_max_charge">
-                        --
-                    </div>
-                    <div class="metric-label">Charge (Ah)</div>
-                </div>
             </div>
         </div>
         <div class="card">
@@ -117,7 +111,6 @@
 
         <div class="footer">
             <span id="uptime">--</span>
-            <span id="read_err" style="color: #f87171; display: none"></span>
             <span class="wifi-icon" id="wifi_icon">
                 <span class="wifi-bar"></span>
                 <span class="wifi-bar"></span>
@@ -196,9 +189,6 @@
                             d.battery.current,
                         ).toFixed(3);
                         $("s1_power").textContent = d.battery.power.toFixed(3);
-                        $("s1_max_charge").textContent = Math.abs(
-                            d.max_charge,
-                        ).toFixed(3);
 
                         // Power supply metrics
                         $("s2_current").textContent = Math.abs(
@@ -213,16 +203,6 @@
                         }
 
                         // Footer
-                        if (d.read_err && d.read_err[0] > 0) {
-                            const pct = (
-                                (d.read_err[0] / d.read_err[1]) *
-                                100
-                            ).toFixed(1);
-                            $("read_err").textContent = "I2C err " + pct + "%";
-                            $("read_err").style.display = "";
-                        } else {
-                            $("read_err").style.display = "none";
-                        }
                         $("uptime").textContent = formatUptime(d.uptime);
                         const bars = $("wifi_icon").children;
                         const level =
