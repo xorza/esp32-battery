@@ -96,7 +96,11 @@ impl HistoryStore {
         let nvs = self.nvs.lock().unwrap();
         match nvs.get_blob(NVS_KEY, buf) {
             Ok(Some(data)) => Some(data.len()),
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("HistoryStore load failed: {e}");
+                None
+            }
         }
     }
 }
