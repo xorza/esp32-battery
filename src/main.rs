@@ -52,9 +52,18 @@ fn start_sntp(flag: Arc<AtomicBool>) -> esp_idf_svc::sntp::EspSntp<'static> {
     info!("Starting NTP sync");
     esp_idf_svc::sntp::EspSntp::new_with_callback(
         &esp_idf_svc::sntp::SntpConf::default(),
-        move |_| {
-            info!("NTP synced");
-            flag.store(true, Ordering::Relaxed);
+        move |synced_at| {
+            // The SNTP callback can fire with a bogus time (bad server, DNS
+            // hijack, pre-sync tick). Only flip the flag once the reported
+            // epoch is within the plausibility window — otherwise a bogus
+            // value reaches SensorData and poisons history.
+            let secs = synced_at.as_secs();
+            if platform::VALID_EPOCH_S.contains(&secs) {
+                info!("NTP synced: epoch={secs}");
+                flag.store(true, Ordering::Relaxed);
+            } else {
+                warn!("NTP sync ignored: implausible epoch={secs}");
+            }
         },
     )
     .unwrap()

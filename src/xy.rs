@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use esp_idf_hal::uart::{UartDriver, config::Config};
 use esp_idf_hal::units::Hertz;
-use log::{error, info, warn};
+use log::{error, warn};
 
 use esp32_battery_logic::data::PsReading;
 
@@ -222,6 +222,7 @@ impl<'d> Xy<'d> {
     }
 }
 
+#[allow(dead_code)] // v_set/i_set/v_in will be surfaced via HTTP panel
 pub struct XyStatus {
     pub v_set: f32,
     pub i_set: f32,

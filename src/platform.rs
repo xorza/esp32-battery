@@ -8,6 +8,12 @@ use esp32_battery_logic::data::Platform;
 const NAMESPACE: &str = "data";
 const NVS_KEY: &str = "hist";
 
+/// Plausibility bounds on the system clock. The SNTP callback fires even when
+/// the system time hasn't actually been set to something sensible (e.g. a
+/// poisoned reply, a captive-portal NTP spoof, or a pre-sync tick), and once
+/// we commit a bogus epoch value it poisons every later sample.
+pub const VALID_EPOCH_S: std::ops::Range<u64> = 1_700_000_000..4_102_444_800;
+
 pub struct EspPlatform {
     nvs: EspNvs<NvsDefault>,
     ntp_synced: Arc<AtomicBool>,
@@ -27,7 +33,11 @@ impl Platform for EspPlatform {
         if !self.ntp_synced.load(Ordering::Relaxed) {
             return None;
         }
-        Some(esp_idf_svc::systime::EspSystemTime.now().as_secs() as u32)
+        let t = esp_idf_svc::systime::EspSystemTime.now().as_secs();
+        if !VALID_EPOCH_S.contains(&t) {
+            return None;
+        }
+        Some(t as u32)
     }
 
     fn save_blob(&self, data: &[u8]) {

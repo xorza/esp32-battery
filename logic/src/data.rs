@@ -228,6 +228,20 @@ impl<P: Platform> SensorData<P> {
             self.last_save_s = time_s;
         }
 
+        // Enforce monotonic time_s on the history. An NTP step-back (or a clock
+        // correction on first sync) can hand us a time earlier than the last
+        // committed sample — pushing it would break every downstream consumer
+        // that assumes chronological order.
+        if let Some(last) = self.history.last()
+            && time_s <= last.time_s
+        {
+            log::warn!(
+                "skipping out-of-order commit: time_s={time_s} <= last={}",
+                last.time_s
+            );
+            return;
+        }
+
         let sample = Sample {
             time_s,
             voltage: bat.voltage,
@@ -849,14 +863,59 @@ mod tests {
     }
 
     #[test]
-    fn save_does_not_panic_on_time_jump_backward() {
+    fn out_of_order_commits_are_rejected() {
+        // NTP correction steps the clock backwards. The pre-jump sample was
+        // committed; the post-jump one must be skipped so history stays ordered.
         let (time, mut sd) = new_sd();
         time.set(2000);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        // Time jumps backward (NTP correction)
+        assert_eq!(sd.history.len(), 1);
+
         time.set(1500);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
-        // Should not panic — saturating_sub yields 0, no save triggered
+        assert_eq!(sd.history.len(), 1, "backward-jump sample must not be pushed");
+
+        // Equal time_s also rejected (strictly increasing required).
+        time.set(2000);
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
+        assert_eq!(sd.history.len(), 1);
+
+        // Forward again: accepted.
+        time.set(2001);
+        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0));
+        assert_eq!(sd.history.len(), 2);
+    }
+
+#[test]
+    fn no_commit_before_ntp_sync() {
+        // epoch_s() returning None gates history commits AND saves entirely.
+        struct NoTimePlatform {
+            saved: std::cell::RefCell<Option<Vec<u8>>>,
+        }
+        impl Platform for NoTimePlatform {
+            fn epoch_s(&self) -> Option<u32> {
+                None
+            }
+            fn save_blob(&self, data: &[u8]) {
+                *self.saved.borrow_mut() = Some(data.to_vec());
+            }
+            fn load_blob(&self, _: &mut [u8]) -> Option<usize> {
+                None
+            }
+        }
+        let platform = NoTimePlatform {
+            saved: std::cell::RefCell::new(None),
+        };
+        let mut sd = SensorData::new(platform);
+        for _ in 0..100 {
+            sd.update_ps(ps_reading(13.0, 2.0));
+            sd.update_battery(bat_reading(13.0, 1.0));
+        }
+        assert!(sd.history.is_empty(), "no samples before NTP sync");
+        assert!(
+            sd.platform.saved.borrow().is_none(),
+            "no NVS save before NTP sync"
+        );
     }
 
     // --- Auto-load on first update ---
@@ -878,16 +937,15 @@ mod tests {
         }
 
         let (time2, mut sd2) = sd_with_blob(&mut sd);
-        time2.set(1009);
+        time2.set(1010);
         update(&mut sd2, bat_reading(14.0, 3.0), ps_reading(14.0, 4.0));
 
-        // 10 restored + 1 new = 11
+        // 10 restored + 1 new = 11. Sample time must be > last restored (1009).
         assert_eq!(sd2.history.len(), 11);
         assert_eq!(sd2.interval, 1);
         assert_eq!(sd2.history[0].time_s, 1000);
         assert!((sd2.history[0].battery_current - 1.0).abs() < 0.001);
-        // New sample: voltage=avg(14,14)=14, battery_current=3
-        assert_eq!(sd2.history[10].time_s, 1009);
+        assert_eq!(sd2.history[10].time_s, 1010);
         assert!((sd2.history[10].voltage - 14.0).abs() < 0.001);
         assert!((sd2.history[10].battery_current - 3.0).abs() < 0.001);
     }
@@ -1036,11 +1094,12 @@ mod tests {
         fill(&mut sd, 100, 1000, &time);
 
         let (time2, mut sd2) = sd_with_blob(&mut sd);
-        time2.set(1099);
+        // fill() ended at t=1099, so the next commit must be > 1099.
+        time2.set(1100);
         update(&mut sd2, bat_reading(14.0, 7.0), ps_reading(14.0, 8.0));
         assert_eq!(sd2.history.len(), 101);
 
-        let trigger_t = 1099 + SAVE_INTERVAL_S;
+        let trigger_t = 1100 + SAVE_INTERVAL_S;
         time2.set(trigger_t);
         update(&mut sd2, bat_reading(13.0, 9.0), ps_reading(13.0, 2.0));
         let blob = sd2.platform.take_blob().unwrap();
