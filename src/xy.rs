@@ -6,16 +6,60 @@
 //!
 //! Wiring: ESP TX -> XY RX, ESP RX -> XY TX, common GND. No voltage divider
 //! needed — both sides are 3.3 V TTL.
+//!
+//! The device is abstracted behind `XyDevice` so the thread loop +
+//! charge-supervisor integration runs unchanged under the `xy-fake` feature
+//! (which substitutes a canned in-memory device for the UART).
 
+use std::thread;
 use std::time::Duration;
+
+use log::{error, warn};
+
+use esp32_battery_logic::charging::{
+    Action, BatterySample, ChargeSupervisor, Chemistry, FaultReason, Profile, SafetyLimits,
+};
+use esp32_battery_logic::data::PsReading;
+use esp32_battery_logic::error_log::{Event, XyError};
+use esp32_battery_logic::modbus::ModbusError;
+
+use crate::app_state::{EventRecorder, SensorDataHandle};
+use crate::board::XyPins;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-#[cfg(not(feature = "xy-fake"))]
-pub use real::start;
+/// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
+/// absorb / 13.5 V float. CC at 10 A; enter absorb at 1 A (C/50), drop
+/// back to float at 0.5 A (C/100). enter > exit so we don't flap.
+const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.5);
+/// Hard trip thresholds programmed into the XY's protection registers.
+/// Derived from the profile so a chemistry/cell-count change moves them
+/// in lockstep — no chance the OVP ceiling drifts below the absorb target.
+const SAFETY: SafetyLimits = PACK_PROFILE.safety_limits();
 
-#[cfg(feature = "xy-fake")]
-pub use fake::start;
+#[allow(dead_code)] // v_set/i_set/v_in will be surfaced via HTTP panel
+struct XyStatus {
+    v_set: f32,
+    i_set: f32,
+    v_out: f32,
+    i_out: f32,
+    p_out: f32,
+    v_in: f32,
+}
+
+/// The set of operations the charging loop needs from the buck. Real
+/// builds get the UART-backed implementation; `xy-fake` builds get an
+/// in-memory canned device. The thread loop is identical for both.
+trait XyDevice {
+    fn read_status(&self) -> Result<XyStatus, ModbusError>;
+    fn set_voltage(&self, volts: f32) -> Result<(), ModbusError>;
+    fn set_current_limit(&self, amps: f32) -> Result<(), ModbusError>;
+    fn set_protection(&self, ovp_v: f32, ocp_a: f32, lvp_v: f32) -> Result<(), ModbusError>;
+    fn set_output(&self, on: bool) -> Result<(), ModbusError>;
+    fn set_power_on_default_off(&self) -> Result<(), ModbusError>;
+}
+
+// --- Real device ------------------------------------------------------------
 
 #[cfg(not(feature = "xy-fake"))]
 mod real {
@@ -24,29 +68,13 @@ mod real {
 
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
-    use log::{error, warn};
 
-    use esp32_battery_logic::charging::{
-        Action, BatterySample, ChargeSupervisor, Chemistry, FaultReason, Profile, SafetyLimits,
-    };
-    use esp32_battery_logic::error_log::{Event, XyError};
-
-    /// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
-    /// absorb / 13.5 V float. CC at 10 A; enter absorb at 1 A (C/50), drop
-    /// back to float at 0.5 A (C/100). enter > exit so we don't flap.
-    const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.5);
-    /// Hard trip thresholds programmed into the XY's protection registers.
-    /// Derived from the profile so a chemistry/cell-count change moves them
-    /// in lockstep — no chance the OVP ceiling drifts below the absorb target.
-    const SAFETY: SafetyLimits = PACK_PROFILE.safety_limits();
-    use esp32_battery_logic::data::PsReading;
     use esp32_battery_logic::modbus::{
         ModbusError, build_read_request, build_write_request, parse_read_response,
         parse_write_response,
     };
 
-    use super::POLL_INTERVAL;
-    use crate::app_state::{EventRecorder, SensorDataHandle};
+    use super::{XyDevice, XyStatus};
     use crate::board::XyPins;
 
     const SLAVE: u8 = 0x01;
@@ -69,12 +97,12 @@ mod real {
     /// want more.
     const POST_WRITE_GAP: Duration = Duration::from_millis(10);
 
-    struct Xy<'d> {
+    pub struct Xy<'d> {
         uart: UartDriver<'d>,
     }
 
     impl<'d> Xy<'d> {
-        fn new(pins: XyPins) -> Self {
+        pub fn new(pins: XyPins) -> Self {
             let config = Config::new().baudrate(Hertz(BAUD));
             let uart = UartDriver::new(
                 pins.uart,
@@ -128,6 +156,20 @@ mod real {
             }
             Ok(n)
         }
+    }
+
+    impl XyDevice for Xy<'_> {
+        fn read_status(&self) -> Result<XyStatus, ModbusError> {
+            let r = self.read_holding(0x0000, 6)?;
+            Ok(XyStatus {
+                v_set: r[0] as f32 / 100.0,
+                i_set: r[1] as f32 / 100.0,
+                v_out: r[2] as f32 / 100.0,
+                i_out: r[3] as f32 / 100.0,
+                p_out: r[4] as f32 / 100.0,
+                v_in: r[5] as f32 / 100.0,
+            })
+        }
 
         fn set_voltage(&self, volts: f32) -> Result<(), ModbusError> {
             self.write_holding(REG_V_SET, (volts * 100.0).round() as u16)
@@ -151,152 +193,179 @@ mod real {
         fn set_power_on_default_off(&self) -> Result<(), ModbusError> {
             self.write_holding(REG_S_INI, 0)
         }
-
-        fn read_status(&self) -> Result<XyStatus, ModbusError> {
-            let r = self.read_holding(0x0000, 6)?;
-            Ok(XyStatus {
-                v_set: r[0] as f32 / 100.0,
-                i_set: r[1] as f32 / 100.0,
-                v_out: r[2] as f32 / 100.0,
-                i_out: r[3] as f32 / 100.0,
-                p_out: r[4] as f32 / 100.0,
-                v_in: r[5] as f32 / 100.0,
-            })
-        }
-    }
-
-    #[allow(dead_code)] // v_set/i_set/v_in will be surfaced via HTTP panel
-    struct XyStatus {
-        v_set: f32,
-        i_set: f32,
-        v_out: f32,
-        i_out: f32,
-        p_out: f32,
-        v_in: f32,
-    }
-
-    /// Programs protection + setpoints, then enables output. Any failure
-    /// short-circuits — we never enable output with unprogrammed setpoints.
-    fn boot_sequence(xy: &Xy, initial_v_set: f32) -> Result<(), ModbusError> {
-        xy.set_output(false)?;
-        xy.set_power_on_default_off()?;
-        xy.set_protection(SAFETY.ovp_v, SAFETY.ocp_a, SAFETY.lvp_v)?;
-        xy.set_voltage(initial_v_set)?;
-        xy.set_current_limit(PACK_PROFILE.regulation_a)?;
-        xy.set_output(true)?;
-        Ok(())
-    }
-
-    pub fn start(pins: XyPins, sensor_data: SensorDataHandle, recorder: EventRecorder) {
-        thread::Builder::new()
-            .name("xy".into())
-            .stack_size(4096)
-            .spawn(move || {
-                let xy = Xy::new(pins);
-                let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
-                thread::sleep(Duration::from_millis(100));
-
-                if let Err(e) = boot_sequence(&xy, supervisor.target_voltage()) {
-                    error!("XY boot failed: {e} — forcing output OFF, will keep polling");
-                    recorder.record(Event::Xy(XyError::BootSequence));
-                    let _ = xy.set_output(false);
-                }
-
-                loop {
-                    let (modbus_ok, battery) = {
-                        let mut sd = sensor_data.lock().unwrap();
-                        let modbus_ok = match xy.read_status() {
-                            Ok(s) => {
-                                sd.update_ps(PsReading {
-                                    voltage: s.v_out,
-                                    current: s.i_out,
-                                    power: s.p_out,
-                                });
-                                true
-                            }
-                            Err(e) => {
-                                warn!("XY read_status: {e}");
-                                recorder.record(Event::Xy(XyError::ReadStatus));
-                                false
-                            }
-                        };
-                        let battery = sd.battery_reading().map(|b| BatterySample {
-                            voltage: b.voltage,
-                            current: b.current,
-                        });
-                        (modbus_ok, battery)
-                    };
-
-                    match supervisor.tick(modbus_ok, battery, POLL_INTERVAL) {
-                        Action::None => {}
-                        Action::SetVoltage(v) => {
-                            let phase = match supervisor.phase() {
-                                esp32_battery_logic::charging::Phase::Float => "float",
-                                esp32_battery_logic::charging::Phase::Absorb => "absorb",
-                            };
-                            log::info!("charge phase → {phase}: setting V_set = {v:.2} V");
-                            if let Err(e) = xy.set_voltage(v) {
-                                warn!("XY set_voltage({v}): {e}");
-                                recorder.record(Event::Xy(XyError::SetVoltage));
-                            }
-                        }
-                        Action::DisableOutput(reason) => {
-                            let reason_str = match reason {
-                                FaultReason::BatterySensorStale => "battery sensor stale",
-                                FaultReason::ModbusUnhealthy => "modbus link unhealthy",
-                                FaultReason::Overvoltage => "pack overvoltage",
-                                FaultReason::AbsorbTimeout => "absorb time cap reached",
-                            };
-                            match xy.set_output(false) {
-                                Ok(()) => {
-                                    error!("CHARGE FAULT ({reason_str}): PS output DISABLED");
-                                    supervisor.ack_disable();
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "CHARGE FAULT ({reason_str}): set_output(false) failed: {e} — will retry"
-                                    );
-                                    recorder.record(Event::Xy(XyError::SetOutput));
-                                }
-                            }
-                        }
-                    }
-                    thread::sleep(POLL_INTERVAL);
-                }
-            })
-            .unwrap();
     }
 
     // Modbus frame tests live in esp32_battery_logic::modbus (host-runnable).
 }
 
+// --- Fake device ------------------------------------------------------------
+
 #[cfg(feature = "xy-fake")]
 mod fake {
-    use std::thread;
+    use std::cell::Cell;
 
-    use esp32_battery_logic::data::PsReading;
+    use esp32_battery_logic::modbus::ModbusError;
 
-    use super::POLL_INTERVAL;
-    use crate::app_state::{EventRecorder, SensorDataHandle};
-    use crate::board::XyPins;
+    use super::{XyDevice, XyStatus};
 
-    const FAKE_READING: PsReading = PsReading {
-        voltage: 13.5,
-        current: 0.0,
-        power: 0.0,
-    };
-
-    pub fn start(_pins: XyPins, sensor_data: SensorDataHandle, _recorder: EventRecorder) {
-        thread::Builder::new()
-            .name("xy".into())
-            .stack_size(4096)
-            .spawn(move || {
-                log::info!("XY: fake mode — no UART, canned readings");
-                loop {
-                    sensor_data.lock().unwrap().update_ps(FAKE_READING);
-                    thread::sleep(POLL_INTERVAL);
-                }
-            })
-            .unwrap();
+    /// In-memory stand-in for the buck. Tracks the last voltage/output
+    /// state set by the supervisor so reads reflect what the supervisor
+    /// last commanded — exercises the same control flow as the real path.
+    pub struct FakeXy {
+        v_set: Cell<f32>,
+        output_on: Cell<bool>,
     }
+
+    impl FakeXy {
+        pub fn new() -> Self {
+            Self {
+                v_set: Cell::new(13.5),
+                output_on: Cell::new(false),
+            }
+        }
+    }
+
+    impl XyDevice for FakeXy {
+        fn read_status(&self) -> Result<XyStatus, ModbusError> {
+            let v = if self.output_on.get() {
+                self.v_set.get()
+            } else {
+                0.0
+            };
+            Ok(XyStatus {
+                v_set: self.v_set.get(),
+                i_set: 10.0,
+                v_out: v,
+                i_out: 0.0,
+                p_out: 0.0,
+                v_in: 24.0,
+            })
+        }
+        fn set_voltage(&self, volts: f32) -> Result<(), ModbusError> {
+            self.v_set.set(volts);
+            Ok(())
+        }
+        fn set_current_limit(&self, _amps: f32) -> Result<(), ModbusError> {
+            Ok(())
+        }
+        fn set_protection(&self, _ovp: f32, _ocp: f32, _lvp: f32) -> Result<(), ModbusError> {
+            Ok(())
+        }
+        fn set_output(&self, on: bool) -> Result<(), ModbusError> {
+            self.output_on.set(on);
+            Ok(())
+        }
+        fn set_power_on_default_off(&self) -> Result<(), ModbusError> {
+            Ok(())
+        }
+    }
+}
+
+// --- Shared thread loop -----------------------------------------------------
+
+/// Programs protection + setpoints, then enables output. Any failure
+/// short-circuits — we never enable output with unprogrammed setpoints.
+fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), ModbusError> {
+    xy.set_output(false)?;
+    xy.set_power_on_default_off()?;
+    xy.set_protection(SAFETY.ovp_v, SAFETY.ocp_a, SAFETY.lvp_v)?;
+    xy.set_voltage(initial_v_set)?;
+    xy.set_current_limit(PACK_PROFILE.regulation_a)?;
+    xy.set_output(true)?;
+    Ok(())
+}
+
+fn run<D: XyDevice>(xy: D, sensor_data: SensorDataHandle, recorder: EventRecorder) {
+    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
+    thread::sleep(Duration::from_millis(100));
+
+    if let Err(e) = boot_sequence(&xy, supervisor.target_voltage()) {
+        error!("XY boot failed: {e} — forcing output OFF, will keep polling");
+        recorder.record(Event::Xy(XyError::BootSequence));
+        let _ = xy.set_output(false);
+    }
+
+    loop {
+        let (modbus_ok, battery) = {
+            let mut sd = sensor_data.lock().unwrap();
+            let modbus_ok = match xy.read_status() {
+                Ok(s) => {
+                    sd.update_ps(PsReading {
+                        voltage: s.v_out,
+                        current: s.i_out,
+                        power: s.p_out,
+                    });
+                    true
+                }
+                Err(e) => {
+                    warn!("XY read_status: {e}");
+                    recorder.record(Event::Xy(XyError::ReadStatus));
+                    false
+                }
+            };
+            let battery = sd.battery_reading().map(|b| BatterySample {
+                voltage: b.voltage,
+                current: b.current,
+            });
+            (modbus_ok, battery)
+        };
+
+        match supervisor.tick(modbus_ok, battery, POLL_INTERVAL) {
+            Action::None => {}
+            Action::SetVoltage(v) => {
+                let phase = match supervisor.phase() {
+                    esp32_battery_logic::charging::Phase::Float => "float",
+                    esp32_battery_logic::charging::Phase::Absorb => "absorb",
+                };
+                log::info!("charge phase → {phase}: setting V_set = {v:.2} V");
+                if let Err(e) = xy.set_voltage(v) {
+                    warn!("XY set_voltage({v}): {e}");
+                    recorder.record(Event::Xy(XyError::SetVoltage));
+                }
+            }
+            Action::DisableOutput(reason) => {
+                let reason_str = match reason {
+                    FaultReason::BatterySensorStale => "battery sensor stale",
+                    FaultReason::ModbusUnhealthy => "modbus link unhealthy",
+                    FaultReason::Overvoltage => "pack overvoltage",
+                    FaultReason::AbsorbTimeout => "absorb time cap reached",
+                };
+                match xy.set_output(false) {
+                    Ok(()) => {
+                        error!("CHARGE FAULT ({reason_str}): PS output DISABLED");
+                        supervisor.ack_disable();
+                    }
+                    Err(e) => {
+                        error!(
+                            "CHARGE FAULT ({reason_str}): set_output(false) failed: {e} — will retry"
+                        );
+                        recorder.record(Event::Xy(XyError::SetOutput));
+                    }
+                }
+            }
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+// --- Public entry point -----------------------------------------------------
+
+#[cfg(not(feature = "xy-fake"))]
+fn make_device(pins: XyPins) -> real::Xy<'static> {
+    real::Xy::new(pins)
+}
+
+#[cfg(feature = "xy-fake")]
+fn make_device(_pins: XyPins) -> fake::FakeXy {
+    log::info!("XY: fake mode — no UART, in-memory device");
+    fake::FakeXy::new()
+}
+
+pub fn start(pins: XyPins, sensor_data: SensorDataHandle, recorder: EventRecorder) {
+    let device = make_device(pins);
+    thread::Builder::new()
+        .name("xy".into())
+        .stack_size(4096)
+        .spawn(move || run(device, sensor_data, recorder))
+        .unwrap();
 }
