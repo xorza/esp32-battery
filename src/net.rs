@@ -19,8 +19,8 @@ use strum::IntoStaticStr;
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 
-/// LCD-visible status. Derived once per supervisor tick from `(Net,
-/// connected)`; not stored inside `Net`.
+/// LCD-visible status. Computed by the supervisor inside each tick arm
+/// (so `bundle.state` is locked at most once per tick).
 ///
 /// `CaptiveTrying` distinguishes "captive AP up, STA mid-association on
 /// the user's freshly-submitted creds" from plain `Captive` — the LCD
@@ -39,31 +39,33 @@ pub enum NetStatus {
 /// `Host` displayed across a single missed `is_connected()` sample (sub-second
 /// deauth, beacon-loss false negative, scan blip) instead of flickering
 /// through `Connecting`. Sustained drops past this window honestly read as
-/// `Connecting`; past `CAPTIVE_AFTER_DISCONNECT` the supervisor falls back
-/// to captive AP entirely.
+/// `Connecting`; past the supervisor's captive-fallback grace the
+/// supervisor falls back to captive AP entirely.
 const LCD_HOST_HYSTERESIS: Duration = Duration::from_secs(3);
 
 impl NetStatus {
-    pub fn derive(net: &Net, connected: bool, now: Duration) -> Self {
-        match net {
-            Net::Sta {
-                last_associated,
-                ever_connected,
-                ..
-            } => {
-                if connected
-                    || (*ever_connected
-                        && now.saturating_sub(*last_associated) < LCD_HOST_HYSTERESIS)
-                {
-                    NetStatus::Host
-                } else {
-                    NetStatus::Connecting
-                }
-            }
-            Net::Captive { bundle } => match &*bundle.state.lock().unwrap() {
-                Submission::Pending { .. } | Submission::Trying { .. } => NetStatus::CaptiveTrying,
-                Submission::Idle | Submission::Failed => NetStatus::Captive,
-            },
+    /// LCD reading for `Net::Sta`. `Host` while associated, or within
+    /// the hysteresis window after the last associated tick (so a single
+    /// missed `is_connected()` sample doesn't flicker the screen);
+    /// `Connecting` otherwise. The hysteresis only fires once we've ever
+    /// associated this session — cold boot does not lie.
+    pub fn for_sta(link_seen: &LinkSeen, connected: bool, now: Duration) -> Self {
+        if connected {
+            return NetStatus::Host;
+        }
+        match link_seen {
+            LinkSeen::At(t) if now.saturating_sub(*t) < LCD_HOST_HYSTERESIS => NetStatus::Host,
+            _ => NetStatus::Connecting,
+        }
+    }
+
+    /// LCD reading for `Net::Captive`. `CaptiveTrying` during the
+    /// `Pending`/`Trying` window so the captive page's "Connecting…"
+    /// overlay stays visible; otherwise `Captive`.
+    pub fn for_captive(s: &Submission) -> Self {
+        match s {
+            Submission::Pending { .. } | Submission::Trying { .. } => NetStatus::CaptiveTrying,
+            Submission::Idle | Submission::Failed => NetStatus::Captive,
         }
     }
 }
@@ -125,18 +127,37 @@ pub struct CaptiveBundle {
 }
 
 pub enum Net {
-    /// Trying to be on the user's network. `last_associated` is the
-    /// monotonic timestamp of the most recent associated tick (or the
-    /// arm's construction time if never associated yet). Once
-    /// `now - last_associated` exceeds the captive grace, we fall back
-    /// to `Captive`. `ever_connected` distinguishes "fresh boot, still
-    /// trying" from "we've been associated and may briefly drop" — only
-    /// the latter gets LCD-side hysteresis.
+    /// Trying to be on the user's network. `link_seen` carries the
+    /// monotonic timestamp the captive-fallback timer counts from, and
+    /// also gates LCD-side hysteresis: only `LinkSeen::At` (we've
+    /// associated at least once this session) qualifies.
     Sta {
         server: EspHttpServer<'static>,
-        last_associated: Duration,
-        ever_connected: bool,
+        link_seen: LinkSeen,
     },
     /// Serving the captive portal AP.
     Captive { bundle: CaptiveBundle },
+}
+
+/// Tracks STA association history within a single `Net::Sta` session.
+/// `Never` carries the arm's construction time so the captive-fallback
+/// timer has a deadline even when STA has never associated; `At` carries
+/// the most recent associated-tick time so both the fallback timer and
+/// the LCD hysteresis read off one value.
+#[derive(Copy, Clone)]
+pub enum LinkSeen {
+    Never { session_start: Duration },
+    At(Duration),
+}
+
+impl LinkSeen {
+    /// Time the captive-fallback grace counts from — either the most
+    /// recent association or the session start when we've never
+    /// associated.
+    pub fn timestamp(&self) -> Duration {
+        match self {
+            LinkSeen::Never { session_start } => *session_start,
+            LinkSeen::At(t) => *t,
+        }
+    }
 }

@@ -32,7 +32,7 @@ use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler
 
 use crate::clock::{EventRecorder, uptime};
 use crate::history_store::{HistoryStore, Persister};
-use crate::net::{Net, NetStatus, NetStatusHandle, Submission};
+use crate::net::{LinkSeen, Net, NetStatus, NetStatusHandle, Submission};
 
 /// How long `is_connected() == false` may persist before we tear down
 /// the host server and fall back to the captive AP. The AP is a fallback
@@ -123,8 +123,9 @@ fn main() {
             let server = http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
             Net::Sta {
                 server,
-                last_associated: uptime(),
-                ever_connected: false,
+                link_seen: LinkSeen::Never {
+                    session_start: uptime(),
+                },
             }
         }
         None => {
@@ -134,19 +135,25 @@ fn main() {
             Net::Captive { bundle }
         }
     };
-    net_status.store(NetStatus::derive(&net, false, uptime()));
+    // Initial LCD: bootstrap captive is always Idle, bootstrap Sta hasn't
+    // associated yet. Both fall through to the obvious value.
+    net_status.store(match &net {
+        Net::Sta { link_seen, .. } => NetStatus::for_sta(link_seen, false, uptime()),
+        Net::Captive { .. } => NetStatus::Captive,
+    });
 
     loop {
         thread::sleep(TICK_PERIOD);
         let now = uptime();
         persister.tick(clock.epoch_s());
 
-        net = match net {
+        let (new_net, lcd) = match net {
             Net::Captive { bundle } => {
                 // Drain a fresh /save handoff (Pending → Trying) and time
                 // out a stale Trying window — single critical section on
-                // the submission lock.
-                {
+                // the submission lock. Compute the captive LCD reading
+                // inside the same lock so end-of-tick doesn't re-acquire.
+                let captive_lcd = {
                     let mut s = bundle.state.lock().unwrap();
                     let taken = std::mem::replace(&mut *s, Submission::Idle);
                     match taken {
@@ -166,7 +173,8 @@ fn main() {
                         }
                         other => *s = other,
                     }
-                }
+                    NetStatus::for_captive(&s)
+                };
 
                 let connected = wifi.lock().unwrap().tick(creds.is_some());
                 if connected {
@@ -183,46 +191,38 @@ fn main() {
                     wifi.lock().unwrap().start_sta(&c);
                     let server =
                         http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
-                    Net::Sta {
+                    let net = Net::Sta {
                         server,
-                        last_associated: now,
-                        ever_connected: true,
-                    }
+                        link_seen: LinkSeen::At(now),
+                    };
+                    (net, NetStatus::Host)
                 } else {
-                    Net::Captive { bundle }
+                    (Net::Captive { bundle }, captive_lcd)
                 }
             }
-            Net::Sta {
-                server,
-                last_associated,
-                ever_connected,
-            } => {
+            Net::Sta { server, link_seen } => {
                 let connected = wifi.lock().unwrap().tick(creds.is_some());
                 if connected {
-                    Net::Sta {
+                    let net = Net::Sta {
                         server,
-                        last_associated: now,
-                        ever_connected: true,
-                    }
-                } else if now.saturating_sub(last_associated) >= CAPTIVE_AFTER_DISCONNECT {
+                        link_seen: LinkSeen::At(now),
+                    };
+                    (net, NetStatus::Host)
+                } else if now.saturating_sub(link_seen.timestamp()) >= CAPTIVE_AFTER_DISCONNECT {
                     // Long STA outage — bring up captive AP+STA so the
                     // user can correct creds while STA keeps retrying.
                     drop(server);
                     wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
                     let state = Arc::new(Mutex::new(Submission::Idle));
                     let bundle = http::start_captive(wifi.clone(), state);
-                    Net::Captive { bundle }
+                    (Net::Captive { bundle }, NetStatus::Captive)
                 } else {
-                    Net::Sta {
-                        server,
-                        last_associated,
-                        ever_connected,
-                    }
+                    let lcd = NetStatus::for_sta(&link_seen, false, now);
+                    (Net::Sta { server, link_seen }, lcd)
                 }
             }
         };
-
-        let connected_now = wifi.lock().unwrap().is_connected();
-        net_status.store(NetStatus::derive(&net, connected_now, uptime()));
+        net = new_net;
+        net_status.store(lcd);
     }
 }
