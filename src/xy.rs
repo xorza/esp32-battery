@@ -305,12 +305,36 @@ fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), XyIoErro
     Ok(())
 }
 
+/// Cold-boot retry budget for `boot_sequence`. The XY7025's UART is
+/// slower to come up than the ESP, especially on standalone (no-USB)
+/// power where there's no CDC-enumeration delay to mask the gap. ~5 s
+/// of retries swallows the race without delaying the supervisor loop
+/// noticeably when the XY is actually unreachable.
+const BOOT_RETRY_DELAY: Duration = Duration::from_millis(200);
+const BOOT_RETRY_COUNT: u32 = 5;
+
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
-    thread::sleep(Duration::from_millis(100));
 
-    if let Err(e) = boot_sequence(&xy, supervisor.target_voltage()) {
-        error!("XY boot failed: {e} — forcing output OFF, will keep polling");
+    let mut last_err = None;
+    let mut booted = false;
+    for attempt in 0..BOOT_RETRY_COUNT {
+        if attempt > 0 {
+            thread::sleep(BOOT_RETRY_DELAY);
+        }
+        match boot_sequence(&xy, supervisor.target_voltage()) {
+            Ok(()) => {
+                booted = true;
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if !booted {
+        let e = last_err.expect("retry loop ran at least once");
+        error!(
+            "XY boot failed after {BOOT_RETRY_COUNT} attempts: {e} — forcing output OFF, will keep polling"
+        );
         recorder.record(Event::Xy(XyError::BootSequence));
         let _ = xy.set_output(false);
     }
