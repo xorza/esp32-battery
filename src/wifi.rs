@@ -33,11 +33,36 @@ fn sta_config(creds: &WifiCredentials) -> ClientConfiguration {
     }
 }
 
+/// Tracks whether the driver is started and whether we have STA credentials
+/// configured. The four reachable combinations are Idle (both false), Sta
+/// (started + has creds), or ApMixed (started, optional creds for the
+/// embedded STA half). The pre-F4 representation used two independent
+/// `bool`s, which had two unreachable shapes.
+enum Mode {
+    Idle,
+    Sta,
+    ApMixed { has_sta_creds: bool },
+}
+
+impl Mode {
+    fn started(&self) -> bool {
+        !matches!(self, Mode::Idle)
+    }
+
+    fn has_sta_creds(&self) -> bool {
+        matches!(
+            self,
+            Mode::Sta | Mode::ApMixed {
+                has_sta_creds: true
+            }
+        )
+    }
+}
+
 pub struct Wifi<'d> {
     wifi: BlockingWifi<EspWifi<'d>>,
     mdns: Option<EspMdns>,
-    started: bool,
-    sta_configured: bool,
+    mode: Mode,
 }
 
 impl<'d> Wifi<'d> {
@@ -84,24 +109,22 @@ impl<'d> Wifi<'d> {
         Self {
             wifi,
             mdns: None,
-            started: false,
-            sta_configured: false,
+            mode: Mode::Idle,
         }
     }
 
     fn start_with(&mut self, config: Configuration) {
-        if self.started {
+        if self.mode.started() {
             let _ = self.wifi.stop();
         }
         self.wifi.set_configuration(&config).unwrap();
         self.wifi.start().unwrap();
-        self.started = true;
     }
 
     pub fn start_sta(&mut self, creds: &WifiCredentials) {
         info!("Starting WiFi STA for '{}'", creds.ssid);
         self.start_with(Configuration::Client(sta_config(creds)));
-        self.sta_configured = true;
+        self.mode = Mode::Sta;
     }
 
     /// Switch to mixed AP+STA mode. AP serves captive portal, STA keeps retrying.
@@ -120,16 +143,18 @@ impl<'d> Wifi<'d> {
         // Always use Mixed mode so the STA interface is available for WiFi scanning.
         let sta = creds.map_or_else(ClientConfiguration::default, sta_config);
         self.start_with(Configuration::Mixed(sta, ap));
-        self.sta_configured = creds.is_some();
+        self.mode = Mode::ApMixed {
+            has_sta_creds: creds.is_some(),
+        };
         info!("AP started");
     }
 
     pub fn is_connected(&self) -> bool {
-        self.sta_configured && self.wifi.is_connected().unwrap_or(false)
+        self.mode.has_sta_creds() && self.wifi.is_connected().unwrap_or(false)
     }
 
     pub fn try_reconnect(&mut self) {
-        if !self.started || !self.sta_configured || self.wifi.is_connected().unwrap_or(false) {
+        if !self.mode.has_sta_creds() || self.wifi.is_connected().unwrap_or(false) {
             return;
         }
         if self.wifi.connect().is_ok() {
