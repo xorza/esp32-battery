@@ -27,7 +27,7 @@ mod real {
     use log::{error, warn};
 
     use esp32_battery_logic::charging::{
-        Action, ChargeSupervisor, Chemistry, FaultReason, Profile,
+        Action, BatterySample, ChargeSupervisor, Chemistry, FaultReason, Profile,
     };
 
     /// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
@@ -229,7 +229,10 @@ mod real {
                                 false
                             }
                         };
-                        let battery = sd.battery_reading().map(|b| (b.voltage, b.current));
+                        let battery = sd.battery_reading().map(|b| BatterySample {
+                            voltage: b.voltage,
+                            current: b.current,
+                        });
                         (modbus_ok, battery)
                     };
 
