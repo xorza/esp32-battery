@@ -1,10 +1,10 @@
 //! Application state. One `AppState` value lives on the main thread for the
-//! life of the program. Worker threads (xy, ina, lcd, http) get an
-//! `Arc<Shared>` clone — the cross-thread, `Send + Sync` subset.
+//! life of the program. Worker threads each receive only the cross-thread
+//! handles they actually use — sensor data, the credential mailbox, or the
+//! current net status — instead of an aggregate `Shared` blob.
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use esp_idf_svc::http::server::EspHttpServer;
 use log::{info, warn};
@@ -16,26 +16,19 @@ use crate::history_store::HistoryStore;
 use crate::nvs_creds::WifiCredentials;
 
 /// Cross-thread net status — what readers (LCD, etc.) should display.
-/// Derived from `NetPhase` at every transition; lives in `Shared` because
-/// `NetPhase` contains `!Send` servers and stays on the main thread.
+/// Derived from `NetPhase` at every transition.
 #[derive(Copy, Clone, PartialEq, Eq)]
-#[repr(u8)]
 pub enum NetStatus {
-    Captive = 0,
-    Connecting = 1,
-    Host = 2,
+    Captive,
+    Connecting,
+    Host,
 }
 
-impl NetStatus {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            0 => NetStatus::Captive,
-            1 => NetStatus::Connecting,
-            2 => NetStatus::Host,
-            _ => unreachable!("NetStatus byte out of range"),
-        }
-    }
-}
+pub type SensorDataHandle = Arc<Mutex<SensorData>>;
+/// Set by the captive `/save` handler when fresh credentials land. Drained
+/// by the main loop, which then drives the live STA reconnect.
+pub type CredsMailbox = Arc<Mutex<Option<WifiCredentials>>>;
+pub type NetStatusHandle = Arc<Mutex<NetStatus>>;
 
 /// Single source of truth for network phase + mounted HTTP server. Lives on
 /// the main thread — `EspHttpServer` is `!Send`.
@@ -74,23 +67,10 @@ impl NetPhase {
     }
 }
 
-/// Cross-thread subset. Cloned (as `Arc<Shared>`) into every worker thread.
-pub struct Shared {
-    pub sensor_data: Mutex<SensorData>,
-    /// Set by the captive `/save` handler when fresh credentials land.
-    /// Drained by the main loop, which then drives the live STA reconnect.
-    pub pending_creds: Mutex<Option<WifiCredentials>>,
-    status: AtomicU8,
-}
-
-impl Shared {
-    pub fn status(&self) -> NetStatus {
-        NetStatus::from_u8(self.status.load(Ordering::Relaxed))
-    }
-}
-
 pub struct AppState {
-    pub shared: Arc<Shared>,
+    pub sensor_data: SensorDataHandle,
+    pub pending_creds: CredsMailbox,
+    pub status: NetStatusHandle,
     pub history_store: HistoryStore,
     phase: NetPhase,
 }
@@ -98,20 +78,16 @@ pub struct AppState {
 impl AppState {
     pub fn new(sensor_data: SensorData, history_store: HistoryStore) -> Self {
         Self {
-            shared: Arc::new(Shared {
-                sensor_data: Mutex::new(sensor_data),
-                pending_creds: Mutex::new(None),
-                status: AtomicU8::new(NetStatus::Connecting as u8),
-            }),
+            sensor_data: Arc::new(Mutex::new(sensor_data)),
+            pending_creds: Arc::new(Mutex::new(None)),
+            status: Arc::new(Mutex::new(NetStatus::Connecting)),
             history_store,
             phase: NetPhase::Bootstrap { ticks: 0 },
         }
     }
 
     fn set_phase(&mut self, phase: NetPhase) {
-        self.shared
-            .status
-            .store(phase.status() as u8, Ordering::Relaxed);
+        *self.status.lock().unwrap() = phase.status();
         self.phase = phase;
     }
 
@@ -208,8 +184,4 @@ impl AppState {
         let (server, dns) = build();
         self.set_phase(NetPhase::Captive { server, dns });
     }
-}
-
-pub fn uptime_s() -> u32 {
-    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u32
 }

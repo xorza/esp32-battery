@@ -1,5 +1,4 @@
 use core::fmt::Write;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -23,7 +22,7 @@ use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
 
-use crate::app_state::{NetStatus, Shared};
+use crate::app_state::{NetStatus, NetStatusHandle, SensorDataHandle};
 use crate::board::LcdPins;
 
 // --- SPI / DMA ---
@@ -416,7 +415,7 @@ fn draw_connecting(gb: &mut GraphBuf) {
 
 // --- Main thread ---
 
-pub fn start(pins: LcdPins, shared: Arc<Shared>) {
+pub fn start(pins: LcdPins, sensor_data: SensorDataHandle, status: NetStatusHandle) {
     thread::Builder::new()
         .stack_size(16384)
         .spawn(move || {
@@ -482,24 +481,24 @@ pub fn start(pins: LcdPins, shared: Arc<Shared>) {
             loop {
                 thread::sleep(REFRESH_INTERVAL);
 
-                let status = shared.status();
-                let need_redraw = status != prev_status || status == NetStatus::Host;
+                let net_status = *status.lock().unwrap();
+                let need_redraw = net_status != prev_status || net_status == NetStatus::Host;
                 let mut buf = heapless::String::<16>::new();
 
                 // One lock for live readings + (if needed) graph paint into the
                 // in-RAM framebuffer. `draw_graph` borrows `sd.history()`
                 // directly — no per-frame Vec clone of ~200 samples.
                 let (r1, r2) = {
-                    let sd = shared.sensor_data.lock().unwrap();
+                    let sd = sensor_data.lock().unwrap();
                     let r1 = sd.battery_reading().unwrap_or_default();
                     let r2 = sd.ps_reading().unwrap_or_default();
-                    if need_redraw && status == NetStatus::Host {
+                    if need_redraw && net_status == NetStatus::Host {
                         gb.clear();
                         draw_graph(&mut gb, sd.history(), sd.interval(), &mut buf);
                     }
                     (r1, r2)
                 };
-                let uptime_s = crate::uptime_s();
+                let uptime = crate::clock::uptime_s();
                 buf.clear();
 
                 // Values
@@ -545,7 +544,7 @@ pub fn start(pins: LcdPins, shared: Arc<Shared>) {
                 );
 
                 // Uptime
-                let up = format_uptime(uptime_s);
+                let up = format_uptime(uptime);
                 fb.clear();
                 Text::new(
                     &up,
@@ -560,8 +559,8 @@ pub fn start(pins: LcdPins, shared: Arc<Shared>) {
                 // painted into `gb` above under the sensor-data lock; the
                 // others don't need data and are painted here.
                 if need_redraw {
-                    prev_status = status;
-                    match status {
+                    prev_status = net_status;
+                    match net_status {
                         NetStatus::Captive => {
                             gb.clear();
                             draw_captive_portal(&mut gb);

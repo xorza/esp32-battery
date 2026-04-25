@@ -38,3 +38,8 @@ impl EspClock {
         Some(t as u32)
     }
 }
+
+/// Monotonic seconds since boot, from `esp_timer_get_time` (microseconds).
+pub fn uptime_s() -> u32 {
+    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u32
+}

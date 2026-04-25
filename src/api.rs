@@ -3,7 +3,7 @@
 //! Wire format preserves the prior hand-rolled shape so the frontend is unchanged.
 //! History rows use a 5-tuple that serializes as `[t, v, c1, c2, online]`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use esp_idf_hal::io::Write;
 use esp_idf_svc::http::server::EspHttpServer;
@@ -15,7 +15,8 @@ use serde::ser::SerializeSeq;
 use esp32_battery_logic::battery;
 use esp32_battery_logic::data::Sample;
 
-use crate::app_state::Shared;
+use crate::app_state::SensorDataHandle;
+use crate::clock::uptime_s;
 use crate::http::text_response;
 
 #[derive(Serialize)]
@@ -99,7 +100,7 @@ fn get_rssi() -> i32 {
     }
 }
 
-pub fn register(server: &mut EspHttpServer<'static>, shared: Arc<Shared>) {
+pub fn register(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHandle) {
     let json_buf = Mutex::new(Box::new([0u8; RESPONSE_BUF_SIZE]));
 
     server
@@ -109,11 +110,11 @@ pub fn register(server: &mut EspHttpServer<'static>, shared: Arc<Shared>) {
             // is bounded by serialization time (~1 ms for ~200 samples) and
             // the JSON buffer lives outside the lock so no alloc happens
             // here.
-            let store = shared.sensor_data.lock().unwrap();
+            let store = sensor_data.lock().unwrap();
             let bat = store.battery_reading().unwrap_or_default();
             let ps = store.ps_reading().unwrap_or_default();
             let response = ApiResponse {
-                uptime: crate::uptime_s(),
+                uptime: uptime_s(),
                 rssi: get_rssi(),
                 voltage: bat.voltage,
                 power_online: store.power_online(),

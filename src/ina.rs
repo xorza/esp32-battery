@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -6,7 +5,7 @@ use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::BusConfig, config::Devic
 
 use esp32_battery_logic::data::Ina228Reading;
 
-use crate::app_state::Shared;
+use crate::app_state::SensorDataHandle;
 use crate::board::I2cPins;
 
 const I2C_SPEED_HZ: u32 = 400_000;
@@ -72,7 +71,7 @@ fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Ina228Reading {
     }
 }
 
-pub fn start(pins: I2cPins, shared: Arc<Shared>) {
+pub fn start(pins: I2cPins, sensor_data: SensorDataHandle) {
     thread::Builder::new()
         .name("ina".into())
         .stack_size(4096)
@@ -105,8 +104,7 @@ pub fn start(pins: I2cPins, shared: Arc<Shared>) {
                     count += 1;
                 }
 
-                shared
-                    .sensor_data
+                sensor_data
                     .lock()
                     .unwrap()
                     .update_battery(bat_acc.average(SAMPLES_PER_UPDATE));

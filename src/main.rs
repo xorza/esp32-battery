@@ -25,7 +25,7 @@ use log::{info, warn};
 
 use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
 
-pub use app_state::{AppState, uptime_s};
+pub use app_state::AppState;
 
 use crate::clock::EspClock;
 use crate::nvs_creds::WifiCredentials;
@@ -41,7 +41,7 @@ fn tick_and_persist(state: &AppState, clock: &EspClock, scheduler: &mut SaveSche
     // lock — keeps NVS I/O out of the critical section but avoids a two-lock
     // dance + stale-state window between them.
     let payload = {
-        let mut sd = state.shared.sensor_data.lock().unwrap();
+        let mut sd = state.sensor_data.lock().unwrap();
         sd.tick(now);
         if scheduler.tick(now) {
             Some(sd.serialize())
@@ -59,7 +59,7 @@ fn drain_pending_creds(
     state: &mut AppState,
     wifi: &Mutex<wifi::Wifi<'static>>,
 ) -> Option<WifiCredentials> {
-    let new = state.shared.pending_creds.lock().unwrap().take()?;
+    let new = state.pending_creds.lock().unwrap().take()?;
     info!("Applying credentials submitted via captive portal");
     wifi.lock().unwrap().start_sta(&new);
     state.on_creds_applied();
@@ -140,12 +140,12 @@ fn main() {
     // internally, so there's no reason to tear it down and restart.
     let _sntp = start_sntp(clock.clone());
 
-    xy::start(board.xy, state.shared.clone());
+    xy::start(board.xy, state.sensor_data.clone());
 
-    ina::start(board.i2c, state.shared.clone());
+    ina::start(board.i2c, state.sensor_data.clone());
 
     #[cfg(feature = "lcd")]
-    lcd::start(board.lcd, state.shared.clone());
+    lcd::start(board.lcd, state.sensor_data.clone(), state.status.clone());
 
     if let Some(ref creds) = creds {
         wifi.lock().unwrap().start_sta(creds);
@@ -163,13 +163,13 @@ fn main() {
 
         let connected = tick_wifi(&wifi);
         if connected {
-            let shared = state.shared.clone();
-            state.on_tick_connected(|| http::start_main(shared, nvs.clone()));
+            let sd = state.sensor_data.clone();
+            state.on_tick_connected(|| http::start_main(sd, nvs.clone()));
         } else {
-            let shared = state.shared.clone();
+            let creds_box = state.pending_creds.clone();
             state.on_tick_disconnected(creds.is_some(), CAPTIVE_AFTER_FAILURES, || {
                 wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
-                http::start_captive(shared, nvs.clone(), wifi.clone())
+                http::start_captive(creds_box, nvs.clone(), wifi.clone())
             });
         }
     }

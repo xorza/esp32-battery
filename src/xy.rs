@@ -19,7 +19,6 @@ pub use fake::start;
 
 #[cfg(not(feature = "xy-fake"))]
 mod real {
-    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -40,7 +39,7 @@ mod real {
     };
 
     use super::POLL_INTERVAL;
-    use crate::app_state::Shared;
+    use crate::app_state::SensorDataHandle;
     use crate::board::XyPins;
 
     const SLAVE: u8 = 0x01;
@@ -197,7 +196,7 @@ mod real {
         Ok(())
     }
 
-    pub fn start(pins: XyPins, shared: Arc<Shared>) {
+    pub fn start(pins: XyPins, sensor_data: SensorDataHandle) {
         thread::Builder::new()
             .name("xy".into())
             .stack_size(4096)
@@ -220,7 +219,7 @@ mod real {
                                 power: s.p_out,
                             };
                             let batt_current = {
-                                let mut sd = shared.sensor_data.lock().unwrap();
+                                let mut sd = sensor_data.lock().unwrap();
                                 sd.update_ps(reading);
                                 sd.battery_reading().map(|b| b.current)
                             };
@@ -253,13 +252,12 @@ mod real {
 
 #[cfg(feature = "xy-fake")]
 mod fake {
-    use std::sync::Arc;
     use std::thread;
 
     use esp32_battery_logic::data::PsReading;
 
     use super::POLL_INTERVAL;
-    use crate::app_state::Shared;
+    use crate::app_state::SensorDataHandle;
     use crate::board::XyPins;
 
     const FAKE_READING: PsReading = PsReading {
@@ -268,7 +266,7 @@ mod fake {
         power: 0.0,
     };
 
-    pub fn start(pins: XyPins, shared: Arc<Shared>) {
+    pub fn start(pins: XyPins, sensor_data: SensorDataHandle) {
         drop(pins);
         thread::Builder::new()
             .name("xy".into())
@@ -276,7 +274,7 @@ mod fake {
             .spawn(move || {
                 log::info!("XY: fake mode — no UART, canned readings");
                 loop {
-                    shared.sensor_data.lock().unwrap().update_ps(FAKE_READING);
+                    sensor_data.lock().unwrap().update_ps(FAKE_READING);
                     thread::sleep(POLL_INTERVAL);
                 }
             })
