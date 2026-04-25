@@ -15,9 +15,13 @@ use std::time::Duration;
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::mdns::EspMdns;
+use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use esp32_battery_logic::data::SensorData;
+use esp32_battery_logic::error_log::EventLog;
 use strum::IntoStaticStr;
 
 use crate::dns::DnsHandle;
+use crate::http;
 use crate::nvs_creds::WifiCredentials;
 use crate::wifi::{MixedWifi, StaWifi};
 
@@ -158,6 +162,43 @@ pub enum Net {
         bundle: CaptiveBundle,
         creds: Option<WifiCredentials>,
     },
+}
+
+impl Net {
+    /// Wrap an already-STA radio in a dashboard server. Moves `creds`
+    /// into the variant so the type is the single source of truth for
+    /// "what credentials are we currently trying."
+    pub fn start_sta(
+        wifi: StaWifi<'static>,
+        creds: WifiCredentials,
+        sensor_data: Arc<Mutex<SensorData>>,
+        event_log: Arc<Mutex<EventLog>>,
+        nvs: Arc<EspNvs<NvsDefault>>,
+        link_seen: LinkSeen,
+    ) -> Self {
+        let server = http::start_main(sensor_data, event_log, nvs);
+        Net::Sta {
+            wifi,
+            server,
+            mdns: None,
+            creds,
+            link_seen,
+        }
+    }
+
+    /// Wrap an already-Mixed radio in a captive HTTP/DNS bundle. `creds`
+    /// is the optional carry-over from a `Sta → Captive` fallback (`None`
+    /// on cold boot with no stored creds).
+    pub fn start_captive(wifi: MixedWifi<'static>, creds: Option<WifiCredentials>) -> Self {
+        let scan_cache = wifi.scan_cache();
+        let state = Arc::new(Mutex::new(Submission::Idle));
+        let bundle = http::start_captive(scan_cache, state);
+        Net::Captive {
+            wifi,
+            bundle,
+            creds,
+        }
+    }
 }
 
 /// Tracks STA association history within a single `Net::Sta` session.

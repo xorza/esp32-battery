@@ -110,23 +110,17 @@ fn main() {
 
     // Bootstrap: STA if we have creds, else captive. Per `wifi flow.md`.
     let mut net = match boot_creds {
-        Some(c) => {
-            let sta_wifi = wifi.into_sta(&c);
-            start_sta_session(
-                sta_wifi,
-                c,
-                &sensor_data,
-                &event_log,
-                &nvs,
-                LinkSeen::Never {
-                    session_start: uptime(),
-                },
-            )
-        }
-        None => {
-            let mixed_wifi = wifi.into_mixed(None);
-            start_captive_session(mixed_wifi, None)
-        }
+        Some(c) => Net::start_sta(
+            wifi.into_sta(&c),
+            c,
+            sensor_data.clone(),
+            event_log.clone(),
+            nvs.clone(),
+            LinkSeen::Never {
+                session_start: uptime(),
+            },
+        ),
+        None => Net::start_captive(wifi.into_mixed(None), None),
     };
     net_status.store(match &net {
         Net::Sta { link_seen, .. } => NetStatus::for_sta(link_seen, false, uptime()),
@@ -167,13 +161,12 @@ fn main() {
                     // Drop captive bundle first so its server/dns threads
                     // join before we tear the AP down via `into_sta`.
                     drop(bundle);
-                    let sta_wifi = wifi.into_sta(&c);
-                    let next = start_sta_session(
-                        sta_wifi,
+                    let next = Net::start_sta(
+                        wifi.into_sta(&c),
                         c,
-                        &sensor_data,
-                        &event_log,
-                        &nvs,
+                        sensor_data.clone(),
+                        event_log.clone(),
+                        nvs.clone(),
                         LinkSeen::At(now),
                     );
                     (next, NetStatus::Host)
@@ -220,8 +213,7 @@ fn main() {
                     // STA keeps retrying.
                     drop(server);
                     drop(mdns);
-                    let mixed_wifi = wifi.into_mixed(Some(&creds));
-                    let next = start_captive_session(mixed_wifi, Some(creds));
+                    let next = Net::start_captive(wifi.into_mixed(Some(&creds)), Some(creds));
                     (next, NetStatus::Captive)
                 } else {
                     let s = NetStatus::for_sta(&link_seen, false, now);
@@ -271,42 +263,4 @@ fn drain_submission(
         other => *s = other,
     }
     NetStatus::for_captive(&s)
-}
-
-/// Bring up the dashboard server around an already-STA radio. `creds`
-/// is moved into `Net::Sta` so the variant is the single source of truth
-/// for "what credentials are we currently trying."
-fn start_sta_session(
-    wifi: wifi::StaWifi<'static>,
-    creds: nvs_creds::WifiCredentials,
-    sensor_data: &Arc<Mutex<SensorData>>,
-    event_log: &Arc<Mutex<EventLog>>,
-    nvs: &Arc<esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>>,
-    link_seen: LinkSeen,
-) -> Net {
-    let server = http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
-    Net::Sta {
-        wifi,
-        server,
-        mdns: None,
-        creds,
-        link_seen,
-    }
-}
-
-/// Bring up the captive HTTP/DNS bundle around an already-Mixed radio.
-/// `creds` is the optional carry-over from a `Sta → Captive` fallback
-/// (`None` on cold boot with no stored creds).
-fn start_captive_session(
-    wifi: wifi::MixedWifi<'static>,
-    creds: Option<nvs_creds::WifiCredentials>,
-) -> Net {
-    let scan_cache = wifi.scan_cache();
-    let state = Arc::new(Mutex::new(Submission::Idle));
-    let bundle = http::start_captive(scan_cache, state);
-    Net::Captive {
-        wifi,
-        bundle,
-        creds,
-    }
 }
