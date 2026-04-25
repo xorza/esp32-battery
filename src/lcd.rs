@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use esp32_battery_logic::data::HISTORY_CAPACITY;
+use esp32_battery_logic::data::Sample;
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Point, Size};
@@ -243,7 +243,7 @@ const COLOR_OFFLINE: Rgb565 = Rgb565::new(2, 0, 0); // very dim red background
 
 fn draw_graph(
     gb: &mut GraphBuf,
-    history: &[(u32, f32, f32, f32, f32)],
+    history: &[Sample],
     interval: u32,
     buf: &mut heapless::String<16>,
 ) {
@@ -261,11 +261,11 @@ fn draw_graph(
     let mut c_min = f32::MAX;
     let mut c_max = f32::MIN;
 
-    for &(_, v, c1, c2, _) in history {
-        v_min = v_min.min(v);
-        v_max = v_max.max(v);
-        c_min = c_min.min(c1).min(c2);
-        c_max = c_max.max(c1).max(c2);
+    for s in history {
+        v_min = v_min.min(s.voltage);
+        v_max = v_max.max(s.voltage);
+        c_min = c_min.min(s.battery_current).min(s.ps_current);
+        c_max = c_max.max(s.battery_current).max(s.ps_current);
     }
 
     let v_margin = (v_max - v_min).max(0.2) * 0.1;
@@ -278,8 +278,8 @@ fn draw_graph(
     c_max += c_margin;
 
     // Time-proportional X mapping
-    let t0 = history[0].0 as f32;
-    let t1 = history[n - 1].0 as f32;
+    let t0 = history[0].time_s as f32;
+    let t1 = history[n - 1].time_s as f32;
     let t_range = (t1 - t0).max(1.0);
     // History is guaranteed chronologically ordered by SensorData, so
     // (t - t0) ∈ [0, t_range] and the cast result fits in [0, GRAPH_W-1].
@@ -289,14 +289,14 @@ fn draw_graph(
     // Build a per-column flag array, then fill once.
     let mut offline_cols = [false; GRAPH_W as usize];
     for i in 0..n {
-        if history[i].4 < 0.99 {
+        if history[i].power_online < 0.99 {
             let x0 = if i > 0 {
-                ((time_to_x(history[i - 1].0) + time_to_x(history[i].0)) / 2) as usize
+                ((time_to_x(history[i - 1].time_s) + time_to_x(history[i].time_s)) / 2) as usize
             } else {
                 0
             };
             let x1 = if i < n - 1 {
-                ((time_to_x(history[i].0) + time_to_x(history[i + 1].0)) / 2) as usize
+                ((time_to_x(history[i].time_s) + time_to_x(history[i + 1].time_s)) / 2) as usize
             } else {
                 GRAPH_W as usize
             };
@@ -365,15 +365,15 @@ fn draw_graph(
     for i in 1..n {
         let prev = history[i - 1];
         let curr = history[i];
-        let x0 = time_to_x(prev.0);
-        let x1 = time_to_x(curr.0);
-        let dt = curr.0.saturating_sub(prev.0);
+        let x0 = time_to_x(prev.time_s);
+        let x1 = time_to_x(curr.time_s);
+        let dt = curr.time_s.saturating_sub(prev.time_s);
 
         // For large gaps, draw a dotted interpolation line instead of solid
         let is_gap = dt > gap_threshold;
 
-        let vals_prev = [prev.1, prev.2, prev.3]; // voltage, bat_current, ps_current
-        let vals_curr = [curr.1, curr.2, curr.3];
+        let vals_prev = [prev.voltage, prev.battery_current, prev.ps_current];
+        let vals_curr = [curr.voltage, curr.battery_current, curr.ps_current];
 
         for (j, &(lo, hi, color)) in traces.iter().enumerate() {
             let y0 = margin + map_to_y(vals_prev[j], lo, hi, plot_h);
@@ -482,32 +482,25 @@ pub fn start(pins: LcdPins, shared: Arc<Shared>) {
             loop {
                 thread::sleep(REFRESH_INTERVAL);
 
-                let (r1, r2, uptime_s, history, interval) = {
-                    let sd = shared.sensor_data.lock().unwrap();
-                    let hist: heapless::Vec<(u32, f32, f32, f32, f32), HISTORY_CAPACITY> = sd
-                        .history()
-                        .iter()
-                        .map(|s| {
-                            (
-                                s.time_s,
-                                s.voltage,
-                                s.battery_current,
-                                s.ps_current,
-                                s.power_online,
-                            )
-                        })
-                        .collect();
-                    let ivl = sd.interval();
-                    (
-                        sd.battery_reading().unwrap_or_default(),
-                        sd.ps_reading().unwrap_or_default(),
-                        crate::uptime_s(),
-                        hist,
-                        ivl,
-                    )
-                };
-
+                let status = shared.status();
+                let need_redraw = status != prev_status || status == NetStatus::Host;
                 let mut buf = heapless::String::<16>::new();
+
+                // One lock for live readings + (if needed) graph paint into the
+                // in-RAM framebuffer. `draw_graph` borrows `sd.history()`
+                // directly — no per-frame Vec clone of ~200 samples.
+                let (r1, r2) = {
+                    let sd = shared.sensor_data.lock().unwrap();
+                    let r1 = sd.battery_reading().unwrap_or_default();
+                    let r2 = sd.ps_reading().unwrap_or_default();
+                    if need_redraw && status == NetStatus::Host {
+                        gb.clear();
+                        draw_graph(&mut gb, sd.history(), sd.interval(), &mut buf);
+                    }
+                    (r1, r2)
+                };
+                let uptime_s = crate::uptime_s();
+                buf.clear();
 
                 // Values
                 let _ = write!(buf, "{:.2} V", r1.voltage);
@@ -563,16 +556,21 @@ pub fn start(pins: LcdPins, shared: Arc<Shared>) {
                 .unwrap();
                 fb.blit_rows(&mut display, Point::new(UPTIME_X, 0), 12);
 
-                // Graph / Captive portal / Connecting
-                let status = shared.status();
-                let need_redraw = status != prev_status || status == NetStatus::Host;
+                // Graph / Captive portal / Connecting. Host case already
+                // painted into `gb` above under the sensor-data lock; the
+                // others don't need data and are painted here.
                 if need_redraw {
                     prev_status = status;
-                    gb.clear();
                     match status {
-                        NetStatus::Captive => draw_captive_portal(&mut gb),
-                        NetStatus::Connecting => draw_connecting(&mut gb),
-                        NetStatus::Host => draw_graph(&mut gb, &history, interval, &mut buf),
+                        NetStatus::Captive => {
+                            gb.clear();
+                            draw_captive_portal(&mut gb);
+                        }
+                        NetStatus::Connecting => {
+                            gb.clear();
+                            draw_connecting(&mut gb);
+                        }
+                        NetStatus::Host => {}
                     }
                     gb.blit(&mut display, Point::new(0, GRAPH_Y));
                 }
