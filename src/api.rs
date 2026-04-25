@@ -5,10 +5,8 @@
 
 use std::sync::Mutex;
 
-use esp_idf_hal::io::Write;
 use esp_idf_svc::http::server::EspHttpServer;
-use esp_idf_svc::sys::EspError;
-use log::{debug, warn};
+use log::debug;
 use serde::Serialize;
 use serde::ser::SerializeSeq;
 
@@ -17,7 +15,7 @@ use esp32_battery_logic::data::Sample;
 
 use crate::app_state::SensorDataHandle;
 use crate::clock::uptime_s;
-use crate::http::text_response;
+use crate::http::json_response;
 
 #[derive(Serialize)]
 pub struct BatteryReading {
@@ -105,62 +103,43 @@ pub fn register(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHand
 
     server
         .fn_handler("/api", esp_idf_svc::http::Method::Get, move |req| {
-            // Hold the sensor-data lock through JSON serialization — the
-            // history is borrowed, not cloned. Measurement-thread latency
-            // is bounded by serialization time (~1 ms for ~200 samples) and
-            // the JSON buffer lives outside the lock so no alloc happens
-            // here.
-            let store = sensor_data.lock().unwrap();
-            let bat = store.battery_reading().unwrap_or_default();
-            let ps = store.ps_reading().unwrap_or_default();
-            let response = ApiResponse {
-                uptime: uptime_s(),
-                rssi: get_rssi(),
-                voltage: bat.voltage,
-                power_online: store.power_online(),
-                heap: HeapInfo::new(),
-                battery: BatteryReading {
-                    soc: battery::ocv_soc(bat.voltage),
-                    current: bat.current,
-                    power: bat.power,
-                },
-                ps: PsReading {
-                    voltage: ps.voltage,
-                    current: ps.current,
-                    power: ps.power,
-                },
-                history: HistoryView(store.history()),
-            };
-
             let mut guard = json_buf.lock().unwrap();
             let buf: &mut [u8] = &mut **guard;
-            let len = match serde_json_core::to_slice(&response, buf) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!("API: JSON serialization failed ({:?}); returning 500", e);
-                    return text_response(req, 500, b"serialization error");
+            json_response(req, buf, |buf| {
+                // Sensor-data lock held only through serialization — history
+                // is borrowed, not cloned. Lock drops at closure end, before
+                // the network write.
+                let store = sensor_data.lock().unwrap();
+                let bat = store.battery_reading().unwrap_or_default();
+                let ps = store.ps_reading().unwrap_or_default();
+                let response = ApiResponse {
+                    uptime: uptime_s(),
+                    rssi: get_rssi(),
+                    voltage: bat.voltage,
+                    power_online: store.power_online(),
+                    heap: HeapInfo::new(),
+                    battery: BatteryReading {
+                        soc: battery::ocv_soc(bat.voltage),
+                        current: bat.current,
+                        power: bat.power,
+                    },
+                    ps: PsReading {
+                        voltage: ps.voltage,
+                        current: ps.current,
+                        power: ps.power,
+                    },
+                    history: HistoryView(store.history()),
+                };
+                let history_len = response.history.0.len();
+                let result = serde_json_core::to_slice(&response, buf);
+                if let Ok(len) = result {
+                    debug!(
+                        "API: history={} json={}/{}",
+                        history_len, len, RESPONSE_BUF_SIZE
+                    );
                 }
-            };
-            let history_len = response.history.0.len();
-            drop(store);
-
-            debug!(
-                "API: history={} json={}/{}",
-                history_len, len, RESPONSE_BUF_SIZE,
-            );
-
-            let mut resp = req
-                .into_response(
-                    200,
-                    None,
-                    &[
-                        ("Content-Type", "application/json"),
-                        ("Connection", "close"),
-                    ],
-                )
-                .map_err(|e| e.0)?;
-            resp.write_all(&buf[..len]).map_err(|e| e.0)?;
-            Ok::<(), EspError>(())
+                result
+            })
         })
         .unwrap();
 }

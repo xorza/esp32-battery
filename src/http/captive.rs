@@ -4,7 +4,6 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use esp_idf_hal::io::Write;
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::sys::EspError;
@@ -16,7 +15,7 @@ use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 use crate::wifi::Wifi;
 
-use super::{create_server, serve_common_assets, serve_static, text_response};
+use super::{create_server, json_response, serve_common_assets, serve_static, text_response};
 
 /// Max JSON size for /scan: 10 APs × ~40 bytes (quoted 32-char SSID + rssi) + brackets.
 const SCAN_BUF_SIZE: usize = 1024;
@@ -34,25 +33,13 @@ pub fn start(
     let scan_buf = Mutex::new(Box::new([0u8; SCAN_BUF_SIZE]));
     server
         .fn_handler("/scan", esp_idf_svc::http::Method::Get, move |req| {
-            let entries = wifi.lock().unwrap().scan();
-            let rows: Vec<(&str, i8)> = entries.iter().map(|(s, r)| (s.as_str(), *r)).collect();
-
             let mut guard = scan_buf.lock().unwrap();
             let buf: &mut [u8] = &mut **guard;
-            let len = serde_json_core::to_slice(&rows, buf).unwrap();
-
-            let mut resp = req
-                .into_response(
-                    200,
-                    None,
-                    &[
-                        ("Content-Type", "application/json"),
-                        ("Connection", "close"),
-                    ],
-                )
-                .map_err(|e| e.0)?;
-            resp.write_all(&buf[..len]).map_err(|e| e.0)?;
-            Ok::<(), EspError>(())
+            json_response(req, buf, |buf| {
+                let entries = wifi.lock().unwrap().scan();
+                let rows: Vec<(&str, i8)> = entries.iter().map(|(s, r)| (s.as_str(), *r)).collect();
+                serde_json_core::to_slice(&rows, buf)
+            })
         })
         .unwrap();
 

@@ -11,17 +11,14 @@
 
 use std::sync::Mutex;
 
-use esp_idf_hal::io::Write;
 use esp_idf_svc::http::server::EspHttpServer;
-use esp_idf_svc::sys::EspError;
-use log::warn;
 use serde::Serialize;
 use serde::ser::{SerializeMap, SerializeSeq};
 
 use esp32_battery_logic::error_log::{Event, EventLog};
 
 use crate::app_state::EventLogHandle;
-use crate::http::text_response;
+use crate::http::json_response;
 
 /// EventLog is bounded (32 entries × ~40 chars + ~30 small counters), well
 /// under 4 KiB even with worst-case float-ish formatting.
@@ -79,36 +76,17 @@ pub fn register(server: &mut EspHttpServer<'static>, event_log: EventLogHandle) 
 
     server
         .fn_handler("/api/errors", esp_idf_svc::http::Method::Get, move |req| {
-            let log = event_log.lock().unwrap();
-            let response = ErrorsResponse {
-                ina_counts: InaCountsView(&log),
-                xy_counts: XyCountsView(&log),
-                recent: RecentView(&log),
-            };
-
             let mut guard = json_buf.lock().unwrap();
             let buf: &mut [u8] = &mut **guard;
-            let len = match serde_json_core::to_slice(&response, buf) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!("API/errors: JSON serialization failed ({:?})", e);
-                    return text_response(req, 500, b"serialization error");
-                }
-            };
-            drop(log);
-
-            let mut resp = req
-                .into_response(
-                    200,
-                    None,
-                    &[
-                        ("Content-Type", "application/json"),
-                        ("Connection", "close"),
-                    ],
-                )
-                .map_err(|e| e.0)?;
-            resp.write_all(&buf[..len]).map_err(|e| e.0)?;
-            Ok::<(), EspError>(())
+            json_response(req, buf, |buf| {
+                let log = event_log.lock().unwrap();
+                let response = ErrorsResponse {
+                    ina_counts: InaCountsView(&log),
+                    xy_counts: XyCountsView(&log),
+                    recent: RecentView(&log),
+                };
+                serde_json_core::to_slice(&response, buf)
+            })
         })
         .unwrap();
 }

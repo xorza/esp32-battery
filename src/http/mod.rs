@@ -13,6 +13,7 @@ use esp_idf_svc::http::server::{
 };
 use esp_idf_svc::sys::EspError;
 use esp_idf_svc::tls::X509;
+use log::warn;
 
 pub use captive::start as start_captive;
 pub use main_server::start as start_main;
@@ -115,5 +116,41 @@ pub(crate) fn text_response(
         .into_response(status, None, &[("Connection", "close")])
         .map_err(|e| e.0)?;
     resp.write_all(body).map_err(|e| e.0)?;
+    Ok(())
+}
+
+/// Serialize a value into `buf` and write it as `application/json`. The
+/// serialize step runs inside `build`, so the caller can hold a data lock
+/// across only the serialization (the lock drops when `build` returns) and
+/// not across the network write. On serialization failure (typically buffer
+/// too small) we return 500 with a plain-text body — matches what
+/// hand-rolled handlers were doing.
+pub(crate) fn json_response<F, E>(
+    req: Request<&mut EspHttpConnection>,
+    buf: &mut [u8],
+    build: F,
+) -> Result<(), EspError>
+where
+    F: FnOnce(&mut [u8]) -> Result<usize, E>,
+    E: core::fmt::Debug,
+{
+    let len = match build(buf) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!("JSON serialization failed: {:?}", e);
+            return text_response(req, 500, b"serialization error");
+        }
+    };
+    let mut resp = req
+        .into_response(
+            200,
+            None,
+            &[
+                ("Content-Type", "application/json"),
+                ("Connection", "close"),
+            ],
+        )
+        .map_err(|e| e.0)?;
+    resp.write_all(&buf[..len]).map_err(|e| e.0)?;
     Ok(())
 }
