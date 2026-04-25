@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use esp_idf_svc::http::server::EspHttpServer;
+use esp_idf_svc::mdns::EspMdns;
 use strum::IntoStaticStr;
 
 use crate::dns::DnsHandle;
@@ -137,6 +138,10 @@ pub enum Net {
         // the server, which stops the dashboard. Same convention as
         // `CaptiveBundle::_server` / `_dns`.
         _server: EspHttpServer<'static>,
+        // `None` until the first associated tick — `EspMdns::take()`
+        // requires a live netif. Reassignment-on-fallback drops it so a
+        // later promote can `take()` again.
+        mdns: Option<EspMdns>,
         creds: WifiCredentials,
         link_seen: LinkSeen,
     },

@@ -64,8 +64,21 @@ fn sta_config(creds: &WifiCredentials) -> ClientConfiguration {
 
 pub struct Wifi<'d> {
     wifi: BlockingWifi<EspWifi<'d>>,
-    mdns: Option<EspMdns>,
     scan_cache: ScanCache,
+}
+
+/// Take and configure the mDNS responder for the dashboard. Owned by
+/// `Net::Sta` (the dashboard's lifecycle is the mDNS responder's
+/// lifecycle); dropping it on `Sta → Captive` lets a later promote
+/// `EspMdns::take()` again.
+pub fn setup_mdns() -> EspMdns {
+    let mut mdns = EspMdns::take().unwrap();
+    mdns.set_hostname(HOSTNAME).unwrap();
+    mdns.set_instance_name(HOSTNAME).unwrap();
+    mdns.add_service(None, "_http", "_tcp", HTTP_PORT, &[])
+        .unwrap();
+    info!("mDNS: {}.local", HOSTNAME);
+    mdns
 }
 
 impl<'d> Wifi<'d> {
@@ -111,7 +124,6 @@ impl<'d> Wifi<'d> {
 
         Self {
             wifi,
-            mdns: None,
             scan_cache: Arc::new(Mutex::new(CachedScan {
                 at: None,
                 entries: ScanResult::new(),
@@ -207,14 +219,16 @@ impl<'d> Wifi<'d> {
         self.wifi.is_connected().unwrap_or(false)
     }
 
-    /// Supervisor tick: when STA creds are configured and we're not
-    /// associated, attempt a reconnect. Returns whether we are associated
-    /// post-attempt. Caller passes `has_sta_creds` because credential
-    /// presence is supervisor-owned state (in `main`'s `creds: Option`).
-    pub fn tick(&mut self, has_sta_creds: bool) -> bool {
-        if has_sta_creds && !self.is_connected() && self.wifi.connect().is_ok() {
+    /// Single connect attempt. Returns post-attempt connection state.
+    /// Caller invokes only when STA creds are configured (so the SSID
+    /// in `Configuration` isn't empty); waits for the netif so a `true`
+    /// return means downstream binds (mDNS, HTTP) can run immediately.
+    pub fn try_connect(&mut self) -> bool {
+        if self.is_connected() {
+            return true;
+        }
+        if self.wifi.connect().is_ok() {
             let _ = self.wifi.wait_netif_up();
-            self.setup_mdns();
         }
         self.is_connected()
     }
@@ -248,18 +262,5 @@ impl<'d> Wifi<'d> {
         }
 
         entries
-    }
-
-    fn setup_mdns(&mut self) {
-        if self.mdns.is_some() {
-            return;
-        }
-        let mut mdns = EspMdns::take().unwrap();
-        mdns.set_hostname(HOSTNAME).unwrap();
-        mdns.set_instance_name(HOSTNAME).unwrap();
-        mdns.add_service(None, "_http", "_tcp", HTTP_PORT, &[])
-            .unwrap();
-        info!("mDNS: {}.local", HOSTNAME);
-        self.mdns = Some(mdns);
     }
 }

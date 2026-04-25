@@ -142,7 +142,11 @@ fn main() {
             Net::Captive { bundle, creds } => {
                 let captive_status = drain_submission(bundle, &wifi, creds, now);
                 let mut w = wifi.lock().unwrap();
-                let connected = w.tick(creds.is_some());
+                let connected = if creds.is_some() {
+                    w.try_connect()
+                } else {
+                    w.is_connected()
+                };
                 // Only refresh while we're not mid-association: a fresh
                 // `scan_n` competes with an in-flight associate and can
                 // tank the user's submitted creds. `Captive` covers the
@@ -163,11 +167,20 @@ fn main() {
                 }
             }
             Net::Sta {
-                link_seen, creds, ..
+                link_seen,
+                creds,
+                mdns,
+                ..
             } => {
-                let connected = wifi.lock().unwrap().tick(true);
+                let connected = wifi.lock().unwrap().try_connect();
                 if connected {
                     *link_seen = LinkSeen::At(now);
+                    if mdns.is_none() {
+                        // First associated tick — netif is up, take and
+                        // configure mDNS. Stays alive until the variant
+                        // is dropped on `Sta → Captive`.
+                        *mdns = Some(wifi::setup_mdns());
+                    }
                     Step::Stay(NetStatus::Host)
                 } else if now.saturating_sub(link_seen.timestamp()) >= CAPTIVE_AFTER_DISCONNECT {
                     Step::FallBack(creds.clone())
@@ -262,6 +275,7 @@ fn start_sta_session(
     let server = http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
     Net::Sta {
         _server: server,
+        mdns: None,
         creds,
         link_seen,
     }
