@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
@@ -20,6 +20,7 @@ use log::info;
 
 use esp32_battery_logic::form;
 
+use crate::clock::uptime;
 use crate::http::{JsonBuf, json_response, mount_get, mount_post, read_to_buf, text_response};
 use crate::nvs_creds::{self, WifiCredentials};
 use crate::wifi::Wifi;
@@ -31,7 +32,7 @@ const STATUS_BUF_SIZE: usize = 64;
 
 pub enum SaveLifecycle {
     Idle,
-    Trying { since: Instant },
+    Trying { since: Duration },
     Connected,
     Failed,
 }
@@ -46,7 +47,7 @@ impl SaveLifecycle {
         }
     }
 
-    pub fn begin_trying(&mut self, now: Instant) {
+    pub fn begin_trying(&mut self, now: Duration) {
         *self = Self::Trying { since: now };
     }
 
@@ -56,9 +57,9 @@ impl SaveLifecycle {
 
     /// If currently `Trying` and the `Trying` window has aged past `timeout`,
     /// transition to `Failed` and return true. Caller logs on the rising edge.
-    pub fn tick_timeout(&mut self, now: Instant, timeout: Duration) -> bool {
+    pub fn tick_timeout(&mut self, now: Duration, timeout: Duration) -> bool {
         if let Self::Trying { since } = self
-            && now.duration_since(*since) >= timeout
+            && now.saturating_sub(*since) >= timeout
         {
             *self = Self::Failed;
             return true;
@@ -127,7 +128,7 @@ pub fn mount(
         // live STA-credential update; once the STA actually associates, the
         // supervisor will call `mark_connected`. If the window ages past
         // CAPTIVE_TRYING_TIMEOUT, the supervisor flips us to `Failed`.
-        state_save.lock().unwrap().begin_trying(Instant::now());
+        state_save.lock().unwrap().begin_trying(uptime());
         info!("Captive: queued new credentials for live STA reconnect");
         text_response(req, 200, b"OK")?;
         Ok::<(), EspError>(())

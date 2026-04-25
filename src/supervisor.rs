@@ -1,16 +1,11 @@
-//! Supervisor state owned by the main thread. Worker threads receive only the
-//! cross-thread handles they actually use — `SensorDataHandle` and (for the
-//! LCD) `NetStatusHandle` — neither of which lives on `Supervisor`.
+//! ESP-side wrapper around the host-testable `net_supervisor::Phase`
+//! state machine. Pins the generic phase to the real handle types
+//! (`EspHttpServer`, `CaptiveBundle`), mirrors status to the LCD-visible
+//! `NetStatusHandle`, and owns the captive→main credential channel.
 //!
-//! `Supervisor` itself is `!Send` because the wrapped `Phase` carries an
-//! `EspHttpServer`. It owns the captive→main credential channel: the captive
-//! `/save` handler gets a `Sender<WifiCredentials>` clone, and the main loop
-//! drains the `Receiver` once per tick.
-//!
-//! The state-machine core lives in `esp32_battery_logic::net_supervisor` so it
-//! can be tested on the host with trivial handle types. This file is the thin
-//! ESP-bound shell: it pins the generic to the real handle types, mirrors
-//! status to the LCD-visible `AtomicU8`, and owns the creds channel.
+//! `Supervisor` is `!Send` because the wrapped `Phase` carries an
+//! `EspHttpServer`. Worker threads only get the small `Clone` handles
+//! defined here (`SensorDataHandle`, `EventLogHandle`, `NetStatusHandle`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -20,38 +15,17 @@ use std::time::Duration;
 use esp_idf_svc::http::server::EspHttpServer;
 
 use esp32_battery_logic::data::SensorData;
-use esp32_battery_logic::error_log::{Event, EventLog};
+use esp32_battery_logic::error_log::EventLog;
 pub use esp32_battery_logic::net_supervisor::{HostTransition, NetStatus};
 use esp32_battery_logic::net_supervisor::Phase;
 
 use crate::captive_api::SaveStateHandle;
-use crate::clock::EspClock;
+use crate::clock::uptime;
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 
 pub type SensorDataHandle = Arc<std::sync::Mutex<SensorData>>;
 pub type EventLogHandle = Arc<std::sync::Mutex<EventLog>>;
-
-/// Pairs the event log with the wall clock used to timestamp entries.
-/// Sensor threads always need both together — bundling them here removes
-/// the per-thread `record(log, clock, kind)` helper duplicated in `ina.rs`
-/// and `xy.rs`. Cheap to clone (two `Arc`s).
-#[derive(Clone)]
-pub struct EventRecorder {
-    log: EventLogHandle,
-    clock: EspClock,
-}
-
-impl EventRecorder {
-    pub fn new(log: EventLogHandle, clock: EspClock) -> Self {
-        Self { log, clock }
-    }
-
-    pub fn record(&self, event: Event) {
-        let ts = self.clock.epoch_s().unwrap_or(0);
-        self.log.lock().unwrap().record(ts, event);
-    }
-}
 
 #[derive(Clone)]
 pub struct NetStatusHandle(Arc<AtomicU8>);
@@ -100,15 +74,13 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    /// `now` anchors the bootstrap window — typically `Duration::ZERO`
-    /// when the caller measures monotonic time from this point.
-    pub fn new(now: Duration) -> Self {
+    pub fn new() -> Self {
         let (creds_tx, creds_rx) = channel();
         Self {
             status: NetStatusHandle::new(NetStatus::Connecting),
             creds_tx,
             creds_rx,
-            phase: Phase::bootstrap(now),
+            phase: Phase::bootstrap(uptime()),
         }
     }
 

@@ -15,7 +15,7 @@ use serde::ser::{SerializeMap, SerializeSeq};
 
 use esp32_battery_logic::error_log::{Event, EventLog};
 
-use crate::app_state::EventLogHandle;
+use crate::supervisor::EventLogHandle;
 use crate::http::{JsonBuf, json_response, mount_get};
 
 /// EventLog is bounded (32 entries × ~40 chars + ~30 small counters), well

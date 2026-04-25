@@ -23,7 +23,8 @@ use esp32_battery_logic::data::PsReading;
 use esp32_battery_logic::error_log::{Event, XyError};
 use esp32_battery_logic::modbus::ModbusError;
 
-use crate::app_state::{EventRecorder, SensorDataHandle};
+use crate::clock::EventRecorder;
+use crate::supervisor::SensorDataHandle;
 use crate::board::XyPins;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -64,7 +65,7 @@ trait XyDevice {
 #[cfg(not(feature = "xy-fake"))]
 mod real {
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
@@ -76,6 +77,7 @@ mod real {
 
     use super::{XyDevice, XyStatus};
     use crate::board::XyPins;
+    use crate::clock::uptime;
 
     const SLAVE: u8 = 0x01;
     const REG_V_SET: u16 = 0x0000;
@@ -143,8 +145,8 @@ mod real {
             self.uart.wait_tx_done(100).ok();
 
             let mut n = 0usize;
-            let deadline = Instant::now() + Duration::from_millis(RESPONSE_TIMEOUT_MS);
-            while n < resp.len() && Instant::now() < deadline {
+            let deadline = uptime() + Duration::from_millis(RESPONSE_TIMEOUT_MS);
+            while n < resp.len() && uptime() < deadline {
                 match self.uart.read(&mut resp[n..], 2) {
                     Ok(k) if k > 0 => n += k,
                     _ if n > 0 => break,

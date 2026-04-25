@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use esp_idf_svc::http::server::{EspHttpConnection, EspHttpServer};
 use esp_idf_svc::ota::EspOta;
@@ -7,6 +7,7 @@ use log::{info, warn};
 use serde::Serialize;
 use sha2::Sha256;
 
+use crate::clock::uptime;
 use crate::http::{json_reply, mount_post};
 
 /// Wall-clock timeout for the entire OTA upload. A legitimate 1.5 MB firmware
@@ -61,11 +62,11 @@ fn handle_upload(
         "OTA initiate_update failed"
     })?;
 
-    let deadline = Instant::now() + UPLOAD_TIMEOUT;
+    let deadline = uptime() + UPLOAD_TIMEOUT;
     let mut buf = [0u8; 4096];
     let mut total: usize = 0;
     let outcome = loop {
-        if Instant::now() >= deadline {
+        if uptime() >= deadline {
             warn!("OTA: upload timed out after {} bytes", total);
             break Err("upload timed out");
         }

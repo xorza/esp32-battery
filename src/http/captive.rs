@@ -9,7 +9,7 @@ use std::time::Duration;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use log::info;
 
-use crate::app_state::CaptiveBundle;
+use crate::supervisor::CaptiveBundle;
 use crate::captive_api;
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;

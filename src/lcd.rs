@@ -22,7 +22,7 @@ use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
 
-use crate::app_state::{NetStatus, NetStatusHandle, SensorDataHandle};
+use crate::supervisor::{NetStatus, NetStatusHandle, SensorDataHandle};
 use crate::board::LcdPins;
 
 // --- SPI / DMA ---

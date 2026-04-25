@@ -11,7 +11,7 @@ use serde::ser::SerializeSeq;
 use esp32_battery_logic::battery;
 use esp32_battery_logic::data::Sample;
 
-use crate::app_state::SensorDataHandle;
+use crate::supervisor::SensorDataHandle;
 use crate::clock::uptime_s;
 use crate::http::{JsonBuf, json_response, mount_get};
 use crate::wifi::sta_rssi;

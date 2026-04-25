@@ -5,6 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{info, warn};
 
+use esp32_battery_logic::error_log::Event;
+
+use crate::supervisor::EventLogHandle;
+
 /// Plausibility bounds on the system clock. The SNTP callback fires even when
 /// the system time hasn't actually been set to something sensible (e.g. a
 /// poisoned reply, a captive-portal NTP spoof, or a pre-sync tick), and once
@@ -41,9 +45,40 @@ impl EspClock {
     }
 }
 
-/// Monotonic seconds since boot, from `esp_timer_get_time` (microseconds).
+/// Monotonic time since boot. Backed by `esp_timer_get_time`
+/// (microseconds), same hardware counter that backs `Instant::now()` —
+/// preferred over `Instant` because no baseline needs to be threaded
+/// through call sites and the value is directly meaningful as "elapsed
+/// since boot".
+pub fn uptime() -> std::time::Duration {
+    let micros = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+    std::time::Duration::from_micros(micros)
+}
+
+/// Whole seconds since boot — for serialization to `u32` (JSON, LCD).
 pub fn uptime_s() -> u32 {
-    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u32
+    uptime().as_secs() as u32
+}
+
+/// Pairs the event log with the wall clock used to timestamp entries.
+/// Sensor threads always need both together — bundling them here removes
+/// the per-thread `record(log, clock, kind)` helper duplicated in `ina.rs`
+/// and `xy.rs`. Cheap to clone (two `Arc`s).
+#[derive(Clone)]
+pub struct EventRecorder {
+    log: EventLogHandle,
+    clock: EspClock,
+}
+
+impl EventRecorder {
+    pub fn new(log: EventLogHandle, clock: EspClock) -> Self {
+        Self { log, clock }
+    }
+
+    pub fn record(&self, event: Event) {
+        let ts = self.clock.epoch_s().unwrap_or(0);
+        self.log.lock().unwrap().record(ts, event);
+    }
 }
 
 /// Start the SNTP client and validate every callback fire against

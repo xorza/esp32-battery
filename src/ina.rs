@@ -11,7 +11,8 @@ use std::time::Duration;
 use esp32_battery_logic::data::Ina228Reading;
 use esp32_battery_logic::error_log::{Event, InaError};
 
-use crate::app_state::{EventRecorder, SensorDataHandle};
+use crate::clock::EventRecorder;
+use crate::supervisor::SensorDataHandle;
 use crate::board::I2cPins;
 
 const SAMPLES_PER_UPDATE: u32 = 10;

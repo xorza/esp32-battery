@@ -7,7 +7,7 @@ use std::time::Duration;
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
-use crate::app_state::{EventLogHandle, SensorDataHandle};
+use crate::supervisor::{EventLogHandle, SensorDataHandle};
 use crate::{api, errors, log_ring, ota, wifi_reset};
 
 use super::{create_server, serve_common_assets, serve_static};

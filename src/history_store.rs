@@ -8,7 +8,7 @@ use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
 use esp32_battery_logic::save_scheduler::SaveScheduler;
 
-use crate::app_state::SensorDataHandle;
+use crate::supervisor::SensorDataHandle;
 
 const NAMESPACE: &str = "data";
 const NVS_KEY: &str = "hist";

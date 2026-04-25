@@ -1,5 +1,4 @@
 mod api;
-mod app_state;
 mod board;
 mod captive_api;
 mod clock;
@@ -14,13 +13,14 @@ mod log_ring;
 mod nvs_creds;
 mod ota;
 mod reboot;
+mod supervisor;
 mod wifi;
 mod wifi_reset;
 mod xy;
 
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -28,10 +28,9 @@ use log::{info, warn};
 
 use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
 
-use crate::app_state::{
-    EventLogHandle, EventRecorder, HostTransition, SensorDataHandle, Supervisor,
-};
+use crate::clock::{EventRecorder, uptime};
 use crate::history_store::{HistoryStore, Persister};
+use crate::supervisor::{EventLogHandle, HostTransition, SensorDataHandle, Supervisor};
 
 /// How long `is_connected() == false` may persist before we tear down
 /// the host server and fall back to the captive AP. Covers initial
@@ -96,10 +95,7 @@ fn main() {
     let sensor_data: SensorDataHandle = Arc::new(Mutex::new(sd));
     let event_log: EventLogHandle =
         Arc::new(Mutex::new(esp32_battery_logic::error_log::EventLog::new()));
-    // Monotonic origin for the supervisor state machine. All `now`
-    // values passed into `Supervisor` are `boot.elapsed()` from here.
-    let boot = Instant::now();
-    let mut supervisor = Supervisor::new(Duration::ZERO);
+    let mut supervisor = Supervisor::new();
     let mut persister = Persister::new(
         sensor_data.clone(),
         history_store,
@@ -122,7 +118,7 @@ fn main() {
 
     loop {
         thread::sleep(TICK_PERIOD);
-        let now = boot.elapsed();
+        let now = uptime();
 
         persister.tick(clock.epoch_s());
 
@@ -141,7 +137,7 @@ fn main() {
             && state
                 .lock()
                 .unwrap()
-                .tick_timeout(Instant::now(), CAPTIVE_TRYING_TIMEOUT)
+                .tick_timeout(now, CAPTIVE_TRYING_TIMEOUT)
         {
             warn!("Captive: STA association timed out; flipping to Failed");
         }
