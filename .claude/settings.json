@@ -1,0 +1,41 @@
+{
+    "permissions": {
+        "allow": [
+            "WebFetch",
+            "WebSearch",
+
+            "Bash(cargo build:*)",
+            "Bash(cargo check:*)",
+            "Bash(cargo clippy:*)",
+            "Bash(cargo fmt:*)",
+            "Bash(cargo test:*)",
+            "Bash(cargo nextest:*)",
+            "Bash(cargo +stable nextest:*)",
+            "Bash(cargo run:*)",
+            "Bash(cargo search:*)",
+            "Bash(cargo tree:*)",
+
+            "Bash(cargo c6:*)",
+            "Bash(cargo c3:*)",
+
+            "Bash(MCU=* cargo c6:*)",
+            "Bash(MCU=* cargo c3:*)",
+
+            "Bash(MCU=* ./flash.sh:*)",
+            "Bash(MCU=* ./deploy.sh:*)",
+            "Bash(MCU=* INA_FAKE=1 XY_FAKE=1 ./flash.sh:*)",
+            "Bash(MCU=* INA_FAKE=1 XY_FAKE=1 ./deploy.sh:*)",
+            "Bash(INA_FAKE=1 XY_FAKE=1 MCU=* ./flash.sh:*)",
+            "Bash(INA_FAKE=1 XY_FAKE=1 MCU=* ./deploy.sh:*)",
+
+            "Bash(timeout * bash -c 'MCU=* ./flash.sh')",
+            "Bash(timeout * bash -c 'INA_FAKE=1 XY_FAKE=1 MCU=* ./flash.sh')",
+            "Bash(timeout * bash -c 'MCU=* ./deploy.sh*')",
+
+            "Bash(espflash flash:*)",
+            "Bash(espflash monitor:*)",
+            "Bash(espflash erase-flash:*)",
+            "Bash(timeout * espflash monitor:*)"
+        ]
+    }
+}
