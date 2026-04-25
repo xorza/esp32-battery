@@ -51,6 +51,9 @@ struct XyStatus {
 /// Transport-level error for the buck. Wraps the pure-codec
 /// `ModbusError` and carries the two UART-side outcomes that don't
 /// belong in the codec module (which is host-testable and has no I/O).
+/// `UartRead`/`UartWrite` only fire on the real UART path; under
+/// `xy-fake` the fake device never errs, hence the lint allow.
+#[allow(dead_code)]
 pub enum XyIoError {
     UartRead,
     UartWrite,
@@ -253,7 +256,7 @@ mod fake {
     }
 
     impl XyDevice for FakeXy {
-        fn read_status(&self) -> Result<XyStatus, ModbusError> {
+        fn read_status(&self) -> Result<XyStatus, XyIoError> {
             let v = if self.output_on.get() {
                 self.v_set.get()
             } else {
@@ -268,21 +271,21 @@ mod fake {
                 v_in: 24.0,
             })
         }
-        fn set_voltage(&self, volts: f32) -> Result<(), ModbusError> {
+        fn set_voltage(&self, volts: f32) -> Result<(), XyIoError> {
             self.v_set.set(volts);
             Ok(())
         }
-        fn set_current_limit(&self, _amps: f32) -> Result<(), ModbusError> {
+        fn set_current_limit(&self, _amps: f32) -> Result<(), XyIoError> {
             Ok(())
         }
-        fn set_protection(&self, _limits: SafetyLimits) -> Result<(), ModbusError> {
+        fn set_protection(&self, _limits: SafetyLimits) -> Result<(), XyIoError> {
             Ok(())
         }
-        fn set_output(&self, on: bool) -> Result<(), ModbusError> {
+        fn set_output(&self, on: bool) -> Result<(), XyIoError> {
             self.output_on.set(on);
             Ok(())
         }
-        fn set_power_on_default_off(&self) -> Result<(), ModbusError> {
+        fn set_power_on_default_off(&self) -> Result<(), XyIoError> {
             Ok(())
         }
     }
