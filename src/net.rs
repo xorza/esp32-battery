@@ -19,6 +19,7 @@ use strum::IntoStaticStr;
 
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
+use crate::wifi::{MixedWifi, StaWifi};
 
 /// LCD-visible status. Computed by the supervisor inside each tick arm
 /// (so `bundle.state` is locked at most once per tick).
@@ -129,10 +130,14 @@ pub enum Net {
     /// also gates LCD-side hysteresis: only `LinkSeen::At` (we've
     /// associated at least once this session) qualifies.
     Sta {
+        /// STA-only radio — the type bounds the legal operations to
+        /// `try_connect` / `into_mixed`. Moves with the variant on
+        /// fallback; no shared `Arc<Mutex<…>>`.
+        wifi: StaWifi<'static>,
         // Alive-for-Drop only — reassigning `net` away from `Sta` drops
         // the server, which stops the dashboard. Same convention as
         // `CaptiveBundle::_server` / `_dns`.
-        _server: EspHttpServer<'static>,
+        server: EspHttpServer<'static>,
         // `None` until the first associated tick — `EspMdns::take()`
         // requires a live netif. Reassignment-on-fallback drops it so a
         // later promote can `take()` again.
@@ -146,6 +151,10 @@ pub enum Net {
     /// also after a `Sta → Captive` fallback (creds carry over so STA
     /// can keep retrying while the user re-enters them).
     Captive {
+        /// Mixed AP+STA radio — the type bounds the legal operations to
+        /// `try_connect` / `set_sta_creds` / `refresh_scan_if_stale` /
+        /// `into_sta`. Moves with the variant on promote.
+        wifi: MixedWifi<'static>,
         bundle: CaptiveBundle,
         creds: Option<WifiCredentials>,
     },
