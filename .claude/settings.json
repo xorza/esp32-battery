@@ -35,6 +35,12 @@
             "Bash(timeout * bash -c 'INA_FAKE=1 XY_FAKE=1 MCU=* ./flash.sh')",
             "Bash(timeout * bash -c 'MCU=* ./deploy.sh*')",
 
+            "Bash(tail:*)",
+            "Bash(head:*)",
+            "Bash(grep:*)",
+            "Bash(rg:*)",
+            "Bash(wc:*)",
+
             "Bash(espflash flash:*)",
             "Bash(espflash monitor:*)",
             "Bash(espflash erase-flash:*)",
