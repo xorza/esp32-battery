@@ -131,7 +131,7 @@ const _: () = assert!(HARDWARE_OVP_MARGIN_V > OV_MARGIN_V);
 pub const INPUT_NOMINAL_V: f32 = 24.0;
 /// Headroom below `INPUT_NOMINAL_V` before the buck cuts output on input sag.
 /// 2 V tolerates ~8% droop and stays well above the XY7025's 12 V minimum.
-pub const INPUT_LVP_MARGIN_V: f32 = 5.0;
+pub const INPUT_LVP_MARGIN_V: f32 = 2.0;
 const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
 /// How long the pack must hold above `absorb_v + OV_MARGIN_V` before tripping.
 /// Time-based so the debounce isn't sensitive to poll cadence.
