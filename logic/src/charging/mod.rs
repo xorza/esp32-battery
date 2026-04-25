@@ -44,8 +44,19 @@ impl Chemistry {
 pub struct Profile {
     pub absorb_v: f32,
     pub float_v: f32,
+    /// Constant-current setpoint sent to the buck during normal charging.
+    pub regulation_a: f32,
     pub enter_absorb_a: f32,
     pub exit_absorb_a: f32,
+}
+
+/// Hard trip limits programmed into the buck's own protection registers.
+/// Last-resort backstops above the supervisor's debounced fault thresholds.
+#[derive(Copy, Clone)]
+pub struct SafetyLimits {
+    pub ovp_v: f32,
+    pub ocp_a: f32,
+    pub lvp_v: f32,
 }
 
 impl Profile {
@@ -55,17 +66,34 @@ impl Profile {
     pub const fn for_pack(
         chemistry: Chemistry,
         cells: u8,
+        regulation_a: f32,
         enter_absorb_a: f32,
         exit_absorb_a: f32,
     ) -> Self {
         assert!(cells > 0);
+        assert!(enter_absorb_a > exit_absorb_a);
+        assert!(regulation_a > enter_absorb_a);
         let (av, fv) = chemistry.per_cell();
         let s = cells as f32;
         Self {
             absorb_v: av * s,
             float_v: fv * s,
+            regulation_a,
             enter_absorb_a,
             exit_absorb_a,
+        }
+    }
+
+    /// Derive hard trip thresholds for the buck's own protection. The buck
+    /// fires these only when regulation has already failed — the supervisor's
+    /// debounced OV at `absorb_v + 0.2 V` should catch problems first. These
+    /// are the absolute backstops: 0.6 V above absorb, 50% over the CC
+    /// setpoint, 3.5 V below float.
+    pub const fn safety_limits(&self) -> SafetyLimits {
+        SafetyLimits {
+            ovp_v: self.absorb_v + 0.6,
+            ocp_a: self.regulation_a * 1.5,
+            lvp_v: self.float_v - 3.5,
         }
     }
 }
@@ -116,8 +144,10 @@ pub struct ChargeController {
 
 impl ChargeController {
     pub fn new(profile: Profile) -> Self {
-        assert!(profile.enter_absorb_a > profile.exit_absorb_a);
         assert!(profile.absorb_v > profile.float_v);
+        // Always boot in Float — never resume Absorb across a reset, even if
+        // we crashed mid-absorb. Conservative by design: re-derive phase from
+        // observed current. Don't add NVS-backed phase persistence.
         Self {
             profile,
             phase: Phase::Float,

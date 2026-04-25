@@ -27,13 +27,17 @@ mod real {
     use log::{error, warn};
 
     use esp32_battery_logic::charging::{
-        Action, BatterySample, ChargeSupervisor, Chemistry, FaultReason, Profile,
+        Action, BatterySample, ChargeSupervisor, Chemistry, FaultReason, Profile, SafetyLimits,
     };
 
     /// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
-    /// absorb / 13.5 V float. Hysteresis: enter absorb at 1 A (C/50), drop
+    /// absorb / 13.5 V float. CC at 10 A; enter absorb at 1 A (C/50), drop
     /// back to float at 0.5 A (C/100). enter > exit so we don't flap.
-    const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 1.0, 0.5);
+    const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.5);
+    /// Hard trip thresholds programmed into the XY's protection registers.
+    /// Derived from the profile so a chemistry/cell-count change moves them
+    /// in lockstep — no chance the OVP ceiling drifts below the absorb target.
+    const SAFETY: SafetyLimits = PACK_PROFILE.safety_limits();
     use esp32_battery_logic::data::PsReading;
     use esp32_battery_logic::modbus::{
         ModbusError, build_read_request, build_write_request, parse_read_response,
@@ -63,13 +67,6 @@ mod real {
     /// baud is 1.75 ms, but cheap Chinese slaves like the XY7025 empirically
     /// want more.
     const POST_WRITE_GAP: Duration = Duration::from_millis(10);
-
-    const BOOT_I_SET: f32 = 10.0;
-    /// Hard trip thresholds (OVP / OCP / LVP). These only fire if CV/CC regulation
-    /// fails or the pack is badly out of spec — headroom above normal setpoints.
-    const BOOT_OVP: f32 = 15.0; // V — safe ceiling above the CV target
-    const BOOT_OCP: f32 = 16.0; // A — well above any normal CC current
-    const BOOT_LVP: f32 = 10.0; // V — refuses to charge a deeply-dead / shorted pack
 
     struct Xy<'d> {
         uart: UartDriver<'d>,
@@ -191,9 +188,9 @@ mod real {
     fn boot_sequence(xy: &Xy, initial_v_set: f32) -> Result<(), ModbusError> {
         xy.set_output(false)?;
         xy.set_power_on_default_off()?;
-        xy.set_protection(BOOT_OVP, BOOT_OCP, BOOT_LVP)?;
+        xy.set_protection(SAFETY.ovp_v, SAFETY.ocp_a, SAFETY.lvp_v)?;
         xy.set_voltage(initial_v_set)?;
-        xy.set_current_limit(BOOT_I_SET)?;
+        xy.set_current_limit(PACK_PROFILE.regulation_a)?;
         xy.set_output(true)?;
         Ok(())
     }

@@ -6,7 +6,7 @@ fn lfp_4s() -> Profile {
     // VOLTAGE — we enter on current, which forces enter > exit so we don't
     // flap. 0.5 A keeps a usable hysteresis band without sitting at CV
     // forever. Absorb voltage (14.4 V) is the bigger longevity win.
-    Profile::for_pack(Chemistry::LiFePo4, 4, 1.0, 0.5)
+    Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.5)
 }
 
 fn approx(a: f32, b: f32) -> bool {
@@ -26,14 +26,14 @@ fn lfp_4s_voltages_match_known_setpoints() {
 #[test]
 fn lfp_top_balance_uses_manufacturer_max() {
     // 3.65 V/cell — used only when BMS needs the headroom to balance.
-    let p = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 1.0, 2.0);
+    let p = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 10.0, 2.0, 0.5);
     assert!(approx(p.absorb_v, 14.6));
     assert!(approx(p.float_v, 13.5));
 }
 
 #[test]
 fn liion_3s_voltages_match_known_setpoints() {
-    let p = Profile::for_pack(Chemistry::LiIon, 3, 1.0, 0.1);
+    let p = Profile::for_pack(Chemistry::LiIon, 3, 10.0, 1.0, 0.1);
     // Longevity-tuned: 4.10 × 3 = 12.3, 4.00 × 3 = 12.0.
     assert!(approx(p.absorb_v, 12.3));
     assert!(approx(p.float_v, 12.0));
@@ -41,9 +41,9 @@ fn liion_3s_voltages_match_known_setpoints() {
 
 #[test]
 fn voltages_scale_with_cell_count() {
-    let p1 = Profile::for_pack(Chemistry::LiFePo4, 1, 1.0, 0.1);
-    let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 1.0, 0.1);
-    let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 1.0, 0.1);
+    let p1 = Profile::for_pack(Chemistry::LiFePo4, 1, 10.0, 1.0, 0.1);
+    let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.1);
+    let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 10.0, 1.0, 0.1);
     assert!(approx(p1.absorb_v, 3.60));
     assert!(approx(p4.absorb_v, 3.60 * 4.0));
     assert!(approx(p16.absorb_v, 3.60 * 16.0));
@@ -55,8 +55,8 @@ fn voltages_scale_with_cell_count() {
 #[test]
 fn currents_do_not_scale_with_cell_count() {
     // Pack-level current — independent of S.
-    let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 2.5, 0.25);
-    let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 2.5, 0.25);
+    let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 2.5, 0.25);
+    let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 10.0, 2.5, 0.25);
     assert_eq!(p4.enter_absorb_a, 2.5);
     assert_eq!(p16.enter_absorb_a, 2.5);
     assert_eq!(p4.exit_absorb_a, 0.25);
@@ -66,7 +66,71 @@ fn currents_do_not_scale_with_cell_count() {
 #[test]
 #[should_panic]
 fn zero_cells_panics() {
-    let _ = Profile::for_pack(Chemistry::LiFePo4, 0, 1.0, 0.1);
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 0, 10.0, 1.0, 0.1);
+}
+
+#[test]
+#[should_panic]
+fn enter_must_exceed_exit() {
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 0.5, 1.0);
+}
+
+#[test]
+#[should_panic]
+fn regulation_must_exceed_enter() {
+    // regulation_a == enter_absorb_a would mean we'd enter Absorb at the
+    // same current we're regulating to — unstable. Strict inequality.
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 1.0, 1.0, 0.5);
+}
+
+#[test]
+fn safety_limits_match_lfp_4s_known_values() {
+    // 4S LFP daily: absorb 14.4 V, float 13.5 V, CC 10 A.
+    // OVP = 14.4 + 0.6 = 15.0; OCP = 10 * 1.5 = 15.0; LVP = 13.5 - 3.5 = 10.0.
+    let s = lfp_4s().safety_limits();
+    assert!(approx(s.ovp_v, 15.0));
+    assert!(approx(s.ocp_a, 15.0));
+    assert!(approx(s.lvp_v, 10.0));
+}
+
+#[test]
+fn safety_limits_track_chemistry_change() {
+    // Top-balance pushes absorb to 14.6 V — OVP must move up too, not stay
+    // at the 4S-daily 15.0 V. Without derived limits this is the footgun.
+    let s = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 10.0, 2.0, 0.5).safety_limits();
+    assert!(approx(s.ovp_v, 15.2));
+    assert!(s.ovp_v > 14.6, "OVP must clear absorb_v");
+}
+
+#[test]
+fn safety_limits_track_cell_count_change() {
+    let s4 = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.1).safety_limits();
+    let s8 = Profile::for_pack(Chemistry::LiFePo4, 8, 10.0, 1.0, 0.1).safety_limits();
+    assert!(s8.ovp_v > s4.ovp_v, "OVP scales with cell count");
+    assert!(s8.lvp_v > s4.lvp_v, "LVP scales with cell count");
+    // OCP is current-only, no S dependence.
+    assert!(approx(s4.ocp_a, s8.ocp_a));
+}
+
+#[test]
+fn safety_limits_ovp_clears_supervisor_threshold() {
+    // The supervisor's OV detection trips at absorb_v + OV_MARGIN_V.
+    // The hardware OVP must sit strictly above that — supervisor first,
+    // hardware backstop second.
+    for (chem, cells, reg) in [
+        (Chemistry::LiFePo4, 4, 10.0),
+        (Chemistry::LiFePo4TopBalance, 4, 10.0),
+        (Chemistry::LiIon, 3, 5.0),
+    ] {
+        let p = Profile::for_pack(chem, cells, reg, 1.0, 0.1);
+        let s = p.safety_limits();
+        assert!(
+            s.ovp_v > p.absorb_v + 0.2,
+            "ovp {} must exceed absorb + supervisor margin {}",
+            s.ovp_v,
+            p.absorb_v + 0.2
+        );
+    }
 }
 
 // --- Controller behavior ---
@@ -197,8 +261,8 @@ fn nan_and_inf_current_are_ignored() {
 
 #[test]
 fn different_chemistries_yield_different_setpoints() {
-    let mut lfp = ChargeController::new(Profile::for_pack(Chemistry::LiFePo4, 4, 1.0, 0.1));
-    let mut liion = ChargeController::new(Profile::for_pack(Chemistry::LiIon, 3, 1.0, 0.1));
+    let mut lfp = ChargeController::new(Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.1));
+    let mut liion = ChargeController::new(Profile::for_pack(Chemistry::LiIon, 3, 10.0, 1.0, 0.1));
     let Decision::Setpoint(v_lfp) = lfp.update(OK_V, -2.0, TICK) else {
         panic!("expected setpoint")
     };
@@ -212,7 +276,7 @@ fn different_chemistries_yield_different_setpoints() {
 #[test]
 fn single_cell_lfp_works() {
     // 1S LFP charger — float 3.375 V, absorb 3.60 V (daily).
-    let mut c = ChargeController::new(Profile::for_pack(Chemistry::LiFePo4, 1, 1.0, 0.1));
+    let mut c = ChargeController::new(Profile::for_pack(Chemistry::LiFePo4, 1, 10.0, 1.0, 0.1));
     assert!(approx(c.target_voltage(), 3.375));
     assert!(matches!(
         c.update(3.4, -1.5, TICK),
