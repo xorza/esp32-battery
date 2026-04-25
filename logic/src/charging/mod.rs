@@ -106,26 +106,15 @@ pub enum Phase {
     Absorb,
 }
 
-/// Fault detected by the controller from logic-layer evidence. Distinct from
-/// `FaultReason` (which also covers transport/sensor failures the controller
-/// cannot see).
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum ChargeFault {
-    /// Pack voltage exceeded `absorb_v + OV_MARGIN_V` for `OV_DURATION.as_secs()` ticks.
-    Overvoltage,
-    /// Stayed in Absorb for `MAX_ABSORB.as_secs()` consecutive ticks. Real CC-CV
-    /// chargers also terminate absorb on time, not just on taper current —
-    /// this catches the case where a parasitic load pins charging current
-    /// above `exit_absorb_a` and absorb would otherwise never end.
-    AbsorbTimeout,
-}
-
 /// Outcome of one controller `update`. Setpoint changes only on phase
-/// transitions; faults are emitted once the relevant counter reaches budget.
+/// transitions; faults are emitted once the relevant counter reaches
+/// budget. Only the controller-emittable variants of `FaultReason`
+/// (`Overvoltage`, `AbsorbTimeout`) ever appear here — the supervisor's
+/// transport/sensor variants are produced one layer up.
 pub enum Decision {
     NoChange,
     Setpoint(f32),
-    Fault(ChargeFault),
+    Fault(FaultReason),
 }
 
 /// How far above `absorb_v` the pack must sit before the firmware's
@@ -194,7 +183,7 @@ impl ChargeController {
         if v_batt.is_finite() && v_batt > self.profile.absorb_v + OV_MARGIN_V {
             self.ov_elapsed = self.ov_elapsed.saturating_add(elapsed);
             if self.ov_elapsed >= OV_DURATION {
-                return Decision::Fault(ChargeFault::Overvoltage);
+                return Decision::Fault(FaultReason::Overvoltage);
             }
         } else {
             self.ov_elapsed = Duration::ZERO;
@@ -219,15 +208,20 @@ impl ChargeController {
         if self.phase == Phase::Absorb {
             self.absorb_elapsed = self.absorb_elapsed.saturating_add(elapsed);
             if self.absorb_elapsed >= MAX_ABSORB {
-                return Decision::Fault(ChargeFault::AbsorbTimeout);
+                return Decision::Fault(FaultReason::AbsorbTimeout);
             }
         }
         Decision::NoChange
     }
 }
 
-/// Why the supervisor latched the buck off. Once latched, only a reboot clears it —
-/// auto-recovery on a battery charger means trying again under the same conditions.
+/// Why the supervisor latched the buck off. Once latched, only a reboot
+/// clears it — auto-recovery on a battery charger means trying again
+/// under the same conditions.
+///
+/// Variant origin is a runtime invariant, not a type-system split:
+/// `BatterySensorStale` and `ModbusUnhealthy` are emitted only by the
+/// supervisor; `Overvoltage` and `AbsorbTimeout` only by the controller.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum FaultReason {
     /// No fresh battery reading for `BATTERY_MISSING_TIMEOUT.as_secs()` consecutive ticks.
@@ -240,8 +234,9 @@ pub enum FaultReason {
     /// Pack voltage exceeded `absorb_v + OV_MARGIN_V` for `OV_DURATION.as_secs()` ticks.
     /// Catches drift below the XY's hardware OVP trip but above the profile target.
     Overvoltage,
-    /// Absorb ran for `MAX_ABSORB.as_secs()` ticks. Under a parasitic load pinning
-    /// current above `exit_absorb_a` we'd otherwise sit at CV forever.
+    /// Absorb ran for `MAX_ABSORB.as_secs()` ticks. Under a parasitic load
+    /// pinning current above `exit_absorb_a` we'd otherwise sit at CV
+    /// forever.
     AbsorbTimeout,
 }
 
@@ -358,8 +353,7 @@ impl ChargeSupervisor {
         match self.controller.update(b.voltage, b.current, elapsed) {
             Decision::NoChange => Action::None,
             Decision::Setpoint(v) => Action::SetVoltage(v),
-            Decision::Fault(ChargeFault::Overvoltage) => self.latch(FaultReason::Overvoltage),
-            Decision::Fault(ChargeFault::AbsorbTimeout) => self.latch(FaultReason::AbsorbTimeout),
+            Decision::Fault(reason) => self.latch(reason),
         }
     }
 

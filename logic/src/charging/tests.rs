@@ -317,7 +317,7 @@ fn ov_emits_fault_after_budget() {
     }
     assert!(matches!(
         c.update(14.7, -0.1, TICK),
-        Decision::Fault(ChargeFault::Overvoltage)
+        Decision::Fault(FaultReason::Overvoltage)
     ));
 }
 
@@ -353,7 +353,7 @@ fn ov_fault_honors_sub_second_elapsed() {
     }
     assert!(matches!(
         c.update(14.7, -0.1, step),
-        Decision::Fault(ChargeFault::Overvoltage)
+        Decision::Fault(FaultReason::Overvoltage)
     ));
 }
 
@@ -364,7 +364,7 @@ fn ov_fault_in_a_single_large_elapsed_tick() {
     let mut c = ChargeController::new(lfp_4s());
     assert!(matches!(
         c.update(14.7, -0.1, OV_DURATION),
-        Decision::Fault(ChargeFault::Overvoltage)
+        Decision::Fault(FaultReason::Overvoltage)
     ));
 }
 
@@ -383,7 +383,7 @@ fn ov_fault_with_mixed_elapsed_values() {
     ));
     assert!(matches!(
         c.update(14.7, -0.1, Duration::from_millis(600)),
-        Decision::Fault(ChargeFault::Overvoltage)
+        Decision::Fault(FaultReason::Overvoltage)
     ));
 }
 
@@ -395,7 +395,7 @@ fn absorb_timeout_in_a_single_large_elapsed_tick() {
     enter_absorb(&mut c);
     assert!(matches!(
         c.update(OK_V, -1.0, MAX_ABSORB),
-        Decision::Fault(ChargeFault::AbsorbTimeout)
+        Decision::Fault(FaultReason::AbsorbTimeout)
     ));
 }
 
@@ -451,7 +451,7 @@ fn absorb_times_out_at_budget() {
     }
     assert!(matches!(
         c.update(OK_V, -1.0, TICK),
-        Decision::Fault(ChargeFault::AbsorbTimeout)
+        Decision::Fault(FaultReason::AbsorbTimeout)
     ));
 }
 
