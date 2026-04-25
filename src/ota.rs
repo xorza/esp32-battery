@@ -123,7 +123,7 @@ fn handle_upload(
     Ok(total)
 }
 
-pub fn register(server: &mut EspHttpServer<'static>) {
+pub fn mount(server: &mut EspHttpServer<'static>) {
     server
         .fn_handler("/ota/upload", esp_idf_svc::http::Method::Post, |mut req| {
             let mut buf = [0u8; 128];

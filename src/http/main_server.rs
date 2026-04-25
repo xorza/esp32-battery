@@ -1,17 +1,16 @@
-//! Main dashboard HTTPS server. Serves the dashboard + static OTA page; each
-//! feature module mounts its own routes via its `register` fn.
+//! Host-mode dashboard server (HTTPS on 443). Composes the per-feature mount
+//! fns; this file owns ordering and dependency wiring, nothing else.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
-use esp_idf_svc::sys::EspError;
 
 use crate::app_state::{EventLogHandle, SensorDataHandle};
-use crate::nvs_creds;
+use crate::{api, errors, log_ring, ota, wifi_reset};
 
-use super::{create_server, serve_common_assets, serve_static, text_response};
+use super::{create_server, serve_common_assets, serve_static};
 
 pub fn start(
     sensor_data: SensorDataHandle,
@@ -38,22 +37,11 @@ pub fn start(
         true,
     );
 
-    crate::api::register(&mut server, sensor_data);
-    crate::errors::register(&mut server, event_log);
-    crate::log_ring::register(&mut server);
-    register_wifi_reset(&mut server, nvs);
-    crate::ota::register(&mut server);
+    api::mount(&mut server, sensor_data);
+    errors::mount(&mut server, event_log);
+    log_ring::mount(&mut server);
+    wifi_reset::mount(&mut server, nvs);
+    ota::mount(&mut server);
 
     server
-}
-
-fn register_wifi_reset(server: &mut EspHttpServer<'static>, nvs: Arc<EspNvs<NvsDefault>>) {
-    server
-        .fn_handler("/wifi-reset", esp_idf_svc::http::Method::Post, move |req| {
-            nvs_creds::clear(&nvs);
-            text_response(req, 200, b"WiFi credentials cleared. Rebooting...")?;
-            crate::reboot::reboot_after("Rebooting after WiFi reset");
-            Ok::<(), EspError>(())
-        })
-        .unwrap();
 }

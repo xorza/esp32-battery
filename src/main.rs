@@ -1,6 +1,7 @@
 mod api;
 mod app_state;
 mod board;
+mod captive_api;
 mod clock;
 mod dns;
 mod errors;
@@ -14,6 +15,7 @@ mod nvs_creds;
 mod ota;
 mod reboot;
 mod wifi;
+mod wifi_reset;
 mod xy;
 
 use std::sync::{Arc, Mutex};

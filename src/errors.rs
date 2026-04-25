@@ -71,7 +71,7 @@ struct ErrorsResponse<'a> {
     recent: RecentView<'a>,
 }
 
-pub fn register(server: &mut EspHttpServer<'static>, event_log: EventLogHandle) {
+pub fn mount(server: &mut EspHttpServer<'static>, event_log: EventLogHandle) {
     let json_buf = Mutex::new(Box::new([0u8; RESPONSE_BUF_SIZE]));
 
     server

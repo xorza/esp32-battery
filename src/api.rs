@@ -90,7 +90,7 @@ pub struct ApiResponse<'a> {
 /// so 16 KiB leaves margin. If serialization still overflows we return 500 instead of panicking.
 pub const RESPONSE_BUF_SIZE: usize = 16_384;
 
-pub fn register(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHandle) {
+pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHandle) {
     let json_buf = Mutex::new(Box::new([0u8; RESPONSE_BUF_SIZE]));
 
     server

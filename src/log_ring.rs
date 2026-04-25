@@ -56,7 +56,7 @@ pub fn snapshot() -> Vec<u8> {
         .unwrap_or_default()
 }
 
-pub fn register(server: &mut EspHttpServer<'static>) {
+pub fn mount(server: &mut EspHttpServer<'static>) {
     server
         .fn_handler("/api/log", esp_idf_svc::http::Method::Get, |req| {
             let body = snapshot();
