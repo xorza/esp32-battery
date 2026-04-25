@@ -28,19 +28,30 @@ use log::{info, warn};
 
 use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
 
-use crate::app_state::{EventLogHandle, EventRecorder, SensorDataHandle, Supervisor};
+use crate::app_state::{
+    EventLogHandle, EventRecorder, HostTransition, SensorDataHandle, Supervisor,
+};
 use crate::history_store::{HistoryStore, Persister};
 
-/// Number of consecutive 1 Hz ticks with `is_connected() == false` before we
-/// tear down the host server and fall back to the captive AP. Sized to cover
-/// initial DHCP/DNS at boot and brief link blips without flapping the SSID.
-const CAPTIVE_AFTER_FAILURES: u32 = 15;
+/// How long `is_connected() == false` may persist before we tear down
+/// the host server and fall back to the captive AP. Covers initial
+/// DHCP/DNS at boot and brief link blips without flapping the SSID.
+const CAPTIVE_AFTER_DISCONNECT: Duration = Duration::from_secs(15);
 
 /// How long the captive page's "Connecting..." spinner is allowed to run
 /// before we declare the submitted credentials a failure and let the user
 /// re-enter them. ESP-IDF associates good creds in 3–8s typically; 20s is
 /// comfortably past that without leaving the user staring forever.
 const CAPTIVE_TRYING_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long the captive bundle stays alive after the STA associates, so
+/// the page (polling `/status` ~1 Hz) sees the lifecycle flip to
+/// `Connected` before the AP disappears. One poll cycle plus slack for
+/// browser scheduling.
+const CAPTIVE_HANDOFF_GRACE: Duration = Duration::from_secs(2);
+
+/// Supervisor loop period.
+const TICK_PERIOD: Duration = Duration::from_secs(1);
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -85,7 +96,10 @@ fn main() {
     let sensor_data: SensorDataHandle = Arc::new(Mutex::new(sd));
     let event_log: EventLogHandle =
         Arc::new(Mutex::new(esp32_battery_logic::error_log::EventLog::new()));
-    let mut supervisor = Supervisor::new();
+    // Monotonic origin for the supervisor state machine. All `now`
+    // values passed into `Supervisor` are `boot.elapsed()` from here.
+    let boot = Instant::now();
+    let mut supervisor = Supervisor::new(Duration::ZERO);
     let mut persister = Persister::new(
         sensor_data.clone(),
         history_store,
@@ -107,7 +121,8 @@ fn main() {
     }
 
     loop {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(TICK_PERIOD);
+        let now = boot.elapsed();
 
         persister.tick(clock.epoch_s());
 
@@ -133,27 +148,39 @@ fn main() {
 
         let connected = wifi.lock().unwrap().tick();
         if connected {
-            // Captive-aware handoff: flip Connected and pause briefly so
-            // the page (polling /status every ~1s) gets a chance to see
-            // it and call window.close() before we tear down the AP. With
-            // no pause the captive server stops accepting requests in the
-            // same tick and the page never observes Connected.
+            // Mark the captive lifecycle Connected on the entry tick so
+            // the page (polling /status ~1 Hz) has CAPTIVE_HANDOFF_GRACE
+            // of supervisor cadence to observe it before the AP
+            // disappears. The Captive→Host transition is then driven by
+            // tick_connected over the next few ticks — no thread::sleep
+            // on the supervisor.
             if let Some(state) = supervisor.captive_save_state() {
                 info!("Captive: STA associated — broadcasting Connected");
                 state.lock().unwrap().mark_connected();
-                thread::sleep(Duration::from_millis(1200));
-                let c = creds.as_ref().expect("captive cannot run without creds");
-                wifi.lock().unwrap().start_sta(c);
             }
             let sd = sensor_data.clone();
             let el = event_log.clone();
-            supervisor.on_tick_connected(|| http::start_main(sd, el, nvs.clone()));
+            let nvs2 = nvs.clone();
+            let wifi_for_handoff = wifi.clone();
+            let creds_for_handoff = creds.clone();
+            supervisor.on_tick_connected(now, CAPTIVE_HANDOFF_GRACE, move |reason| {
+                if reason == HostTransition::FromCaptive {
+                    let c = creds_for_handoff.expect("handoff requires creds");
+                    wifi_for_handoff.lock().unwrap().start_sta(&c);
+                }
+                http::start_main(sd, el, nvs2)
+            });
         } else {
             let creds_tx = supervisor.creds_sender();
-            supervisor.on_tick_disconnected(creds.is_some(), CAPTIVE_AFTER_FAILURES, || {
-                wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
-                http::start_captive(creds_tx, nvs.clone(), wifi.clone())
-            });
+            supervisor.on_tick_disconnected(
+                now,
+                creds.is_some(),
+                CAPTIVE_AFTER_DISCONNECT,
+                || {
+                    wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
+                    http::start_captive(creds_tx, nvs.clone(), wifi.clone())
+                },
+            );
         }
     }
 }

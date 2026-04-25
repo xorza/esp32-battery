@@ -15,12 +15,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Duration;
 
 use esp_idf_svc::http::server::EspHttpServer;
 
 use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::{Event, EventLog};
-pub use esp32_battery_logic::net_supervisor::NetStatus;
+pub use esp32_battery_logic::net_supervisor::{HostTransition, NetStatus};
 use esp32_battery_logic::net_supervisor::Phase;
 
 use crate::captive_api::SaveStateHandle;
@@ -99,13 +100,15 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new() -> Self {
+    /// `now` anchors the bootstrap window — typically `Duration::ZERO`
+    /// when the caller measures monotonic time from this point.
+    pub fn new(now: Duration) -> Self {
         let (creds_tx, creds_rx) = channel();
         Self {
             status: NetStatusHandle::new(NetStatus::Connecting),
             creds_tx,
             creds_rx,
-            phase: Phase::bootstrap(),
+            phase: Phase::bootstrap(now),
         }
     }
 
@@ -137,21 +140,30 @@ impl Supervisor {
         }
     }
 
-    pub fn on_tick_connected(&mut self, build_host: impl FnOnce() -> ServerHandle) {
-        self.transition(|p| p.tick_connected(build_host));
+    pub fn on_tick_connected(
+        &mut self,
+        now: Duration,
+        handoff_grace: Duration,
+        build_host: impl FnOnce(HostTransition) -> ServerHandle,
+    ) {
+        self.transition(|p| p.tick_connected(now, handoff_grace, build_host));
     }
 
     pub fn on_tick_disconnected(
         &mut self,
+        now: Duration,
         has_creds: bool,
-        grace_ticks: u32,
+        captive_grace: Duration,
         build_captive: impl FnOnce() -> CaptiveBundle,
     ) {
-        self.transition(|p| p.tick_disconnected(has_creds, grace_ticks, build_captive));
+        self.transition(|p| p.tick_disconnected(now, has_creds, captive_grace, build_captive));
     }
 
     fn transition(&mut self, f: impl FnOnce(EspPhase) -> EspPhase) {
-        let next = f(std::mem::replace(&mut self.phase, Phase::bootstrap()));
+        // Placeholder is overwritten by `f` before anyone observes it —
+        // the entered_at value is throwaway.
+        let placeholder = Phase::bootstrap(Duration::ZERO);
+        let next = f(std::mem::replace(&mut self.phase, placeholder));
         self.replace_phase(next);
     }
 

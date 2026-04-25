@@ -3,6 +3,7 @@ use log::info;
 
 const NAMESPACE: &str = "wifi";
 
+#[derive(Clone)]
 pub struct WifiCredentials {
     pub ssid: String,
     pub password: String,
