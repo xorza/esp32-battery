@@ -11,6 +11,7 @@
 //! charge-supervisor integration runs unchanged under the `xy-fake` feature
 //! (which substitutes a canned in-memory device for the UART).
 
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -19,13 +20,12 @@ use log::{error, warn};
 use esp32_battery_logic::charging::{
     Action, BatterySample, ChargeSupervisor, Chemistry, FaultReason, Profile, SafetyLimits,
 };
-use esp32_battery_logic::data::PsReading;
+use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
 use esp32_battery_logic::modbus::ModbusError;
 
-use crate::clock::EventRecorder;
-use crate::supervisor::SensorDataHandle;
 use crate::board::XyPins;
+use crate::clock::EventRecorder;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -277,7 +277,7 @@ fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), ModbusEr
     Ok(())
 }
 
-fn run<D: XyDevice>(xy: D, sensor_data: SensorDataHandle, recorder: EventRecorder) {
+fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
     thread::sleep(Duration::from_millis(100));
 
@@ -368,7 +368,7 @@ fn make_device(pins: XyPins) -> fake::FakeXy {
     fake::FakeXy::new()
 }
 
-pub fn start(pins: XyPins, sensor_data: SensorDataHandle, recorder: EventRecorder) {
+pub fn start(pins: XyPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     let device = make_device(pins);
     thread::Builder::new()
         .name("xy".into())

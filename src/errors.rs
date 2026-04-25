@@ -9,13 +9,14 @@
 //! }
 //! ```
 
+use std::sync::{Arc, Mutex};
+
 use esp_idf_svc::http::server::EspHttpServer;
 use serde::Serialize;
 use serde::ser::{SerializeMap, SerializeSeq};
 
 use esp32_battery_logic::error_log::{Event, EventLog};
 
-use crate::supervisor::EventLogHandle;
 use crate::http::{JsonBuf, json_response, mount_get};
 
 /// EventLog is bounded (32 entries × ~40 chars + ~30 small counters), well
@@ -69,7 +70,7 @@ struct ErrorsResponse<'a> {
     recent: RecentView<'a>,
 }
 
-pub fn mount(server: &mut EspHttpServer<'static>, event_log: EventLogHandle) {
+pub fn mount(server: &mut EspHttpServer<'static>, event_log: Arc<Mutex<EventLog>>) {
     let json_buf: JsonBuf<RESPONSE_BUF_SIZE> = JsonBuf::new();
 
     mount_get(server, "/api/errors", move |req| {

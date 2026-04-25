@@ -1,8 +1,9 @@
 use core::fmt::Write;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp32_battery_logic::data::Sample;
+use esp32_battery_logic::data::{Sample, SensorData};
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Point, Size};
@@ -22,8 +23,8 @@ use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
 
-use crate::supervisor::{NetStatus, NetStatusHandle, SensorDataHandle};
 use crate::board::LcdPins;
+use crate::net::{NetStatus, NetStatusHandle};
 
 // --- SPI / DMA ---
 
@@ -413,7 +414,7 @@ fn draw_connecting(gb: &mut GraphBuf) {
 
 // --- Main thread ---
 
-pub fn start(pins: LcdPins, sensor_data: SensorDataHandle, status: NetStatusHandle) {
+pub fn start(pins: LcdPins, sensor_data: Arc<Mutex<SensorData>>, status: NetStatusHandle) {
     thread::Builder::new()
         .stack_size(16384)
         .spawn(move || {

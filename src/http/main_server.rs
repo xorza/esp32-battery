@@ -1,20 +1,22 @@
 //! Host-mode dashboard server (HTTPS on 443). Composes the per-feature mount
 //! fns; this file owns ordering and dependency wiring, nothing else.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
-use crate::supervisor::{EventLogHandle, SensorDataHandle};
+use esp32_battery_logic::data::SensorData;
+use esp32_battery_logic::error_log::EventLog;
+
 use crate::{api, errors, log_ring, ota, wifi_reset};
 
 use super::{create_server, serve_common_assets, serve_static};
 
 pub fn start(
-    sensor_data: SensorDataHandle,
-    event_log: EventLogHandle,
+    sensor_data: Arc<Mutex<SensorData>>,
+    event_log: Arc<Mutex<EventLog>>,
     nvs: Arc<EspNvs<NvsDefault>>,
 ) -> EspHttpServer<'static> {
     let mut server = create_server(10240, false, 4, Some(Duration::from_secs(0)), true);

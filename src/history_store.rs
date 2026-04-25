@@ -2,13 +2,12 @@
 //! Owned externally to `SensorData` so flash I/O happens outside the data
 //! mutex — producer threads never stall on the 50–100 ms erase/write.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
+use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::save_scheduler::SaveScheduler;
-
-use crate::supervisor::SensorDataHandle;
 
 const NAMESPACE: &str = "data";
 const NVS_KEY: &str = "hist";
@@ -52,14 +51,14 @@ impl HistoryStore {
 /// the same lock so flash I/O is the only thing held outside the critical
 /// section. Bundles the three pieces that always move together.
 pub struct Persister {
-    sensor_data: SensorDataHandle,
+    sensor_data: Arc<Mutex<SensorData>>,
     store: HistoryStore,
     scheduler: SaveScheduler,
 }
 
 impl Persister {
     pub fn new(
-        sensor_data: SensorDataHandle,
+        sensor_data: Arc<Mutex<SensorData>>,
         store: HistoryStore,
         scheduler: SaveScheduler,
     ) -> Self {

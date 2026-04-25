@@ -8,10 +8,11 @@ use log::debug;
 use serde::Serialize;
 use serde::ser::SerializeSeq;
 
-use esp32_battery_logic::battery;
-use esp32_battery_logic::data::Sample;
+use std::sync::{Arc, Mutex};
 
-use crate::supervisor::SensorDataHandle;
+use esp32_battery_logic::battery;
+use esp32_battery_logic::data::{Sample, SensorData};
+
 use crate::clock::uptime_s;
 use crate::http::{JsonBuf, json_response, mount_get};
 use crate::wifi::sta_rssi;
@@ -88,7 +89,7 @@ pub struct ApiResponse<'a> {
 /// so 16 KiB leaves margin. If serialization still overflows we return 500 instead of panicking.
 pub const RESPONSE_BUF_SIZE: usize = 16_384;
 
-pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHandle) {
+pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorData>>) {
     let json_buf: JsonBuf<RESPONSE_BUF_SIZE> = JsonBuf::new();
 
     mount_get(server, "/api", move |req| {

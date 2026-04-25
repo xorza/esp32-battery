@@ -5,15 +5,15 @@
 //! in-memory device for the I²C INA228 — useful when developing without
 //! the sensor wired up).
 
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp32_battery_logic::data::Ina228Reading;
+use esp32_battery_logic::data::{Ina228Reading, SensorData};
 use esp32_battery_logic::error_log::{Event, InaError};
 
-use crate::clock::EventRecorder;
-use crate::supervisor::SensorDataHandle;
 use crate::board::I2cPins;
+use crate::clock::EventRecorder;
 
 const SAMPLES_PER_UPDATE: u32 = 10;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
@@ -136,7 +136,7 @@ mod fake {
 
 // --- Shared thread loop -----------------------------------------------------
 
-fn run<D: InaDevice>(mut device: D, sensor_data: SensorDataHandle, recorder: EventRecorder) {
+fn run<D: InaDevice>(mut device: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     loop {
         let mut bat_acc = ReadingAccum::default();
         let mut count: u32 = 0;
@@ -183,7 +183,7 @@ fn make_device(pins: I2cPins) -> fake::FakeIna {
     fake::FakeIna
 }
 
-pub fn start(pins: I2cPins, sensor_data: SensorDataHandle, recorder: EventRecorder) {
+pub fn start(pins: I2cPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     thread::Builder::new()
         .name("ina".into())
         .stack_size(4096)

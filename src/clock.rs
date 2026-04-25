@@ -1,13 +1,11 @@
 //! Wall-clock source backed by ESP-IDF's SNTP-driven system time.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{info, warn};
 
-use esp32_battery_logic::error_log::Event;
-
-use crate::supervisor::EventLogHandle;
+use esp32_battery_logic::error_log::{Event, EventLog};
 
 /// Plausibility bounds on the system clock. The SNTP callback fires even when
 /// the system time hasn't actually been set to something sensible (e.g. a
@@ -66,12 +64,12 @@ pub fn uptime_s() -> u32 {
 /// and `xy.rs`. Cheap to clone (two `Arc`s).
 #[derive(Clone)]
 pub struct EventRecorder {
-    log: EventLogHandle,
+    log: Arc<Mutex<EventLog>>,
     clock: EspClock,
 }
 
 impl EventRecorder {
-    pub fn new(log: EventLogHandle, clock: EspClock) -> Self {
+    pub fn new(log: Arc<Mutex<EventLog>>, clock: EspClock) -> Self {
         Self { log, clock }
     }
 
