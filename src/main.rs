@@ -25,23 +25,27 @@ use log::{info, warn};
 
 use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
 
-pub use app_state::AppState;
-
+use crate::app_state::{SensorDataHandle, Supervisor};
 use crate::clock::EspClock;
-use crate::nvs_creds::WifiCredentials;
+use crate::history_store::HistoryStore;
 
 /// Number of consecutive 1 Hz ticks with `is_connected() == false` before we
 /// tear down the host server and fall back to the captive AP. Sized to cover
 /// initial DHCP/DNS at boot and brief link blips without flapping the SSID.
 const CAPTIVE_AFTER_FAILURES: u32 = 15;
 
-fn tick_and_persist(state: &AppState, clock: &EspClock, scheduler: &mut SaveScheduler) {
+fn tick_and_persist(
+    sensor_data: &SensorDataHandle,
+    history_store: &HistoryStore,
+    clock: &EspClock,
+    scheduler: &mut SaveScheduler,
+) {
     let now = clock.epoch_s();
     // Tick the data store and (if the save timer fires) serialize under one
     // lock — keeps NVS I/O out of the critical section but avoids a two-lock
     // dance + stale-state window between them.
     let payload = {
-        let mut sd = state.sensor_data.lock().unwrap();
+        let mut sd = sensor_data.lock().unwrap();
         sd.tick(now);
         if scheduler.tick(now) {
             Some(sd.serialize())
@@ -51,19 +55,8 @@ fn tick_and_persist(state: &AppState, clock: &EspClock, scheduler: &mut SaveSche
     };
     if let Some(bytes) = payload {
         log::info!("Emitting save payload: {} bytes", bytes.len());
-        state.history_store.save(&bytes);
+        history_store.save(&bytes);
     }
-}
-
-fn drain_pending_creds(
-    state: &mut AppState,
-    wifi: &Mutex<wifi::Wifi<'static>>,
-) -> Option<WifiCredentials> {
-    let new = state.pending_creds.lock().unwrap().take()?;
-    info!("Applying credentials submitted via captive portal");
-    wifi.lock().unwrap().start_sta(&new);
-    state.on_creds_applied();
-    Some(new)
 }
 
 fn tick_wifi(wifi: &Mutex<wifi::Wifi<'static>>) -> bool {
@@ -115,7 +108,7 @@ fn main() {
     let mut creds = nvs_creds::load(&nvs);
 
     let clock = clock::EspClock::new();
-    let history_store = history_store::HistoryStore::new(nvs_partition.clone());
+    let history_store = HistoryStore::new(nvs_partition.clone());
 
     let wifi = Arc::new(Mutex::new(wifi::Wifi::new(
         board.modem,
@@ -125,51 +118,52 @@ fn main() {
 
     // Load persisted history at boot so the first commit doesn't dump a stale
     // blob and the dashboard has data before the first live commit lands.
-    let mut sensor_data = esp32_battery_logic::data::SensorData::new();
+    let mut sd = esp32_battery_logic::data::SensorData::new();
     let mut load_buf = vec![0u8; esp32_battery_logic::data::SERIALIZED_MAX_BYTES];
     if let Some(len) = history_store.load(&mut load_buf)
-        && !sensor_data.load_from_bytes(&load_buf[..len])
+        && !sd.load_from_bytes(&load_buf[..len])
     {
         warn!("history blob in NVS is corrupt or from an older version — discarding");
     }
 
-    let mut state = AppState::new(sensor_data, history_store);
+    let sensor_data: SensorDataHandle = Arc::new(Mutex::new(sd));
+    let mut supervisor = Supervisor::new();
     let mut save_scheduler = SaveScheduler::new(DEFAULT_SAVE_INTERVAL_S);
 
     // SNTP runs once for the whole lifetime — the client handles WiFi flaps
     // internally, so there's no reason to tear it down and restart.
     let _sntp = start_sntp(clock.clone());
 
-    xy::start(board.xy, state.sensor_data.clone());
-
-    ina::start(board.i2c, state.sensor_data.clone());
+    xy::start(board.xy, sensor_data.clone());
+    ina::start(board.i2c, sensor_data.clone());
 
     #[cfg(feature = "lcd")]
-    lcd::start(board.lcd, state.sensor_data.clone(), state.status.clone());
+    lcd::start(board.lcd, sensor_data.clone(), supervisor.status.clone());
 
     if let Some(ref creds) = creds {
         wifi.lock().unwrap().start_sta(creds);
-        state.on_creds_applied();
+        supervisor.on_creds_applied();
     }
 
     loop {
         thread::sleep(Duration::from_secs(1));
 
-        tick_and_persist(&state, &clock, &mut save_scheduler);
+        tick_and_persist(&sensor_data, &history_store, &clock, &mut save_scheduler);
 
-        if let Some(new) = drain_pending_creds(&mut state, &wifi) {
+        if let Some(new) = supervisor.take_pending_creds() {
+            wifi.lock().unwrap().start_sta(&new);
             creds = Some(new);
         }
 
         let connected = tick_wifi(&wifi);
         if connected {
-            let sd = state.sensor_data.clone();
-            state.on_tick_connected(|| http::start_main(sd, nvs.clone()));
+            let sd = sensor_data.clone();
+            supervisor.on_tick_connected(|| http::start_main(sd, nvs.clone()));
         } else {
-            let creds_box = state.pending_creds.clone();
-            state.on_tick_disconnected(creds.is_some(), CAPTIVE_AFTER_FAILURES, || {
+            let creds_tx = supervisor.creds_sender();
+            supervisor.on_tick_disconnected(creds.is_some(), CAPTIVE_AFTER_FAILURES, || {
                 wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
-                http::start_captive(creds_box, nvs.clone(), wifi.clone())
+                http::start_captive(creds_tx, nvs.clone(), wifi.clone())
             });
         }
     }

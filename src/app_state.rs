@@ -1,10 +1,15 @@
-//! Application state. One `AppState` value lives on the main thread for the
-//! life of the program. Worker threads each receive only the cross-thread
-//! handles they actually use — sensor data, the credential mailbox, or the
-//! current net status — instead of an aggregate `Shared` blob.
+//! Supervisor state owned by the main thread. Worker threads receive only the
+//! cross-thread handles they actually use — `SensorDataHandle` and (for the
+//! LCD) `NetStatusHandle` — neither of which lives on `Supervisor`.
+//!
+//! `Supervisor` itself is `!Send` because `NetPhase` carries an `EspHttpServer`.
+//! It owns the captive→main credential channel: the captive `/save` handler
+//! gets a `Sender<WifiCredentials>` clone, and the main loop drains the
+//! `Receiver` once per tick.
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use esp_idf_svc::http::server::EspHttpServer;
 use log::{info, warn};
@@ -12,7 +17,6 @@ use log::{info, warn};
 use esp32_battery_logic::data::SensorData;
 
 use crate::dns::DnsHandle;
-use crate::history_store::HistoryStore;
 use crate::nvs_creds::WifiCredentials;
 
 /// Cross-thread net status — what readers (LCD, etc.) should display.
@@ -25,13 +29,9 @@ pub enum NetStatus {
 }
 
 pub type SensorDataHandle = Arc<Mutex<SensorData>>;
-/// Set by the captive `/save` handler when fresh credentials land. Drained
-/// by the main loop, which then drives the live STA reconnect.
-pub type CredsMailbox = Arc<Mutex<Option<WifiCredentials>>>;
 pub type NetStatusHandle = Arc<Mutex<NetStatus>>;
 
-/// Single source of truth for network phase + mounted HTTP server. Lives on
-/// the main thread — `EspHttpServer` is `!Send`.
+/// Single source of truth for network phase + mounted HTTP server.
 ///
 /// `Host.grace` carries a tick counter when the WiFi link has dropped but
 /// we're keeping the dashboard server mounted in case the link comes back
@@ -67,23 +67,45 @@ impl NetPhase {
     }
 }
 
-pub struct AppState {
-    pub sensor_data: SensorDataHandle,
-    pub pending_creds: CredsMailbox,
+pub struct Supervisor {
     pub status: NetStatusHandle,
-    pub history_store: HistoryStore,
+    creds_tx: Sender<WifiCredentials>,
+    creds_rx: Receiver<WifiCredentials>,
     phase: NetPhase,
 }
 
-impl AppState {
-    pub fn new(sensor_data: SensorData, history_store: HistoryStore) -> Self {
+impl Supervisor {
+    pub fn new() -> Self {
+        let (creds_tx, creds_rx) = channel();
         Self {
-            sensor_data: Arc::new(Mutex::new(sensor_data)),
-            pending_creds: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new(NetStatus::Connecting)),
-            history_store,
+            creds_tx,
+            creds_rx,
             phase: NetPhase::Bootstrap { ticks: 0 },
         }
+    }
+
+    /// Cloneable handle for the captive `/save` handler to deliver new
+    /// credentials back to the main loop.
+    pub fn creds_sender(&self) -> Sender<WifiCredentials> {
+        self.creds_tx.clone()
+    }
+
+    /// Drain any credentials posted by the captive portal since the last
+    /// tick, returning the most recent (later submissions supersede earlier
+    /// ones — same "latest wins" semantics as the previous mailbox). On a
+    /// hit, resets the phase to `Bootstrap` so the post-reconnect grace
+    /// counter starts from zero.
+    pub fn take_pending_creds(&mut self) -> Option<WifiCredentials> {
+        let mut latest = None;
+        while let Ok(c) = self.creds_rx.try_recv() {
+            latest = Some(c);
+        }
+        if latest.is_some() {
+            info!("Applying credentials submitted via captive portal");
+            self.on_creds_applied();
+        }
+        latest
     }
 
     fn set_phase(&mut self, phase: NetPhase) {
