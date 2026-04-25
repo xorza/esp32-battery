@@ -1,5 +1,11 @@
 //! Board-specific peripheral wiring. All GPIO / peripheral assignments live here.
 
+#[cfg(not(any(feature = "esp32c3", feature = "esp32c6")))]
+compile_error!("enable exactly one MCU feature: `esp32c3` or `esp32c6`");
+
+#[cfg(all(feature = "esp32c3", feature = "esp32c6"))]
+compile_error!("enable exactly one MCU feature, not both `esp32c3` and `esp32c6`");
+
 use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::modem::Modem;
 use esp_idf_hal::peripherals::Peripherals;
