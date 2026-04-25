@@ -104,7 +104,14 @@
                     var m = document.getElementById("msg");
                     if (x.status === 200) {
                         m.className = "msg ok";
-                        m.textContent = "Saved! Rebooting...";
+                        m.textContent = "Saved! Connecting...";
+                        // Dismiss the captive portal popup. window.close() works in
+                        // Android/iOS captive WebViews; about:blank is a fallback for
+                        // regular browsers where close() is a no-op.
+                        setTimeout(function () {
+                            window.close();
+                            window.location.href = "about:blank";
+                        }, 1200);
                     } else {
                         m.className = "msg err";
                         m.textContent = "Error: " + x.responseText;
