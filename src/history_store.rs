@@ -58,7 +58,11 @@ pub struct Persister {
 }
 
 impl Persister {
-    pub fn new(sensor_data: SensorDataHandle, store: HistoryStore, scheduler: SaveScheduler) -> Self {
+    pub fn new(
+        sensor_data: SensorDataHandle,
+        store: HistoryStore,
+        scheduler: SaveScheduler,
+    ) -> Self {
         Self {
             sensor_data,
             store,

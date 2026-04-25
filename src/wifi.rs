@@ -52,9 +52,10 @@ impl Mode {
     fn has_sta_creds(&self) -> bool {
         matches!(
             self,
-            Mode::Sta | Mode::ApMixed {
-                has_sta_creds: true
-            }
+            Mode::Sta
+                | Mode::ApMixed {
+                    has_sta_creds: true
+                }
         )
     }
 }

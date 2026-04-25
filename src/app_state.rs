@@ -20,8 +20,8 @@ use esp_idf_svc::http::server::EspHttpServer;
 use log::info;
 
 use esp32_battery_logic::data::SensorData;
-use esp32_battery_logic::net_supervisor::Phase;
 pub use esp32_battery_logic::net_supervisor::NetStatus;
+use esp32_battery_logic::net_supervisor::Phase;
 
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
