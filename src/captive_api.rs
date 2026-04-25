@@ -16,7 +16,7 @@ use log::info;
 use esp32_battery_logic::form;
 
 use crate::clock::uptime;
-use crate::http::{JsonBuf, json_response, mount_get, mount_post, read_to_buf, text_response};
+use crate::http::{JsonBuf, mount_get, mount_json_get, mount_post, read_to_buf, text_response};
 use crate::net::{CaptiveStateHandle, Submission};
 use crate::nvs_creds::WifiCredentials;
 use crate::wifi::ScanCache;
@@ -29,20 +29,20 @@ pub fn mount(
     scan_cache: ScanCache,
     state: CaptiveStateHandle,
 ) {
-    let scan_buf: JsonBuf<SCAN_BUF_SIZE> = JsonBuf::new();
-    mount_get(server, "/scan", move |req| {
-        scan_buf.with(|buf| {
-            json_response(req, buf, |buf| {
-                let cached = scan_cache.lock().unwrap();
-                let rows: Vec<(&str, i8)> = cached
-                    .entries
-                    .iter()
-                    .map(|(s, r)| (s.as_str(), *r))
-                    .collect();
-                serde_json_core::to_slice(&rows, buf)
-            })
-        })
-    });
+    mount_json_get(
+        server,
+        "/scan",
+        JsonBuf::<SCAN_BUF_SIZE>::new(),
+        move |buf| {
+            let cached = scan_cache.lock().unwrap();
+            let rows: Vec<(&str, i8)> = cached
+                .entries
+                .iter()
+                .map(|(s, r)| (s.as_str(), *r))
+                .collect();
+            serde_json_core::to_slice(&rows, buf)
+        },
+    );
 
     let save_state = state.clone();
     mount_post(server, "/save", move |mut req| {
@@ -85,17 +85,17 @@ pub fn mount(
         Ok::<(), EspError>(())
     });
 
-    let status_buf: JsonBuf<STATUS_BUF_SIZE> = JsonBuf::new();
     let status_state = state;
-    mount_get(server, "/status", move |req| {
-        status_buf.with(|buf| {
-            json_response(req, buf, |buf| {
-                let name: &'static str = (&*status_state.lock().unwrap()).into();
-                let response = StatusResponse { state: name };
-                serde_json_core::to_slice(&response, buf)
-            })
-        })
-    });
+    mount_json_get(
+        server,
+        "/status",
+        JsonBuf::<STATUS_BUF_SIZE>::new(),
+        move |buf| {
+            let name: &'static str = (&*status_state.lock().unwrap()).into();
+            let response = StatusResponse { state: name };
+            serde_json_core::to_slice(&response, buf)
+        },
+    );
 
     // Android captive portal detection: expects 204, gets 302 → triggers popup.
     mount_get(server, "/generate_204", |req| {

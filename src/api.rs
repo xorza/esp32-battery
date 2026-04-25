@@ -14,7 +14,7 @@ use esp32_battery_logic::battery;
 use esp32_battery_logic::data::{Sample, SensorData};
 
 use crate::clock::uptime_s;
-use crate::http::{JsonBuf, json_response, mount_get};
+use crate::http::{JsonBuf, mount_json_get};
 use crate::wifi::sta_rssi;
 
 #[derive(Serialize)]
@@ -90,45 +90,44 @@ pub struct ApiResponse<'a> {
 pub const RESPONSE_BUF_SIZE: usize = 16_384;
 
 pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorData>>) {
-    let json_buf: JsonBuf<RESPONSE_BUF_SIZE> = JsonBuf::new();
-
-    mount_get(server, "/api", move |req| {
-        json_buf.with(|buf| {
-            json_response(req, buf, |buf| {
-                // Sensor-data lock held only through serialization — history
-                // is borrowed, not cloned. Lock drops at closure end, before
-                // the network write.
-                let store = sensor_data.lock().unwrap();
-                let bat = store.battery_reading().unwrap_or_default();
-                let ps = store.ps_reading().unwrap_or_default();
-                let response = ApiResponse {
-                    uptime: uptime_s(),
-                    rssi: sta_rssi(),
-                    voltage: bat.voltage,
-                    power_online: store.power_online(),
-                    heap: HeapInfo::new(),
-                    battery: BatteryReading {
-                        soc: battery::ocv_soc(bat.voltage),
-                        current: bat.current,
-                        power: bat.power,
-                    },
-                    ps: PsReading {
-                        voltage: ps.voltage,
-                        current: ps.current,
-                        power: ps.power,
-                    },
-                    history: HistoryView(store.history()),
-                };
-                let history_len = response.history.0.len();
-                let result = serde_json_core::to_slice(&response, buf);
-                if let Ok(len) = result {
-                    debug!(
-                        "API: history={} json={}/{}",
-                        history_len, len, RESPONSE_BUF_SIZE
-                    );
-                }
-                result
-            })
-        })
-    });
+    mount_json_get(
+        server,
+        "/api",
+        JsonBuf::<RESPONSE_BUF_SIZE>::new(),
+        move |buf| {
+            // Sensor-data lock held only through serialization — history
+            // is borrowed, not cloned. Lock drops at closure end, before
+            // the network write.
+            let store = sensor_data.lock().unwrap();
+            let bat = store.battery_reading().unwrap_or_default();
+            let ps = store.ps_reading().unwrap_or_default();
+            let response = ApiResponse {
+                uptime: uptime_s(),
+                rssi: sta_rssi(),
+                voltage: bat.voltage,
+                power_online: store.power_online(),
+                heap: HeapInfo::new(),
+                battery: BatteryReading {
+                    soc: battery::ocv_soc(bat.voltage),
+                    current: bat.current,
+                    power: bat.power,
+                },
+                ps: PsReading {
+                    voltage: ps.voltage,
+                    current: ps.current,
+                    power: ps.power,
+                },
+                history: HistoryView(store.history()),
+            };
+            let history_len = response.history.0.len();
+            let result = serde_json_core::to_slice(&response, buf);
+            if let Ok(len) = result {
+                debug!(
+                    "API: history={} json={}/{}",
+                    history_len, len, RESPONSE_BUF_SIZE
+                );
+            }
+            result
+        },
+    );
 }

@@ -267,6 +267,26 @@ where
     mount_uri(server, uri, Method::Get, f);
 }
 
+/// Mount a `GET` route that owns a reusable JSON scratch buffer and
+/// serializes whatever `build` writes into it. Collapses the
+/// `mount_get → JsonBuf::with → json_response` triple-closure that
+/// every JSON handler used to spell out by hand. `build` runs inside
+/// the buffer-mutex critical section, so it can hold the data lock
+/// across `to_slice` without leaking it into the network write.
+pub(crate) fn mount_json_get<F, E, const N: usize>(
+    server: &mut EspHttpServer<'static>,
+    uri: &'static str,
+    buf: JsonBuf<N>,
+    build: F,
+) where
+    F: Fn(&mut [u8]) -> Result<usize, E> + Send + 'static,
+    E: core::fmt::Debug,
+{
+    mount_get(server, uri, move |req| {
+        buf.with(|b| json_response(req, b, |inner| build(inner)))
+    });
+}
+
 pub(crate) fn mount_post<E, F>(server: &mut EspHttpServer<'static>, uri: &'static str, f: F)
 where
     F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), E> + Send + 'static,
