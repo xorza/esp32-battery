@@ -132,7 +132,10 @@ pub enum Net {
     /// also gates LCD-side hysteresis: only `LinkSeen::At` (we've
     /// associated at least once this session) qualifies.
     Sta {
-        server: EspHttpServer<'static>,
+        // Alive-for-Drop only — reassigning `net` away from `Sta` drops
+        // the server, which stops the dashboard. Same convention as
+        // `CaptiveBundle::_server` / `_dns`.
+        _server: EspHttpServer<'static>,
         link_seen: LinkSeen,
     },
     /// Serving the captive portal AP.

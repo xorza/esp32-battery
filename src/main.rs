@@ -111,32 +111,20 @@ fn main() {
     #[cfg(feature = "lcd")]
     lcd::start(board.lcd, sensor_data.clone(), net_status.clone());
 
-    // Initial state: STA if we have creds, else captive. Bootstrap with
-    // a host server eagerly when creds are present — `last_associated`
-    // starts at boot time so the grace timer covers DHCP.
-    // Radio mode tracks Net: STA-only when we have saved creds, Mixed
-    // AP+STA when we don't (or after long STA outage). Per `wifi
-    // flow.md`.
+    // Bootstrap: STA if we have creds, else captive. Per `wifi flow.md`.
     let mut net = match &creds {
-        Some(c) => {
-            wifi.lock().unwrap().start_sta(c);
-            let server = http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
-            Net::Sta {
-                server,
-                link_seen: LinkSeen::Never {
-                    session_start: uptime(),
-                },
-            }
-        }
-        None => {
-            wifi.lock().unwrap().start_ap_mixed(None);
-            let state = Arc::new(Mutex::new(Submission::Idle));
-            let bundle = http::start_captive(wifi.clone(), state);
-            Net::Captive { bundle }
-        }
+        Some(c) => start_sta_session(
+            &wifi,
+            c,
+            &sensor_data,
+            &event_log,
+            &nvs,
+            LinkSeen::Never {
+                session_start: uptime(),
+            },
+        ),
+        None => start_captive_session(&wifi, None),
     };
-    // Initial LCD: bootstrap captive is always Idle, bootstrap Sta hasn't
-    // associated yet. Both fall through to the obvious value.
     net_status.store(match &net {
         Net::Sta { link_seen, .. } => NetStatus::for_sta(link_seen, false, uptime()),
         Net::Captive { .. } => NetStatus::Captive,
@@ -147,82 +135,126 @@ fn main() {
         let now = uptime();
         persister.tick(clock.epoch_s());
 
-        let (new_net, lcd) = match net {
+        // Two-phase: decide what to do (with `&mut net` so stay cases
+        // can mutate in place), then apply transitions where consuming
+        // the old `net` is needed to drop server/bundle.
+        let step = match &mut net {
             Net::Captive { bundle } => {
-                // Drain a fresh /save handoff (Pending → Trying) and time
-                // out a stale Trying window — single critical section on
-                // the submission lock. Compute the captive LCD reading
-                // inside the same lock so end-of-tick doesn't re-acquire.
-                let captive_lcd = {
-                    let mut s = bundle.state.lock().unwrap();
-                    let taken = std::mem::replace(&mut *s, Submission::Idle);
-                    match taken {
-                        Submission::Pending {
-                            creds: new_creds,
-                            since,
-                        } => {
-                            wifi.lock().unwrap().set_sta_creds_live(&new_creds);
-                            *s = Submission::Trying { since };
-                            creds = Some(new_creds);
-                        }
-                        Submission::Trying { since }
-                            if now.saturating_sub(since) >= CAPTIVE_TRYING_TIMEOUT =>
-                        {
-                            *s = Submission::Failed;
-                            warn!("Captive: STA association timed out; flipping to Failed");
-                        }
-                        other => *s = other,
-                    }
-                    NetStatus::for_captive(&s)
-                };
-
+                let captive_status = drain_submission(bundle, &wifi, &mut creds, now);
                 let connected = wifi.lock().unwrap().tick(creds.is_some());
                 if connected {
-                    let c = creds
-                        .clone()
-                        .expect("captive→sta transition requires creds");
-                    // Persist only after the new creds successfully
-                    // associated. Wrong creds therefore never overwrite
-                    // a known-good pair on flash.
-                    nvs_creds::save(&nvs, &c.ssid, &c.password);
-                    drop(bundle);
-                    // Switch radio to STA-only — AP goes down now that
-                    // the user has a working network.
-                    wifi.lock().unwrap().start_sta(&c);
-                    let server =
-                        http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
-                    let net = Net::Sta {
-                        server,
-                        link_seen: LinkSeen::At(now),
-                    };
-                    (net, NetStatus::Host)
+                    Step::Promote
                 } else {
-                    (Net::Captive { bundle }, captive_lcd)
+                    Step::Stay(captive_status)
                 }
             }
-            Net::Sta { server, link_seen } => {
+            Net::Sta { link_seen, .. } => {
                 let connected = wifi.lock().unwrap().tick(creds.is_some());
                 if connected {
-                    let net = Net::Sta {
-                        server,
-                        link_seen: LinkSeen::At(now),
-                    };
-                    (net, NetStatus::Host)
+                    *link_seen = LinkSeen::At(now);
+                    Step::Stay(NetStatus::Host)
                 } else if now.saturating_sub(link_seen.timestamp()) >= CAPTIVE_AFTER_DISCONNECT {
-                    // Long STA outage — bring up captive AP+STA so the
-                    // user can correct creds while STA keeps retrying.
-                    drop(server);
-                    wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
-                    let state = Arc::new(Mutex::new(Submission::Idle));
-                    let bundle = http::start_captive(wifi.clone(), state);
-                    (Net::Captive { bundle }, NetStatus::Captive)
+                    Step::FallBack
                 } else {
-                    let lcd = NetStatus::for_sta(&link_seen, false, now);
-                    (Net::Sta { server, link_seen }, lcd)
+                    Step::Stay(NetStatus::for_sta(link_seen, false, now))
                 }
             }
         };
-        net = new_net;
-        net_status.store(lcd);
+
+        let status = match step {
+            Step::Stay(s) => s,
+            Step::Promote => {
+                // Creds just associated — persist now (wrong creds never
+                // overwrite a known-good pair on flash) and promote to
+                // STA-only. Reassigning `net` drops the captive bundle,
+                // which stops the captive HTTP server + DNS responder.
+                let c = creds
+                    .clone()
+                    .expect("captive→sta transition requires creds");
+                nvs_creds::save(&nvs, &c.ssid, &c.password);
+                net =
+                    start_sta_session(&wifi, &c, &sensor_data, &event_log, &nvs, LinkSeen::At(now));
+                NetStatus::Host
+            }
+            Step::FallBack => {
+                // Long STA outage — bring up captive AP+STA so the user
+                // can correct creds while STA keeps retrying. Reassigning
+                // `net` drops the dashboard server.
+                net = start_captive_session(&wifi, creds.as_ref());
+                NetStatus::Captive
+            }
+        };
+        net_status.store(status);
     }
+}
+
+/// One supervisor-tick decision. Decoupled from application so the
+/// observation phase can borrow `&mut net` (and mutate `link_seen` in
+/// place for stay-in-Sta) while transitions run after the borrow ends.
+enum Step {
+    /// No transition; `link_seen` may have been refreshed in place. The
+    /// LCD reading was computed during observation.
+    Stay(NetStatus),
+    /// Captive → Sta. STA just associated with submitted creds.
+    Promote,
+    /// Sta → Captive. STA has been disconnected past the grace window.
+    FallBack,
+}
+
+/// Drain a fresh `/save` handoff (`Pending → Trying`) and time-out a
+/// stale `Trying` window — single critical section on the submission
+/// lock. Returns the captive LCD reading post-drain so the caller
+/// doesn't have to re-acquire the lock.
+fn drain_submission(
+    bundle: &net::CaptiveBundle,
+    wifi: &Mutex<wifi::Wifi<'static>>,
+    creds: &mut Option<nvs_creds::WifiCredentials>,
+    now: Duration,
+) -> NetStatus {
+    let mut s = bundle.state.lock().unwrap();
+    let taken = std::mem::replace(&mut *s, Submission::Idle);
+    match taken {
+        Submission::Pending {
+            creds: new_creds,
+            since,
+        } => {
+            wifi.lock().unwrap().set_sta_creds_live(&new_creds);
+            *s = Submission::Trying { since };
+            *creds = Some(new_creds);
+        }
+        Submission::Trying { since } if now.saturating_sub(since) >= CAPTIVE_TRYING_TIMEOUT => {
+            *s = Submission::Failed;
+            warn!("Captive: STA association timed out; flipping to Failed");
+        }
+        other => *s = other,
+    }
+    NetStatus::for_captive(&s)
+}
+
+/// Bring up STA-only mode + dashboard server.
+fn start_sta_session(
+    wifi: &Arc<Mutex<wifi::Wifi<'static>>>,
+    creds: &nvs_creds::WifiCredentials,
+    sensor_data: &Arc<Mutex<SensorData>>,
+    event_log: &Arc<Mutex<EventLog>>,
+    nvs: &Arc<esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>>,
+    link_seen: LinkSeen,
+) -> Net {
+    wifi.lock().unwrap().start_sta(creds);
+    let server = http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
+    Net::Sta {
+        _server: server,
+        link_seen,
+    }
+}
+
+/// Bring up AP+STA Mixed + captive HTTP/DNS bundle.
+fn start_captive_session(
+    wifi: &Arc<Mutex<wifi::Wifi<'static>>>,
+    creds: Option<&nvs_creds::WifiCredentials>,
+) -> Net {
+    wifi.lock().unwrap().start_ap_mixed(creds);
+    let state = Arc::new(Mutex::new(Submission::Idle));
+    let bundle = http::start_captive(wifi.clone(), state);
+    Net::Captive { bundle }
 }
