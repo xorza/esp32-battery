@@ -62,6 +62,17 @@ fn sta_config(creds: &WifiCredentials) -> ClientConfiguration {
     }
 }
 
+fn ap_config() -> AccessPointConfiguration {
+    AccessPointConfiguration {
+        ssid: AP_SSID.try_into().unwrap(),
+        password: AP_PASS.try_into().unwrap(),
+        auth_method: esp_idf_svc::wifi::AuthMethod::WPA2Personal,
+        channel: 1,
+        max_connections: 4,
+        ..Default::default()
+    }
+}
+
 pub struct Wifi<'d> {
     wifi: BlockingWifi<EspWifi<'d>>,
     scan_cache: ScanCache,
@@ -177,17 +188,8 @@ impl<'d> Wifi<'d> {
     /// user's phone while the STA half retries against the new SSID.
     pub fn set_sta_creds_live(&mut self, creds: &WifiCredentials) {
         info!("Updating STA creds for '{}' (live)", creds.ssid);
-        let ap = AccessPointConfiguration {
-            ssid: AP_SSID.try_into().unwrap(),
-            password: AP_PASS.try_into().unwrap(),
-            auth_method: esp_idf_svc::wifi::AuthMethod::WPA2Personal,
-            channel: 1,
-            max_connections: 4,
-            ..Default::default()
-        };
-        let sta = sta_config(creds);
         self.wifi
-            .set_configuration(&Configuration::Mixed(sta, ap))
+            .set_configuration(&Configuration::Mixed(sta_config(creds), ap_config()))
             .unwrap();
         // Drop the old (failing) association attempt; kick off a fresh
         // connect against the new creds. Errors are non-fatal — the
@@ -199,19 +201,9 @@ impl<'d> Wifi<'d> {
     /// Switch to mixed AP+STA mode. AP serves captive portal, STA keeps retrying.
     pub fn start_ap_mixed(&mut self, creds: Option<&WifiCredentials>) {
         info!("Starting AP: {}", AP_SSID);
-
-        let ap = AccessPointConfiguration {
-            ssid: AP_SSID.try_into().unwrap(),
-            password: AP_PASS.try_into().unwrap(),
-            auth_method: esp_idf_svc::wifi::AuthMethod::WPA2Personal,
-            channel: 1,
-            max_connections: 4,
-            ..Default::default()
-        };
-
         // Always use Mixed mode so the STA interface is available for WiFi scanning.
         let sta = creds.map_or_else(ClientConfiguration::default, sta_config);
-        self.start_with(Configuration::Mixed(sta, ap));
+        self.start_with(Configuration::Mixed(sta, ap_config()));
         info!("AP started");
     }
 

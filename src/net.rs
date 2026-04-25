@@ -28,7 +28,7 @@ use crate::nvs_creds::WifiCredentials;
 /// keeps showing the AP credentials (so the user can reconnect on
 /// failure) and overlays a connecting indicator.
 #[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, strum::FromRepr)]
 pub enum NetStatus {
     Captive = 0,
     CaptiveTrying = 1,
@@ -84,13 +84,8 @@ impl NetStatusHandle {
     }
 
     pub fn load(&self) -> NetStatus {
-        match self.0.load(Ordering::Relaxed) {
-            0 => NetStatus::Captive,
-            1 => NetStatus::CaptiveTrying,
-            2 => NetStatus::Connecting,
-            3 => NetStatus::Host,
-            v => unreachable!("invalid NetStatus discriminant: {v}"),
-        }
+        let v = self.0.load(Ordering::Relaxed);
+        NetStatus::from_repr(v).expect("invalid NetStatus discriminant")
     }
 }
 
