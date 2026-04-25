@@ -41,10 +41,6 @@ pub enum XyError {
     SetOutput,
     SetProtection,
     BootSequence,
-    /// A write succeeded only on the second attempt — the link is alive
-    /// but degraded. Recorded so a degraded-but-not-failing link still
-    /// shows up in counters even if no outright failures latch.
-    WriteRetried,
 }
 
 impl XyError {
@@ -279,12 +275,12 @@ mod tests {
             if i % 3 == 0 {
                 log.record(i, Event::Ina(InaError::CurrentRead));
             } else {
-                log.record(i, Event::Xy(XyError::WriteRetried));
+                log.record(i, Event::Xy(XyError::ReadStatus));
             }
         }
         // 0,3,6,…,48 → 17 INA. 50 - 17 = 33 XY.
         assert_eq!(log.ina_count(InaError::CurrentRead), 17);
-        assert_eq!(log.xy_count(XyError::WriteRetried), 33);
+        assert_eq!(log.xy_count(XyError::ReadStatus), 33);
         assert_eq!(log.len(), EventLog::CAPACITY);
     }
 }

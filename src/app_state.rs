@@ -20,6 +20,7 @@ use esp_idf_svc::http::server::EspHttpServer;
 use log::info;
 
 use esp32_battery_logic::data::SensorData;
+use esp32_battery_logic::error_log::EventLog;
 pub use esp32_battery_logic::net_supervisor::NetStatus;
 use esp32_battery_logic::net_supervisor::Phase;
 
@@ -27,6 +28,7 @@ use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 
 pub type SensorDataHandle = Arc<std::sync::Mutex<SensorData>>;
+pub type EventLogHandle = Arc<std::sync::Mutex<EventLog>>;
 
 #[derive(Clone)]
 pub struct NetStatusHandle(Arc<AtomicU8>);

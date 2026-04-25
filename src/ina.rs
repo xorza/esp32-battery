@@ -4,9 +4,11 @@ use std::time::Duration;
 use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::BusConfig, config::DeviceConfig};
 
 use esp32_battery_logic::data::Ina228Reading;
+use esp32_battery_logic::error_log::{Event, InaError};
 
-use crate::app_state::SensorDataHandle;
+use crate::app_state::{EventLogHandle, SensorDataHandle};
 use crate::board::I2cPins;
+use crate::clock::EspClock;
 
 const I2C_SPEED_HZ: u32 = 400_000;
 const BATTERY_INA_ADDR: u8 = 0x40;
@@ -59,19 +61,31 @@ fn init_ina(dev: I2cDev, addr: u8) -> Option<ina228::Ina228<I2cDev>> {
     }
 }
 
-fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Ina228Reading {
-    let voltage = ina.bus_voltage().expect("");
-    let current = ina.current().expect("");
-    let power = ina.power().expect("");
-
-    Ina228Reading {
+/// Read all three INA registers. Returns the kind of the *first* register
+/// that failed so the caller can record it; partial reads are discarded
+/// because mixing fresh + stale fields would silently bias the average.
+fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Result<Ina228Reading, InaError> {
+    let voltage = ina.bus_voltage().map_err(|_| InaError::BusVoltageRead)?;
+    let current = ina.current().map_err(|_| InaError::CurrentRead)?;
+    let power = ina.power().map_err(|_| InaError::PowerRead)?;
+    Ok(Ina228Reading {
         voltage,
         current,
         power,
-    }
+    })
 }
 
-pub fn start(pins: I2cPins, sensor_data: SensorDataHandle) {
+fn record(event_log: &EventLogHandle, clock: &EspClock, kind: InaError) {
+    let ts = clock.epoch_s().unwrap_or(0);
+    event_log.lock().unwrap().record(ts, Event::Ina(kind));
+}
+
+pub fn start(
+    pins: I2cPins,
+    sensor_data: SensorDataHandle,
+    event_log: EventLogHandle,
+    clock: EspClock,
+) {
     thread::Builder::new()
         .name("ina".into())
         .stack_size(4096)
@@ -81,16 +95,25 @@ pub fn start(pins: I2cPins, sensor_data: SensorDataHandle) {
                 I2cBusDriver::new(pins.i2c, pins.sda, pins.scl, &BusConfig::new()).unwrap(),
             ));
             let dev_config = DeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
-            let ina = I2cDriver::new(i2c_bus, BATTERY_INA_ADDR, &dev_config)
+            let ina_init = I2cDriver::new(i2c_bus, BATTERY_INA_ADDR, &dev_config)
                 .ok()
                 .and_then(|dev| init_ina(dev, BATTERY_INA_ADDR));
 
             #[cfg(feature = "ina-fake")]
-            let mut battery_ina = ina;
+            let mut battery_ina = ina_init;
             #[cfg(not(feature = "ina-fake"))]
-            let mut battery_ina = ina.expect(
-                "battery INA228 did not initialize — enable `ina-fake` to run without sensor",
-            );
+            let mut battery_ina = match ina_init {
+                Some(ina) => ina,
+                None => {
+                    // Init failure — record once and keep the thread alive so the
+                    // supervisor's BatterySensorStale fault eventually latches the
+                    // buck off. No retry: panicking would hide the failure mode
+                    // from the dashboard.
+                    record(&event_log, &clock, InaError::Init);
+                    log::error!("INA228 did not initialize — battery readings will go stale");
+                    return;
+                }
+            };
 
             loop {
                 let mut bat_acc = ReadingAccum::default();
@@ -99,9 +122,18 @@ pub fn start(pins: I2cPins, sensor_data: SensorDataHandle) {
                 while count < SAMPLES_PER_UPDATE {
                     thread::sleep(SAMPLE_INTERVAL);
 
-                    let bat_r = read_battery(&mut battery_ina);
-                    bat_acc.add(&bat_r);
-                    count += 1;
+                    match read_battery(&mut battery_ina) {
+                        Ok(bat_r) => {
+                            bat_acc.add(&bat_r);
+                            count += 1;
+                        }
+                        Err(kind) => {
+                            // Drop the failed sample, log it. Stale-reading
+                            // detection in the supervisor is what catches a
+                            // sensor that's truly dead.
+                            record(&event_log, &clock, kind);
+                        }
+                    }
                 }
 
                 sensor_data
@@ -114,14 +146,14 @@ pub fn start(pins: I2cPins, sensor_data: SensorDataHandle) {
 }
 
 #[cfg(feature = "ina-fake")]
-fn read_battery(ina: &mut Option<ina228::Ina228<I2cDev>>) -> Ina228Reading {
+fn read_battery(ina: &mut Option<ina228::Ina228<I2cDev>>) -> Result<Ina228Reading, InaError> {
     match ina {
         Some(ina) => read_ina(ina),
-        None => FAKE_READING,
+        None => Ok(FAKE_READING),
     }
 }
 
 #[cfg(not(feature = "ina-fake"))]
-fn read_battery(ina: &mut ina228::Ina228<I2cDev>) -> Ina228Reading {
+fn read_battery(ina: &mut ina228::Ina228<I2cDev>) -> Result<Ina228Reading, InaError> {
     read_ina(ina)
 }

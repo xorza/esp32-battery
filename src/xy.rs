@@ -29,6 +29,7 @@ mod real {
     use esp32_battery_logic::charging::{
         Action, BatterySample, ChargeSupervisor, Chemistry, FaultReason, Profile, SafetyLimits,
     };
+    use esp32_battery_logic::error_log::{Event, XyError};
 
     /// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
     /// absorb / 13.5 V float. CC at 10 A; enter absorb at 1 A (C/50), drop
@@ -45,8 +46,9 @@ mod real {
     };
 
     use super::POLL_INTERVAL;
-    use crate::app_state::SensorDataHandle;
+    use crate::app_state::{EventLogHandle, SensorDataHandle};
     use crate::board::XyPins;
+    use crate::clock::EspClock;
 
     const SLAVE: u8 = 0x01;
     const REG_V_SET: u16 = 0x0000;
@@ -96,23 +98,14 @@ mod real {
         }
 
         fn write_holding(&self, addr: u16, value: u16) -> Result<(), ModbusError> {
-            let result = match self.write_holding_once(addr, value) {
-                Ok(()) => Ok(()),
-                Err(_) => {
-                    warn!("write_holding: first attempt failed, retrying");
-                    thread::sleep(Duration::from_millis(80));
-                    self.write_holding_once(addr, value)
-                }
+            let req = build_write_request(SLAVE, addr, value);
+            let mut resp = [0u8; 8];
+            let result = match self.transact(&req, &mut resp) {
+                Ok(n) => parse_write_response(&resp[..n], &req),
+                Err(e) => Err(e),
             };
             thread::sleep(POST_WRITE_GAP);
             result
-        }
-
-        fn write_holding_once(&self, addr: u16, value: u16) -> Result<(), ModbusError> {
-            let req = build_write_request(SLAVE, addr, value);
-            let mut resp = [0u8; 8];
-            let n = self.transact(&req, &mut resp)?;
-            parse_write_response(&resp[..n], &req)
         }
 
         /// UART transaction: write request, collect reply until quiet-deadline.
@@ -195,7 +188,17 @@ mod real {
         Ok(())
     }
 
-    pub fn start(pins: XyPins, sensor_data: SensorDataHandle) {
+    fn record(event_log: &EventLogHandle, clock: &EspClock, kind: XyError) {
+        let ts = clock.epoch_s().unwrap_or(0);
+        event_log.lock().unwrap().record(ts, Event::Xy(kind));
+    }
+
+    pub fn start(
+        pins: XyPins,
+        sensor_data: SensorDataHandle,
+        event_log: EventLogHandle,
+        clock: EspClock,
+    ) {
         thread::Builder::new()
             .name("xy".into())
             .stack_size(4096)
@@ -206,6 +209,7 @@ mod real {
 
                 if let Err(e) = boot_sequence(&xy, supervisor.target_voltage()) {
                     error!("XY boot failed: {e} — forcing output OFF, will keep polling");
+                    record(&event_log, &clock, XyError::BootSequence);
                     let _ = xy.set_output(false);
                 }
 
@@ -223,6 +227,7 @@ mod real {
                             }
                             Err(e) => {
                                 warn!("XY read_status: {e}");
+                                record(&event_log, &clock, XyError::ReadStatus);
                                 false
                             }
                         };
@@ -243,6 +248,7 @@ mod real {
                             log::info!("charge phase → {phase}: setting V_set = {v:.2} V");
                             if let Err(e) = xy.set_voltage(v) {
                                 warn!("XY set_voltage({v}): {e}");
+                                record(&event_log, &clock, XyError::SetVoltage);
                             }
                         }
                         Action::DisableOutput(reason) => {
@@ -261,6 +267,7 @@ mod real {
                                     error!(
                                         "CHARGE FAULT ({reason_str}): set_output(false) failed: {e} — will retry"
                                     );
+                                    record(&event_log, &clock, XyError::SetOutput);
                                 }
                             }
                         }
@@ -281,8 +288,9 @@ mod fake {
     use esp32_battery_logic::data::PsReading;
 
     use super::POLL_INTERVAL;
-    use crate::app_state::SensorDataHandle;
+    use crate::app_state::{EventLogHandle, SensorDataHandle};
     use crate::board::XyPins;
+    use crate::clock::EspClock;
 
     const FAKE_READING: PsReading = PsReading {
         voltage: 13.5,
@@ -290,7 +298,12 @@ mod fake {
         power: 0.0,
     };
 
-    pub fn start(pins: XyPins, sensor_data: SensorDataHandle) {
+    pub fn start(
+        pins: XyPins,
+        sensor_data: SensorDataHandle,
+        _event_log: EventLogHandle,
+        _clock: EspClock,
+    ) {
         drop(pins);
         thread::Builder::new()
             .name("xy".into())

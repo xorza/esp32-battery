@@ -25,7 +25,7 @@ use log::warn;
 
 use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
 
-use crate::app_state::{SensorDataHandle, Supervisor};
+use crate::app_state::{EventLogHandle, SensorDataHandle, Supervisor};
 use crate::history_store::{HistoryStore, Persister};
 
 /// Number of consecutive 1 Hz ticks with `is_connected() == false` before we
@@ -74,6 +74,8 @@ fn main() {
     }
 
     let sensor_data: SensorDataHandle = Arc::new(Mutex::new(sd));
+    let event_log: EventLogHandle =
+        Arc::new(Mutex::new(esp32_battery_logic::error_log::EventLog::new()));
     let mut supervisor = Supervisor::new();
     let mut persister = Persister::new(
         sensor_data.clone(),
@@ -83,8 +85,18 @@ fn main() {
 
     let _sntp = clock::start_sntp(clock.clone());
 
-    xy::start(board.xy, sensor_data.clone());
-    ina::start(board.i2c, sensor_data.clone());
+    xy::start(
+        board.xy,
+        sensor_data.clone(),
+        event_log.clone(),
+        clock.clone(),
+    );
+    ina::start(
+        board.i2c,
+        sensor_data.clone(),
+        event_log.clone(),
+        clock.clone(),
+    );
 
     #[cfg(feature = "lcd")]
     lcd::start(board.lcd, sensor_data.clone(), supervisor.status.clone());
