@@ -259,12 +259,19 @@ const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long Modbus reads to the XY can keep failing before we fail closed.
 const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Latch state. `Tripped { acked: false }` is the only state that emits
+/// `DisableOutput`; the unreachable `(None, true)` of the old two-field
+/// encoding can't be expressed.
+enum LatchState {
+    Active,
+    Tripped { reason: FaultReason, acked: bool },
+}
+
 pub struct ChargeSupervisor {
     controller: ChargeController,
     battery_missing_elapsed: Duration,
     modbus_err_elapsed: Duration,
-    fault: Option<FaultReason>,
-    disable_acked: bool,
+    latch: LatchState,
 }
 
 impl ChargeSupervisor {
@@ -273,8 +280,7 @@ impl ChargeSupervisor {
             controller: ChargeController::new(profile),
             battery_missing_elapsed: Duration::ZERO,
             modbus_err_elapsed: Duration::ZERO,
-            fault: None,
-            disable_acked: false,
+            latch: LatchState::Active,
         }
     }
 
@@ -287,15 +293,20 @@ impl ChargeSupervisor {
     }
 
     pub fn fault(&self) -> Option<FaultReason> {
-        self.fault
+        match self.latch {
+            LatchState::Active => None,
+            LatchState::Tripped { reason, .. } => Some(reason),
+        }
     }
 
     /// Caller invokes this after a successful `set_output(false)` Modbus write.
     /// Until then, the supervisor will keep emitting `DisableOutput` so a
     /// failed disable write gets retried on every tick.
     pub fn ack_disable(&mut self) {
-        assert!(self.fault.is_some(), "ack_disable without latched fault");
-        self.disable_acked = true;
+        match &mut self.latch {
+            LatchState::Tripped { acked, .. } => *acked = true,
+            LatchState::Active => panic!("ack_disable without latched fault"),
+        }
     }
 
     /// Drive one poll cycle. `modbus_ok` reflects the most recent read attempt
@@ -309,12 +320,13 @@ impl ChargeSupervisor {
         battery: Option<BatterySample>,
         elapsed: Duration,
     ) -> Action {
-        if let Some(reason) = self.fault {
-            return if self.disable_acked {
-                Action::None
-            } else {
-                Action::DisableOutput(reason)
-            };
+        match self.latch {
+            LatchState::Tripped { acked: true, .. } => return Action::None,
+            LatchState::Tripped {
+                reason,
+                acked: false,
+            } => return Action::DisableOutput(reason),
+            LatchState::Active => {}
         }
 
         if modbus_ok {
@@ -344,8 +356,10 @@ impl ChargeSupervisor {
     }
 
     fn latch(&mut self, reason: FaultReason) -> Action {
-        self.fault = Some(reason);
-        self.disable_acked = false;
+        self.latch = LatchState::Tripped {
+            reason,
+            acked: false,
+        };
         Action::DisableOutput(reason)
     }
 }
