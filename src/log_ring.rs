@@ -1,17 +1,13 @@
-//! In-RAM ring buffer that captures every ESP-IDF log line (native C logs and
-//! Rust `log::` calls both route through the same vprintf hook). Exposed via
-//! `GET /api/log` so we can triage remotely after OTA deploys.
+//! ESP-IDF log capture. Hooks `esp_log_set_vprintf` so every native C log line
+//! and every Rust `log::` call (which routes through the same vprintf) lands
+//! in an in-RAM ring buffer, exposed via `GET /api/log` for remote triage
+//! after OTA deploys. Bytes are also re-emitted via `printf` so the UART
+//! monitor keeps working.
 //!
-//! The hook formats into a stack buffer, appends the bytes to the ring, and
-//! re-emits the formatted text on UART so local serial monitoring still works.
-//! The original vprintf isn't re-called — that would require `va_copy`, which
-//! Rust doesn't expose portably.
-//!
-//! The ring uses a `Mutex`, not a spin-lock, so any log call that races with a
-//! snapshot just drops a line rather than blocking. Not ISR-safe; ESP-IDF
-//! logging is only called from tasks.
-//!
-//! Default buffer is 16 KiB — about 150 lines of typical ESP-IDF output.
+//! The ring uses a `Mutex`, not a spin-lock, so any log call that races with
+//! a snapshot just drops a line rather than blocking. Not ISR-safe; ESP-IDF
+//! logging is only called from tasks. The original vprintf isn't re-called —
+//! that would require `va_copy`, which Rust doesn't expose portably.
 
 use std::ffi::c_char;
 use std::sync::Mutex;
@@ -22,69 +18,18 @@ use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::sys;
 use esp_idf_svc::sys::EspError;
 
+use esp32_battery_logic::log_ring::Ring;
+
 unsafe extern "C" {
     fn vsnprintf(s: *mut c_char, n: usize, fmt: *const c_char, args: sys::va_list) -> i32;
 }
 
+/// Ring capacity — about 150 lines of typical ESP-IDF output.
 const BUF_SIZE: usize = 16 * 1024;
 /// Per-call stack buffer. Shipped ESP-IDF log lines top out around 200 bytes;
 /// 512 covers the long ones while staying well under the smallest default
 /// task stacks (≈2–4 KiB).
 const LINE_BUF_SIZE: usize = 512;
-
-struct Ring {
-    data: Box<[u8; BUF_SIZE]>,
-    /// Next write index.
-    head: usize,
-    /// True once the ring has wrapped; before that, valid data is `[0..head]`.
-    wrapped: bool,
-}
-
-impl Ring {
-    fn new() -> Self {
-        Self {
-            data: Box::new([0u8; BUF_SIZE]),
-            head: 0,
-            wrapped: false,
-        }
-    }
-
-    fn write(&mut self, mut bytes: &[u8]) {
-        // Oversized line: keep only the most recent BUF_SIZE bytes so wrapping
-        // lands at a clean final position.
-        if bytes.len() > BUF_SIZE {
-            bytes = &bytes[bytes.len() - BUF_SIZE..];
-            self.head = 0;
-            self.wrapped = true;
-        }
-        let tail = BUF_SIZE - self.head;
-        if bytes.len() <= tail {
-            self.data[self.head..self.head + bytes.len()].copy_from_slice(bytes);
-            self.head += bytes.len();
-            if self.head == BUF_SIZE {
-                self.head = 0;
-                self.wrapped = true;
-            }
-        } else {
-            let (first, rest) = bytes.split_at(tail);
-            self.data[self.head..].copy_from_slice(first);
-            self.data[..rest.len()].copy_from_slice(rest);
-            self.head = rest.len();
-            self.wrapped = true;
-        }
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        if self.wrapped {
-            let mut out = Vec::with_capacity(BUF_SIZE);
-            out.extend_from_slice(&self.data[self.head..]);
-            out.extend_from_slice(&self.data[..self.head]);
-            out
-        } else {
-            self.data[..self.head].to_vec()
-        }
-    }
-}
 
 static RING: Mutex<Option<Ring>> = Mutex::new(None);
 /// The vprintf handler that was installed before our hook took over. We don't
@@ -95,7 +40,7 @@ static PREV_VPRINTF: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Call once at startup. Installs the vprintf hook.
 pub fn init() {
-    *RING.lock().unwrap() = Some(Ring::new());
+    *RING.lock().unwrap() = Some(Ring::new(BUF_SIZE));
     let prev = unsafe { sys::esp_log_set_vprintf(Some(vprintf_hook)) };
     PREV_VPRINTF.store(
         prev.map_or(std::ptr::null_mut(), |f| f as *mut ()),
