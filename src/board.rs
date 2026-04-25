@@ -37,7 +37,6 @@ pub struct LcdPins {
     pub ledc_channel: CHANNEL0<'static>,
 }
 
-#[cfg_attr(feature = "xy-fake", allow(dead_code))]
 pub struct XyPins {
     pub uart: UART1<'static>,
     pub tx: AnyIOPin<'static>,

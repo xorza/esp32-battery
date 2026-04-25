@@ -356,7 +356,12 @@ fn make_device(pins: XyPins) -> real::Xy<'static> {
 }
 
 #[cfg(feature = "xy-fake")]
-fn make_device(_pins: XyPins) -> fake::FakeXy {
+fn make_device(pins: XyPins) -> fake::FakeXy {
+    // Burn the peripherals through black_box so XyPins fields aren't
+    // flagged dead — we still claim them at boot and just don't drive
+    // the bus.
+    let XyPins { uart, tx, rx } = pins;
+    std::hint::black_box((uart, tx, rx));
     log::info!("XY: fake mode — no UART, in-memory device");
     fake::FakeXy::new()
 }
