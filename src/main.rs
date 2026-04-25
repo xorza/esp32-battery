@@ -21,70 +21,17 @@ use std::time::Duration;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use log::{info, warn};
+use log::warn;
 
 use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
 
 use crate::app_state::{SensorDataHandle, Supervisor};
-use crate::clock::EspClock;
-use crate::history_store::HistoryStore;
+use crate::history_store::{HistoryStore, Persister};
 
 /// Number of consecutive 1 Hz ticks with `is_connected() == false` before we
 /// tear down the host server and fall back to the captive AP. Sized to cover
 /// initial DHCP/DNS at boot and brief link blips without flapping the SSID.
 const CAPTIVE_AFTER_FAILURES: u32 = 15;
-
-fn tick_and_persist(
-    sensor_data: &SensorDataHandle,
-    history_store: &HistoryStore,
-    clock: &EspClock,
-    scheduler: &mut SaveScheduler,
-) {
-    let now = clock.epoch_s();
-    // Tick the data store and (if the save timer fires) serialize under one
-    // lock — keeps NVS I/O out of the critical section but avoids a two-lock
-    // dance + stale-state window between them.
-    let payload = {
-        let mut sd = sensor_data.lock().unwrap();
-        sd.tick(now);
-        if scheduler.tick(now) {
-            Some(sd.serialize())
-        } else {
-            None
-        }
-    };
-    if let Some(bytes) = payload {
-        log::info!("Emitting save payload: {} bytes", bytes.len());
-        history_store.save(&bytes);
-    }
-}
-
-fn tick_wifi(wifi: &Mutex<wifi::Wifi<'static>>) -> bool {
-    let mut wf = wifi.lock().unwrap();
-    wf.try_reconnect();
-    wf.is_connected()
-}
-
-fn start_sntp(clock: clock::EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
-    info!("Starting NTP sync");
-    esp_idf_svc::sntp::EspSntp::new_with_callback(
-        &esp_idf_svc::sntp::SntpConf::default(),
-        move |synced_at| {
-            // The SNTP callback can fire with a bogus time (bad server, DNS
-            // hijack, pre-sync tick). Only flip the flag once the reported
-            // epoch is within the plausibility window — otherwise a bogus
-            // value reaches SensorData and poisons history.
-            let secs = synced_at.as_secs();
-            if clock::VALID_EPOCH_S.contains(&secs) {
-                info!("NTP synced: epoch={secs}");
-                clock.mark_synced();
-            } else {
-                warn!("NTP sync ignored: implausible epoch={secs}");
-            }
-        },
-    )
-    .unwrap()
-}
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -128,11 +75,13 @@ fn main() {
 
     let sensor_data: SensorDataHandle = Arc::new(Mutex::new(sd));
     let mut supervisor = Supervisor::new();
-    let mut save_scheduler = SaveScheduler::new(DEFAULT_SAVE_INTERVAL_S);
+    let mut persister = Persister::new(
+        sensor_data.clone(),
+        history_store,
+        SaveScheduler::new(DEFAULT_SAVE_INTERVAL_S),
+    );
 
-    // SNTP runs once for the whole lifetime — the client handles WiFi flaps
-    // internally, so there's no reason to tear it down and restart.
-    let _sntp = start_sntp(clock.clone());
+    let _sntp = clock::start_sntp(clock.clone());
 
     xy::start(board.xy, sensor_data.clone());
     ina::start(board.i2c, sensor_data.clone());
@@ -148,14 +97,14 @@ fn main() {
     loop {
         thread::sleep(Duration::from_secs(1));
 
-        tick_and_persist(&sensor_data, &history_store, &clock, &mut save_scheduler);
+        persister.tick(clock.epoch_s());
 
         if let Some(new) = supervisor.take_pending_creds() {
             wifi.lock().unwrap().start_sta(&new);
             creds = Some(new);
         }
 
-        let connected = tick_wifi(&wifi);
+        let connected = wifi.lock().unwrap().tick();
         if connected {
             let sd = sensor_data.clone();
             supervisor.on_tick_connected(|| http::start_main(sd, nvs.clone()));

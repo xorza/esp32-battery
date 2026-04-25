@@ -163,6 +163,13 @@ impl<'d> Wifi<'d> {
         }
     }
 
+    /// Supervisor tick: attempt reconnect (no-op if not configured or already
+    /// connected) and report current associated state.
+    pub fn tick(&mut self) -> bool {
+        self.try_reconnect();
+        self.is_connected()
+    }
+
     /// Scan for visible access points, deduplicated by SSID (strongest signal kept),
     /// sorted by signal strength descending.
     pub fn scan(&mut self) -> ScanResult {
