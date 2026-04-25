@@ -1,11 +1,5 @@
-use std::sync::Arc;
-
-use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
-use esp_idf_svc::sys::EspError;
 use log::info;
-
-use crate::http::text_response;
 
 const NAMESPACE: &str = "wifi";
 
@@ -52,15 +46,4 @@ pub fn clear(nvs: &EspNvs<NvsDefault>) {
     let _ = nvs.remove("ssid");
     let _ = nvs.remove("pass");
     info!("WiFi credentials cleared");
-}
-
-pub fn register_reset(server: &mut EspHttpServer<'static>, nvs: Arc<EspNvs<NvsDefault>>) {
-    server
-        .fn_handler("/wifi-reset", esp_idf_svc::http::Method::Post, move |req| {
-            clear(&nvs);
-            text_response(req, 200, b"WiFi credentials cleared. Rebooting...")?;
-            crate::reboot::reboot_after("Rebooting after WiFi reset");
-            Ok::<(), EspError>(())
-        })
-        .unwrap();
 }
