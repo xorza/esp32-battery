@@ -127,7 +127,8 @@ pub struct CaptiveBundle {
 }
 
 pub enum Net {
-    /// Trying to be on the user's network. `link_seen` carries the
+    /// Trying to be on the user's network. `creds` is always present
+    /// (constructing `Sta` requires them); `link_seen` carries the
     /// monotonic timestamp the captive-fallback timer counts from, and
     /// also gates LCD-side hysteresis: only `LinkSeen::At` (we've
     /// associated at least once this session) qualifies.
@@ -136,10 +137,18 @@ pub enum Net {
         // the server, which stops the dashboard. Same convention as
         // `CaptiveBundle::_server` / `_dns`.
         _server: EspHttpServer<'static>,
+        creds: WifiCredentials,
         link_seen: LinkSeen,
     },
-    /// Serving the captive portal AP.
-    Captive { bundle: CaptiveBundle },
+    /// Serving the captive portal AP. `creds` is `None` pre-first-save
+    /// (cold boot with no stored creds) or `Some` after the captive
+    /// `/save` produced a `Pending` that the supervisor drained — and
+    /// also after a `Sta → Captive` fallback (creds carry over so STA
+    /// can keep retrying while the user re-enters them).
+    Captive {
+        bundle: CaptiveBundle,
+        creds: Option<WifiCredentials>,
+    },
 }
 
 /// Tracks STA association history within a single `Net::Sta` session.

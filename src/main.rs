@@ -70,7 +70,7 @@ fn main() {
     let nvs_partition = EspDefaultNvsPartition::take().unwrap();
 
     let nvs = Arc::new(nvs_creds::open(nvs_partition.clone()));
-    let mut creds = nvs_creds::load(&nvs);
+    let boot_creds = nvs_creds::load(&nvs);
 
     let clock = clock::EspClock::new();
     let history_store = HistoryStore::new(nvs_partition.clone());
@@ -112,7 +112,7 @@ fn main() {
     lcd::start(board.lcd, sensor_data.clone(), net_status.clone());
 
     // Bootstrap: STA if we have creds, else captive. Per `wifi flow.md`.
-    let mut net = match &creds {
+    let mut net = match boot_creds {
         Some(c) => start_sta_session(
             &wifi,
             c,
@@ -139,8 +139,8 @@ fn main() {
         // can mutate in place), then apply transitions where consuming
         // the old `net` is needed to drop server/bundle.
         let step = match &mut net {
-            Net::Captive { bundle } => {
-                let captive_status = drain_submission(bundle, &wifi, &mut creds, now);
+            Net::Captive { bundle, creds } => {
+                let captive_status = drain_submission(bundle, &wifi, creds, now);
                 let mut w = wifi.lock().unwrap();
                 let connected = w.tick(creds.is_some());
                 // Only refresh while we're not mid-association: a fresh
@@ -153,18 +153,24 @@ fn main() {
                 }
                 drop(w);
                 if connected {
-                    Step::Promote
+                    // `connected` here implies a Pending was drained
+                    // earlier this tick (or a prior tick that landed
+                    // creds and we associated since) — creds is Some.
+                    let c = creds.clone().expect("captive associated implies creds");
+                    Step::Promote(c)
                 } else {
                     Step::Stay(captive_status)
                 }
             }
-            Net::Sta { link_seen, .. } => {
-                let connected = wifi.lock().unwrap().tick(creds.is_some());
+            Net::Sta {
+                link_seen, creds, ..
+            } => {
+                let connected = wifi.lock().unwrap().tick(true);
                 if connected {
                     *link_seen = LinkSeen::At(now);
                     Step::Stay(NetStatus::Host)
                 } else if now.saturating_sub(link_seen.timestamp()) >= CAPTIVE_AFTER_DISCONNECT {
-                    Step::FallBack
+                    Step::FallBack(creds.clone())
                 } else {
                     Step::Stay(NetStatus::for_sta(link_seen, false, now))
                 }
@@ -173,24 +179,21 @@ fn main() {
 
         let status = match step {
             Step::Stay(s) => s,
-            Step::Promote => {
+            Step::Promote(c) => {
                 // Creds just associated — persist now (wrong creds never
                 // overwrite a known-good pair on flash) and promote to
                 // STA-only. Reassigning `net` drops the captive bundle,
                 // which stops the captive HTTP server + DNS responder.
-                let c = creds
-                    .clone()
-                    .expect("captive→sta transition requires creds");
                 nvs_creds::save(&nvs, &c.ssid, &c.password);
                 net =
-                    start_sta_session(&wifi, &c, &sensor_data, &event_log, &nvs, LinkSeen::At(now));
+                    start_sta_session(&wifi, c, &sensor_data, &event_log, &nvs, LinkSeen::At(now));
                 NetStatus::Host
             }
-            Step::FallBack => {
+            Step::FallBack(c) => {
                 // Long STA outage — bring up captive AP+STA so the user
                 // can correct creds while STA keeps retrying. Reassigning
                 // `net` drops the dashboard server.
-                net = start_captive_session(&wifi, creds.as_ref());
+                net = start_captive_session(&wifi, Some(c));
                 NetStatus::Captive
             }
         };
@@ -205,10 +208,13 @@ enum Step {
     /// No transition; `link_seen` may have been refreshed in place. The
     /// LCD reading was computed during observation.
     Stay(NetStatus),
-    /// Captive → Sta. STA just associated with submitted creds.
-    Promote,
-    /// Sta → Captive. STA has been disconnected past the grace window.
-    FallBack,
+    /// Captive → Sta. Carries the creds extracted from `Net::Captive`
+    /// so the application phase can save them and seed `Net::Sta`.
+    Promote(nvs_creds::WifiCredentials),
+    /// Sta → Captive. Carries the creds we were trying so they survive
+    /// into the new `Net::Captive { creds: Some(_) }` and STA keeps
+    /// retrying behind the captive AP.
+    FallBack(nvs_creds::WifiCredentials),
 }
 
 /// Drain a fresh `/save` handoff (`Pending → Trying`) and time-out a
@@ -241,34 +247,39 @@ fn drain_submission(
     NetStatus::for_captive(&s)
 }
 
-/// Bring up STA-only mode + dashboard server.
+/// Bring up STA-only mode + dashboard server. `creds` is moved into
+/// `Net::Sta` so the variant is the single source of truth for "what
+/// credentials are we currently trying."
 fn start_sta_session(
     wifi: &Arc<Mutex<wifi::Wifi<'static>>>,
-    creds: &nvs_creds::WifiCredentials,
+    creds: nvs_creds::WifiCredentials,
     sensor_data: &Arc<Mutex<SensorData>>,
     event_log: &Arc<Mutex<EventLog>>,
     nvs: &Arc<esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>>,
     link_seen: LinkSeen,
 ) -> Net {
-    wifi.lock().unwrap().start_sta(creds);
+    wifi.lock().unwrap().start_sta(&creds);
     let server = http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
     Net::Sta {
         _server: server,
+        creds,
         link_seen,
     }
 }
 
-/// Bring up AP+STA Mixed + captive HTTP/DNS bundle.
+/// Bring up AP+STA Mixed + captive HTTP/DNS bundle. `creds` is the
+/// optional carry-over from a `Sta → Captive` fallback (`None` on cold
+/// boot with no stored creds).
 fn start_captive_session(
     wifi: &Arc<Mutex<wifi::Wifi<'static>>>,
-    creds: Option<&nvs_creds::WifiCredentials>,
+    creds: Option<nvs_creds::WifiCredentials>,
 ) -> Net {
     let scan_cache = {
         let mut w = wifi.lock().unwrap();
-        w.start_ap_mixed(creds);
+        w.start_ap_mixed(creds.as_ref());
         w.scan_cache()
     };
     let state = Arc::new(Mutex::new(Submission::Idle));
     let bundle = http::start_captive(scan_cache, state);
-    Net::Captive { bundle }
+    Net::Captive { bundle, creds }
 }
