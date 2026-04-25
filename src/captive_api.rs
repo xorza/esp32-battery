@@ -20,8 +20,8 @@ use esp32_battery_logic::form;
 
 use crate::clock::uptime;
 use crate::http::{JsonBuf, json_response, mount_get, mount_post, read_to_buf, text_response};
-use crate::nvs_creds::{self, WifiCredentials};
 use crate::net::{CaptiveStateHandle, Submission};
+use crate::nvs_creds::{self, WifiCredentials};
 use crate::wifi::Wifi;
 
 const SCAN_BUF_SIZE: usize = 1024;
@@ -76,9 +76,9 @@ pub fn mount(
             password: password.to_string(),
         };
 
-        *save_state.lock().unwrap() = Submission::Trying {
+        *save_state.lock().unwrap() = Submission::Pending {
+            creds,
             since: uptime(),
-            pending: Some(creds),
         };
 
         info!("Captive: queued new credentials for live STA reconnect");

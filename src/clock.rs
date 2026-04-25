@@ -1,7 +1,7 @@
 //! Wall-clock source backed by ESP-IDF's SNTP-driven system time.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use log::{info, warn};
 

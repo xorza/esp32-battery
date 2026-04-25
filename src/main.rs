@@ -10,10 +10,10 @@ mod ina;
 #[cfg(feature = "lcd")]
 mod lcd;
 mod log_ring;
+mod net;
 mod nvs_creds;
 mod ota;
 mod reboot;
-mod net;
 mod wifi;
 mod wifi_reset;
 mod xy;
@@ -33,7 +33,6 @@ use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler
 use crate::clock::{EventRecorder, uptime};
 use crate::history_store::{HistoryStore, Persister};
 use crate::net::{Net, NetStatus, NetStatusHandle, Submission};
-use crate::wifi::LinkState;
 
 /// How long `is_connected() == false` may persist before we tear down
 /// the host server and fall back to the captive AP. Covers initial
@@ -116,7 +115,6 @@ fn main() {
         Some(c) => {
             wifi.lock().unwrap().start_sta(c);
             let server = http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
-            net_status.store(NetStatus::Connecting);
             Net::Sta {
                 server,
                 last_associated: uptime(),
@@ -126,10 +124,10 @@ fn main() {
             wifi.lock().unwrap().start_ap_mixed(None);
             let state = Arc::new(Mutex::new(Submission::Idle));
             let bundle = http::start_captive(nvs.clone(), wifi.clone(), state);
-            net_status.store(NetStatus::Captive);
             Net::Captive { bundle }
         }
     };
+    net_status.store(NetStatus::derive(&net, false));
 
     loop {
         thread::sleep(TICK_PERIOD);
@@ -138,24 +136,33 @@ fn main() {
 
         net = match net {
             Net::Captive { bundle } => {
-                // Apply any newly-submitted creds and time out a stale
-                // Trying window — same mutex, one critical section.
+                // Drain a fresh /save handoff (Pending → Trying) and time
+                // out a stale Trying window — single critical section on
+                // the submission lock.
                 {
                     let mut s = bundle.state.lock().unwrap();
-                    if let Submission::Trying { since, pending } = &mut *s {
-                        if let Some(new_creds) = pending.take() {
+                    let taken = std::mem::replace(&mut *s, Submission::Idle);
+                    match taken {
+                        Submission::Pending {
+                            creds: new_creds,
+                            since,
+                        } => {
                             wifi.lock().unwrap().set_sta_creds_live(&new_creds);
+                            *s = Submission::Trying { since };
                             creds = Some(new_creds);
                         }
-                        if now.saturating_sub(*since) >= CAPTIVE_TRYING_TIMEOUT {
+                        Submission::Trying { since }
+                            if now.saturating_sub(since) >= CAPTIVE_TRYING_TIMEOUT =>
+                        {
                             *s = Submission::Failed;
                             warn!("Captive: STA association timed out; flipping to Failed");
                         }
+                        other => *s = other,
                     }
                 }
 
-                let link = wifi.lock().unwrap().tick();
-                if link == LinkState::Associated {
+                let connected = wifi.lock().unwrap().tick(creds.is_some());
+                if connected {
                     let c = creds
                         .clone()
                         .expect("captive→sta transition requires creds");
@@ -163,13 +170,11 @@ fn main() {
                     wifi.lock().unwrap().start_sta(&c);
                     let server =
                         http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
-                    net_status.store(NetStatus::Host);
                     Net::Sta {
                         server,
                         last_associated: now,
                     }
                 } else {
-                    net_status.store(NetStatus::Captive);
                     Net::Captive { bundle }
                 }
             }
@@ -177,9 +182,8 @@ fn main() {
                 server,
                 last_associated,
             } => {
-                let link = wifi.lock().unwrap().tick();
-                if link == LinkState::Associated {
-                    net_status.store(NetStatus::Host);
+                let connected = wifi.lock().unwrap().tick(creds.is_some());
+                if connected {
                     Net::Sta {
                         server,
                         last_associated: now,
@@ -189,10 +193,8 @@ fn main() {
                     wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
                     let state = Arc::new(Mutex::new(Submission::Idle));
                     let bundle = http::start_captive(nvs.clone(), wifi.clone(), state);
-                    net_status.store(NetStatus::Captive);
                     Net::Captive { bundle }
                 } else {
-                    net_status.store(NetStatus::Connecting);
                     Net::Sta {
                         server,
                         last_associated,
@@ -200,5 +202,7 @@ fn main() {
                 }
             }
         };
+
+        net_status.store(NetStatus::derive(&net, wifi.lock().unwrap().is_connected()));
     }
 }

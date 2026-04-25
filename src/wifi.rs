@@ -25,16 +25,6 @@ const MAX_SCAN_APS: usize = 10;
 
 pub type ScanResult = heapless::Vec<(heapless::String<32>, i8), MAX_SCAN_APS>;
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum LinkState {
-    /// No STA credentials configured — captive portal needs to collect them.
-    NoCreds,
-    /// Have creds but not currently associated — reconnect is worth attempting.
-    Disassociated,
-    /// STA is associated; the host server can run.
-    Associated,
-}
-
 /// Current STA RSSI in dBm, or 0 when not associated. Reads the live AP
 /// record via `esp_wifi_sta_get_ap_info`; the call is cheap and doesn't
 /// require a `Wifi` handle.
@@ -55,37 +45,9 @@ fn sta_config(creds: &WifiCredentials) -> ClientConfiguration {
     }
 }
 
-/// Tracks whether the driver is started and whether we have STA credentials
-/// configured. The four reachable combinations are Idle (both false), Sta
-/// (started + has creds), or ApMixed (started, optional creds for the
-/// embedded STA half). The pre-F4 representation used two independent
-/// `bool`s, which had two unreachable shapes.
-enum Mode {
-    Idle,
-    Sta,
-    ApMixed { has_sta_creds: bool },
-}
-
-impl Mode {
-    fn started(&self) -> bool {
-        !matches!(self, Mode::Idle)
-    }
-
-    fn has_sta_creds(&self) -> bool {
-        matches!(
-            self,
-            Mode::Sta
-                | Mode::ApMixed {
-                    has_sta_creds: true
-                }
-        )
-    }
-}
-
 pub struct Wifi<'d> {
     wifi: BlockingWifi<EspWifi<'d>>,
     mdns: Option<EspMdns>,
-    mode: Mode,
 }
 
 impl<'d> Wifi<'d> {
@@ -129,17 +91,13 @@ impl<'d> Wifi<'d> {
         )
         .unwrap();
 
-        Self {
-            wifi,
-            mdns: None,
-            mode: Mode::Idle,
-        }
+        Self { wifi, mdns: None }
     }
 
     fn start_with(&mut self, config: Configuration) {
-        if self.mode.started() {
-            let _ = self.wifi.stop();
-        }
+        // stop() errors when the driver isn't running; ignore — start()
+        // is what matters and will surface a real failure.
+        let _ = self.wifi.stop();
         self.wifi.set_configuration(&config).unwrap();
         self.wifi.start().unwrap();
     }
@@ -147,18 +105,14 @@ impl<'d> Wifi<'d> {
     pub fn start_sta(&mut self, creds: &WifiCredentials) {
         info!("Starting WiFi STA for '{}'", creds.ssid);
         self.start_with(Configuration::Client(sta_config(creds)));
-        self.mode = Mode::Sta;
     }
 
     /// Update STA credentials in the running mixed (AP+STA) mode without
     /// stopping the radio — so the captive AP stays associated with the
-    /// user's phone while the STA half retries against the new SSID. Should
-    /// only be called while already in `ApMixed` mode; panics otherwise.
+    /// user's phone while the STA half retries against the new SSID. The
+    /// supervisor only calls this from the captive arm; no state-machine
+    /// guard inside `Wifi`.
     pub fn set_sta_creds_live(&mut self, creds: &WifiCredentials) {
-        assert!(
-            matches!(self.mode, Mode::ApMixed { .. }),
-            "set_sta_creds_live requires ApMixed mode"
-        );
         info!("Updating STA creds for '{}' (live)", creds.ssid);
         let ap = AccessPointConfiguration {
             ssid: AP_SSID.try_into().unwrap(),
@@ -172,9 +126,6 @@ impl<'d> Wifi<'d> {
         self.wifi
             .set_configuration(&Configuration::Mixed(sta, ap))
             .unwrap();
-        self.mode = Mode::ApMixed {
-            has_sta_creds: true,
-        };
         // Drop the old (failing) association attempt; kick off a fresh
         // connect against the new creds. Errors are non-fatal — the
         // supervisor's per-tick reconnect will retry on its own.
@@ -198,40 +149,23 @@ impl<'d> Wifi<'d> {
         // Always use Mixed mode so the STA interface is available for WiFi scanning.
         let sta = creds.map_or_else(ClientConfiguration::default, sta_config);
         self.start_with(Configuration::Mixed(sta, ap));
-        self.mode = Mode::ApMixed {
-            has_sta_creds: creds.is_some(),
-        };
         info!("AP started");
     }
 
-    /// Distinct STA states the supervisor reasons about. `NoCreds` and
-    /// `Disassociated` both mean "not currently routable", but they take
-    /// different recovery paths — only `Disassociated` is worth retrying.
-    pub fn link_state(&self) -> LinkState {
-        if !self.mode.has_sta_creds() {
-            LinkState::NoCreds
-        } else if self.wifi.is_connected().unwrap_or(false) {
-            LinkState::Associated
-        } else {
-            LinkState::Disassociated
-        }
+    pub fn is_connected(&self) -> bool {
+        self.wifi.is_connected().unwrap_or(false)
     }
 
-    fn try_reconnect(&mut self) {
-        if self.link_state() != LinkState::Disassociated {
-            return;
-        }
-        if self.wifi.connect().is_ok() {
+    /// Supervisor tick: when STA creds are configured and we're not
+    /// associated, attempt a reconnect. Returns whether we are associated
+    /// post-attempt. Caller passes `has_sta_creds` because credential
+    /// presence is supervisor-owned state (in `main`'s `creds: Option`).
+    pub fn tick(&mut self, has_sta_creds: bool) -> bool {
+        if has_sta_creds && !self.is_connected() && self.wifi.connect().is_ok() {
             let _ = self.wifi.wait_netif_up();
             self.setup_mdns();
         }
-    }
-
-    /// Supervisor tick: try reconnect (no-op unless `Disassociated`) and
-    /// return the post-reconnect link state.
-    pub fn tick(&mut self) -> LinkState {
-        self.try_reconnect();
-        self.link_state()
+        self.is_connected()
     }
 
     /// Scan for visible access points, deduplicated by SSID (strongest signal kept),

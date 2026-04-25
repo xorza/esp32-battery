@@ -161,9 +161,7 @@ fn body_response(
         headers.push(("Content-Type", ct)).unwrap();
     }
     headers.push(("Connection", "close")).unwrap();
-    let mut resp = req
-        .into_response(status, None, &headers)
-        .map_err(|e| e.0)?;
+    let mut resp = req.into_response(status, None, &headers).map_err(|e| e.0)?;
     resp.write_all(body).map_err(|e| e.0)?;
     Ok(())
 }

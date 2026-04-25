@@ -19,14 +19,24 @@ use strum::IntoStaticStr;
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 
-/// LCD-visible status. Derived from `Net` + the most recent link
-/// observation each tick — not stored inside `Net` itself.
+/// LCD-visible status. Derived once per supervisor tick from `(Net,
+/// connected)`; not stored inside `Net`.
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum NetStatus {
     Captive = 0,
     Connecting = 1,
     Host = 2,
+}
+
+impl NetStatus {
+    pub fn derive(net: &Net, connected: bool) -> Self {
+        match (net, connected) {
+            (Net::Captive { .. }, _) => NetStatus::Captive,
+            (Net::Sta { .. }, true) => NetStatus::Host,
+            (Net::Sta { .. }, false) => NetStatus::Connecting,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -51,20 +61,27 @@ impl NetStatusHandle {
     }
 }
 
-/// Shared state between `/save` (producer) and the main loop
-/// (consumer). `Trying { pending: Some(_) }` means /save just landed
-/// fresh creds for main to apply; main `take()`s the inner `Option`
-/// and leaves the `Trying` window running. Timeout flips to `Failed`.
-/// "Connected" isn't a variant — once STA associates the main loop
-/// drops the captive bundle, the AP goes down, and the page's
-/// `/status` poll just fails (its cue to assume success).
+/// Shared state between `/save` (producer) and the main loop (consumer).
+///
+/// Lifecycle: `Idle` → `Pending { creds, since }` (set by `/save`) →
+/// `Trying { since }` (supervisor consumed creds and called
+/// `set_sta_creds_live`) → `Failed` on timeout, or the whole captive
+/// bundle is dropped on association success — the page's `/status` poll
+/// then errors, which it treats as success.
+///
+/// `Pending` carries the one-shot creds payload; `Trying` carries only
+/// the deadline. Splitting them keeps the lifecycle visible at the type
+/// level instead of through an `Option<WifiCredentials>` in `Trying`.
 #[derive(IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
 pub enum Submission {
     Idle,
+    Pending {
+        creds: WifiCredentials,
+        since: Duration,
+    },
     Trying {
         since: Duration,
-        pending: Option<WifiCredentials>,
     },
     Failed,
 }
