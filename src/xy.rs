@@ -9,9 +9,6 @@
 
 use std::time::Duration;
 
-/// Default voltage/current setpoint applied on boot (real) / used as the fake
-/// reading's voltage (fake). Output is kept OFF until enabled manually.
-const BOOT_V_SET: f32 = 13.6;
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[cfg(not(feature = "xy-fake"))]
@@ -30,13 +27,19 @@ mod real {
     use esp_idf_hal::units::Hertz;
     use log::{error, warn};
 
+    use esp32_battery_logic::charge_strategy::{ChargeController, Chemistry, Profile};
+
+    /// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
+    /// absorb / 13.5 V float. Hysteresis: enter absorb at 1 A (C/50), drop
+    /// back to float at 0.5 A (C/100). enter > exit so we don't flap.
+    const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 1.0, 0.5);
     use esp32_battery_logic::data::PsReading;
     use esp32_battery_logic::modbus::{
         ModbusError, build_read_request, build_write_request, parse_read_response,
         parse_write_response,
     };
 
-    use super::{BOOT_V_SET, POLL_INTERVAL};
+    use super::POLL_INTERVAL;
     use crate::app_state::Shared;
     use crate::board::XyPins;
 
@@ -175,10 +178,10 @@ mod real {
 
     /// Programs protection + setpoints, then enables output. Any failure
     /// short-circuits — we never enable output with unprogrammed setpoints.
-    fn boot_sequence(xy: &Xy) -> Result<(), ModbusError> {
+    fn boot_sequence(xy: &Xy, initial_v_set: f32) -> Result<(), ModbusError> {
         xy.set_output(false)?;
         xy.set_protection(BOOT_OVP, BOOT_OCP, BOOT_LVP)?;
-        xy.set_voltage(BOOT_V_SET)?;
+        xy.set_voltage(initial_v_set)?;
         xy.set_current_limit(BOOT_I_SET)?;
         xy.set_output(true)?;
         Ok(())
@@ -190,9 +193,10 @@ mod real {
             .stack_size(4096)
             .spawn(move || {
                 let xy = Xy::new(pins);
+                let mut controller = ChargeController::new(PACK_PROFILE);
                 thread::sleep(Duration::from_millis(100));
 
-                if let Err(e) = boot_sequence(&xy) {
+                if let Err(e) = boot_sequence(&xy, controller.target_voltage()) {
                     error!("XY boot failed: {e} — forcing output OFF, will keep polling");
                     let _ = xy.set_output(false);
                 }
@@ -205,7 +209,26 @@ mod real {
                                 current: s.i_out,
                                 power: s.p_out,
                             };
-                            shared.sensor_data.lock().unwrap().update_ps(reading);
+                            let batt_current = {
+                                let mut sd = shared.sensor_data.lock().unwrap();
+                                sd.update_ps(reading);
+                                sd.battery_reading().map(|b| b.current)
+                            };
+                            if let Some(i) = batt_current
+                                && let Some(new_v) = controller.update(i)
+                            {
+                                let phase = controller.phase();
+                                let phase_name = match phase {
+                                    esp32_battery_logic::charge_strategy::Phase::Float => "float",
+                                    esp32_battery_logic::charge_strategy::Phase::Absorb => "absorb",
+                                };
+                                log::info!(
+                                    "charge phase → {phase_name}: setting V_set = {new_v:.2} V (I_batt = {i:.3} A)"
+                                );
+                                if let Err(e) = xy.set_voltage(new_v) {
+                                    warn!("XY set_voltage({new_v}): {e}");
+                                }
+                            }
                         }
                         Err(e) => warn!("XY read_status: {e}"),
                     }
@@ -225,12 +248,12 @@ mod fake {
 
     use esp32_battery_logic::data::PsReading;
 
-    use super::{BOOT_V_SET, POLL_INTERVAL};
+    use super::POLL_INTERVAL;
     use crate::app_state::Shared;
     use crate::board::XyPins;
 
     const FAKE_READING: PsReading = PsReading {
-        voltage: BOOT_V_SET,
+        voltage: 13.5,
         current: 0.0,
         power: 0.0,
     };

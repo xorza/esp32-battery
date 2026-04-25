@@ -1,4 +1,5 @@
 pub mod battery;
+pub mod charge_strategy;
 pub mod data;
 pub mod form;
 pub mod modbus;
