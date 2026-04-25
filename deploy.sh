@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DIR="$(dirname "$0")"
-CHIP="${MCU:?Set MCU=esp32c3 or MCU=esp32c6}"
+CHIP="${MCU:-esp32c6}"
 
 case "$CHIP" in
     esp32c3) TARGET="riscv32imc-esp-espidf" ; ALIAS="c3" ;;
