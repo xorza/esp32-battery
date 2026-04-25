@@ -1,18 +1,18 @@
 //! Captive-portal API: WiFi scan, credential save, status polling, and
 //! the Android captive-detection probe.
 //!
-//! `/save` writes the pending creds and flips `Submission::Trying`
-//! atomically into the shared `CaptiveStateHandle`. The main loop
-//! drains the pending creds on its next tick and applies them via
-//! `wifi.set_sta_creds_live`. On association the main loop drops the
-//! whole captive bundle (AP goes down, page's `/status` poll fails —
-//! the page treats that as success).
+//! `/save` parks the submitted creds in `Submission::Pending` and the
+//! main loop drains them on its next tick — applying them live via
+//! `wifi.set_sta_creds_live` and persisting to NVS only after STA
+//! actually associates. Bad creds therefore never overwrite a known-good
+//! pair on flash. On association the main loop drops the whole captive
+//! bundle (AP goes down, page's `/status` poll fails — the page treats
+//! that as success).
 
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use esp_idf_svc::http::server::EspHttpServer;
-use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::sys::EspError;
 use log::info;
 
@@ -21,7 +21,7 @@ use esp32_battery_logic::form;
 use crate::clock::uptime;
 use crate::http::{JsonBuf, json_response, mount_get, mount_post, read_to_buf, text_response};
 use crate::net::{CaptiveStateHandle, Submission};
-use crate::nvs_creds::{self, WifiCredentials};
+use crate::nvs_creds::WifiCredentials;
 use crate::wifi::Wifi;
 
 const SCAN_BUF_SIZE: usize = 1024;
@@ -30,7 +30,6 @@ const STATUS_BUF_SIZE: usize = 64;
 pub fn mount(
     server: &mut EspHttpServer<'static>,
     wifi: Arc<Mutex<Wifi<'static>>>,
-    nvs: Arc<EspNvs<NvsDefault>>,
     state: CaptiveStateHandle,
 ) {
     let scan_buf: JsonBuf<SCAN_BUF_SIZE> = JsonBuf::new();
@@ -70,7 +69,6 @@ pub fn mount(
             return text_response(req, 400, b"Password must be 8-63 characters");
         }
 
-        nvs_creds::save(&nvs, ssid, password);
         let creds = WifiCredentials {
             ssid: ssid.to_string(),
             password: password.to_string(),

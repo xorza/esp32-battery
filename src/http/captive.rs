@@ -5,7 +5,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use log::info;
 
 use crate::captive_api;
@@ -15,16 +14,12 @@ use crate::wifi::Wifi;
 
 use super::{create_server, serve_common_assets, serve_static};
 
-pub fn start(
-    nvs: Arc<EspNvs<NvsDefault>>,
-    wifi: Arc<Mutex<Wifi<'static>>>,
-    state: CaptiveStateHandle,
-) -> CaptiveBundle {
+pub fn start(wifi: Arc<Mutex<Wifi<'static>>>, state: CaptiveStateHandle) -> CaptiveBundle {
     let dns = DnsHandle::start();
 
     let mut server = create_server(8192, true, 4, Some(Duration::from_secs(2)), false);
 
-    captive_api::mount(&mut server, wifi, nvs, state.clone());
+    captive_api::mount(&mut server, wifi, state.clone());
     serve_common_assets(&mut server);
 
     // Wildcard fallback — must be the last fn_handler call so the named

@@ -102,6 +102,9 @@ impl<'d> Wifi<'d> {
         self.wifi.start().unwrap();
     }
 
+    /// Switch to STA-only. Tears down the AP — used after the user's
+    /// creds successfully associate, so the device runs in client mode
+    /// for normal operation.
     pub fn start_sta(&mut self, creds: &WifiCredentials) {
         info!("Starting WiFi STA for '{}'", creds.ssid);
         self.start_with(Configuration::Client(sta_config(creds)));
@@ -109,9 +112,7 @@ impl<'d> Wifi<'d> {
 
     /// Update STA credentials in the running mixed (AP+STA) mode without
     /// stopping the radio — so the captive AP stays associated with the
-    /// user's phone while the STA half retries against the new SSID. The
-    /// supervisor only calls this from the captive arm; no state-machine
-    /// guard inside `Wifi`.
+    /// user's phone while the STA half retries against the new SSID.
     pub fn set_sta_creds_live(&mut self, creds: &WifiCredentials) {
         info!("Updating STA creds for '{}' (live)", creds.ssid);
         let ap = AccessPointConfiguration {

@@ -383,7 +383,7 @@ fn draw_graph(
 
 // --- Captive portal overlay ---
 
-fn draw_captive_portal(gb: &mut GraphBuf) {
+fn draw_captive_portal(gb: &mut GraphBuf, trying: bool) {
     let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
     let value = MonoTextStyle::new(&FONT_10X20, COLOR_VOLTAGE);
     let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
@@ -403,6 +403,18 @@ fn draw_captive_portal(gb: &mut GraphBuf) {
     Text::new(crate::wifi::AP_PASS, Point::new(20, 102), value)
         .draw(gb)
         .unwrap();
+
+    if trying {
+        // Top-right indicator so the AP creds remain readable while STA
+        // is mid-association on the user's submitted creds.
+        Text::new(
+            "Connecting...",
+            Point::new(190, 24),
+            MonoTextStyle::new(&FONT_6X10, COLOR_DISCHARGING),
+        )
+        .draw(gb)
+        .unwrap();
+    }
 }
 
 fn draw_connecting(gb: &mut GraphBuf) {
@@ -562,7 +574,11 @@ pub fn start(pins: LcdPins, sensor_data: Arc<Mutex<SensorData>>, status: NetStat
                     match net_status {
                         NetStatus::Captive => {
                             gb.clear();
-                            draw_captive_portal(&mut gb);
+                            draw_captive_portal(&mut gb, false);
+                        }
+                        NetStatus::CaptiveTrying => {
+                            gb.clear();
+                            draw_captive_portal(&mut gb, true);
                         }
                         NetStatus::Connecting => {
                             gb.clear();

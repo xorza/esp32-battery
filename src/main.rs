@@ -35,9 +35,12 @@ use crate::history_store::{HistoryStore, Persister};
 use crate::net::{Net, NetStatus, NetStatusHandle, Submission};
 
 /// How long `is_connected() == false` may persist before we tear down
-/// the host server and fall back to the captive AP. Covers initial
-/// DHCP/DNS at boot and brief link blips without flapping the SSID.
-const CAPTIVE_AFTER_DISCONNECT: Duration = Duration::from_secs(15);
+/// the host server and fall back to the captive AP. The AP is a fallback
+/// for "the saved creds no longer work" (rotated password, SSID gone),
+/// so we wait long enough that a real outage of the user's router (ISP
+/// reboot, scheduled maintenance) doesn't unnecessarily flap us into
+/// captive mode and break the dashboard for everyone on the LAN.
+const CAPTIVE_AFTER_DISCONNECT: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// How long the captive page's "Connecting..." spinner is allowed to
 /// run before we declare the submitted credentials a failure and let
@@ -111,6 +114,9 @@ fn main() {
     // Initial state: STA if we have creds, else captive. Bootstrap with
     // a host server eagerly when creds are present — `last_associated`
     // starts at boot time so the grace timer covers DHCP.
+    // Radio mode tracks Net: STA-only when we have saved creds, Mixed
+    // AP+STA when we don't (or after long STA outage). Per `wifi
+    // flow.md`.
     let mut net = match &creds {
         Some(c) => {
             wifi.lock().unwrap().start_sta(c);
@@ -118,16 +124,17 @@ fn main() {
             Net::Sta {
                 server,
                 last_associated: uptime(),
+                ever_connected: false,
             }
         }
         None => {
             wifi.lock().unwrap().start_ap_mixed(None);
             let state = Arc::new(Mutex::new(Submission::Idle));
-            let bundle = http::start_captive(nvs.clone(), wifi.clone(), state);
+            let bundle = http::start_captive(wifi.clone(), state);
             Net::Captive { bundle }
         }
     };
-    net_status.store(NetStatus::derive(&net, false));
+    net_status.store(NetStatus::derive(&net, false, uptime()));
 
     loop {
         thread::sleep(TICK_PERIOD);
@@ -166,13 +173,20 @@ fn main() {
                     let c = creds
                         .clone()
                         .expect("captive→sta transition requires creds");
+                    // Persist only after the new creds successfully
+                    // associated. Wrong creds therefore never overwrite
+                    // a known-good pair on flash.
+                    nvs_creds::save(&nvs, &c.ssid, &c.password);
                     drop(bundle);
+                    // Switch radio to STA-only — AP goes down now that
+                    // the user has a working network.
                     wifi.lock().unwrap().start_sta(&c);
                     let server =
                         http::start_main(sensor_data.clone(), event_log.clone(), nvs.clone());
                     Net::Sta {
                         server,
                         last_associated: now,
+                        ever_connected: true,
                     }
                 } else {
                     Net::Captive { bundle }
@@ -181,28 +195,34 @@ fn main() {
             Net::Sta {
                 server,
                 last_associated,
+                ever_connected,
             } => {
                 let connected = wifi.lock().unwrap().tick(creds.is_some());
                 if connected {
                     Net::Sta {
                         server,
                         last_associated: now,
+                        ever_connected: true,
                     }
                 } else if now.saturating_sub(last_associated) >= CAPTIVE_AFTER_DISCONNECT {
+                    // Long STA outage — bring up captive AP+STA so the
+                    // user can correct creds while STA keeps retrying.
                     drop(server);
                     wifi.lock().unwrap().start_ap_mixed(creds.as_ref());
                     let state = Arc::new(Mutex::new(Submission::Idle));
-                    let bundle = http::start_captive(nvs.clone(), wifi.clone(), state);
+                    let bundle = http::start_captive(wifi.clone(), state);
                     Net::Captive { bundle }
                 } else {
                     Net::Sta {
                         server,
                         last_associated,
+                        ever_connected,
                     }
                 }
             }
         };
 
-        net_status.store(NetStatus::derive(&net, wifi.lock().unwrap().is_connected()));
+        let connected_now = wifi.lock().unwrap().is_connected();
+        net_status.store(NetStatus::derive(&net, connected_now, uptime()));
     }
 }
