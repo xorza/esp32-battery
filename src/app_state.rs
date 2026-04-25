@@ -17,13 +17,13 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use esp_idf_svc::http::server::EspHttpServer;
-use log::info;
 
 use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::{Event, EventLog};
 pub use esp32_battery_logic::net_supervisor::NetStatus;
 use esp32_battery_logic::net_supervisor::Phase;
 
+use crate::captive_api::SaveStateHandle;
 use crate::clock::EspClock;
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
@@ -75,7 +75,20 @@ impl NetStatusHandle {
 }
 
 type ServerHandle = EspHttpServer<'static>;
-type CaptiveBundle = (EspHttpServer<'static>, DnsHandle);
+
+/// Server + DNS responder for the captive portal, plus the shared
+/// `SaveState` the supervisor reads/writes to coordinate the
+/// captive→host handoff with the captive page's `/status` poll.
+/// `server` and `dns` are held only for their `Drop` side effects (stop
+/// the server, kill the DNS thread); the supervisor never reads them.
+pub struct CaptiveBundle {
+    #[allow(dead_code)]
+    pub server: EspHttpServer<'static>,
+    #[allow(dead_code)]
+    pub dns: DnsHandle,
+    pub save_state: SaveStateHandle,
+}
+
 type EspPhase = Phase<ServerHandle, CaptiveBundle>;
 
 pub struct Supervisor {
@@ -102,26 +115,26 @@ impl Supervisor {
 
     /// Drain any credentials posted by the captive portal since the last
     /// tick, returning the most recent (later submissions supersede
-    /// earlier ones — same "latest wins" semantics as the previous
-    /// mailbox). On a hit, resets the phase to `Bootstrap` so the
-    /// post-reconnect grace counter starts from zero.
+    /// earlier ones). The captive phase stays alive — main loop applies
+    /// the new creds via a live STA-config update (so the AP doesn't
+    /// blip) and waits for the STA to associate before transitioning to
+    /// host mode.
     pub fn take_pending_creds(&mut self) -> Option<WifiCredentials> {
         let mut latest = None;
         while let Ok(c) = self.creds_rx.try_recv() {
             latest = Some(c);
         }
-        if latest.is_some() {
-            info!("Applying credentials submitted via captive portal");
-            self.on_creds_applied();
-        }
         latest
     }
 
-    /// New credentials applied to the WiFi hardware (boot load, or
-    /// captive `/save`). Drops any live server and resets to `Bootstrap`
-    /// so the supervisor begins the grace count from zero.
-    pub fn on_creds_applied(&mut self) {
-        self.replace_phase(Phase::bootstrap());
+    /// Snapshot the SaveState handle when the supervisor is in `Captive`.
+    /// Returns an owned `Arc` clone so the caller can use it after
+    /// dropping the supervisor borrow and re-borrowing for `on_tick_*`.
+    pub fn captive_save_state(&self) -> Option<SaveStateHandle> {
+        match &self.phase {
+            Phase::Captive { bundle } => Some(bundle.save_state.clone()),
+            _ => None,
+        }
     }
 
     pub fn on_tick_connected(&mut self, build_host: impl FnOnce() -> ServerHandle) {

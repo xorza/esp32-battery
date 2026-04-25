@@ -6,10 +6,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use log::info;
 
+use crate::app_state::CaptiveBundle;
 use crate::captive_api;
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
@@ -21,12 +21,13 @@ pub fn start(
     creds_tx: Sender<WifiCredentials>,
     nvs: Arc<EspNvs<NvsDefault>>,
     wifi: Arc<Mutex<Wifi<'static>>>,
-) -> (EspHttpServer<'static>, DnsHandle) {
-    let dns_handle = DnsHandle::start();
+) -> CaptiveBundle {
+    let dns = DnsHandle::start();
 
     let mut server = create_server(8192, true, 4, Some(Duration::from_secs(2)), false);
 
-    captive_api::mount(&mut server, wifi, creds_tx, nvs);
+    let save_state = captive_api::new_save_state();
+    captive_api::mount(&mut server, wifi, creds_tx, nvs, save_state.clone());
     serve_common_assets(&mut server);
 
     // Wildcard fallback — must be the last fn_handler call so the named
@@ -42,5 +43,9 @@ pub fn start(
 
     info!("Captive portal started");
 
-    (server, dns_handle)
+    CaptiveBundle {
+        server,
+        dns,
+        save_state,
+    }
 }

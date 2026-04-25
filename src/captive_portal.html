@@ -82,6 +82,44 @@
             }
             scan();
 
+            function pollStatus(submitBtn, msgEl) {
+                var x = new XMLHttpRequest();
+                x.timeout = 5000;
+                x.open("GET", "/status");
+                x.onload = function () {
+                    if (x.status !== 200) {
+                        // Server reachable but errored — keep polling.
+                        setTimeout(function () { pollStatus(submitBtn, msgEl); }, 1500);
+                        return;
+                    }
+                    var s;
+                    try { s = JSON.parse(x.responseText).state; }
+                    catch (e) { s = "trying"; }
+                    if (s === "connected") {
+                        msgEl.className = "msg ok";
+                        msgEl.textContent = "Connected — closing...";
+                        // Captive WebView popups honor window.close(); regular
+                        // browsers fall back to about:blank.
+                        setTimeout(function () {
+                            window.close();
+                            window.location.href = "about:blank";
+                        }, 800);
+                    } else if (s === "failed") {
+                        msgEl.className = "msg err";
+                        msgEl.textContent = "Could not connect — check the password and try again.";
+                        submitBtn.disabled = false;
+                    } else {
+                        // idle / trying — keep polling
+                        setTimeout(function () { pollStatus(submitBtn, msgEl); }, 1000);
+                    }
+                };
+                x.onerror = x.ontimeout = function () {
+                    // AP may be momentarily unreachable; back off and retry.
+                    setTimeout(function () { pollStatus(submitBtn, msgEl); }, 2000);
+                };
+                x.send();
+            }
+
             document.getElementById("f").onsubmit = function (e) {
                 e.preventDefault();
                 var m = document.getElementById("msg");
@@ -103,15 +141,9 @@
                 x.onload = function () {
                     var m = document.getElementById("msg");
                     if (x.status === 200) {
-                        m.className = "msg ok";
-                        m.textContent = "Saved! Connecting...";
-                        // Dismiss the captive portal popup. window.close() works in
-                        // Android/iOS captive WebViews; about:blank is a fallback for
-                        // regular browsers where close() is a no-op.
-                        setTimeout(function () {
-                            window.close();
-                            window.location.href = "about:blank";
-                        }, 1200);
+                        m.className = "msg progress";
+                        m.textContent = "Connecting...";
+                        pollStatus(b, m);
                     } else {
                         m.className = "msg err";
                         m.textContent = "Error: " + x.responseText;

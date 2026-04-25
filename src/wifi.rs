@@ -140,6 +140,38 @@ impl<'d> Wifi<'d> {
         self.mode = Mode::Sta;
     }
 
+    /// Update STA credentials in the running mixed (AP+STA) mode without
+    /// stopping the radio — so the captive AP stays associated with the
+    /// user's phone while the STA half retries against the new SSID. Should
+    /// only be called while already in `ApMixed` mode; panics otherwise.
+    pub fn set_sta_creds_live(&mut self, creds: &WifiCredentials) {
+        assert!(
+            matches!(self.mode, Mode::ApMixed { .. }),
+            "set_sta_creds_live requires ApMixed mode"
+        );
+        info!("Updating STA creds for '{}' (live)", creds.ssid);
+        let ap = AccessPointConfiguration {
+            ssid: AP_SSID.try_into().unwrap(),
+            password: AP_PASS.try_into().unwrap(),
+            auth_method: esp_idf_svc::wifi::AuthMethod::WPA2Personal,
+            channel: 1,
+            max_connections: 4,
+            ..Default::default()
+        };
+        let sta = sta_config(creds);
+        self.wifi
+            .set_configuration(&Configuration::Mixed(sta, ap))
+            .unwrap();
+        self.mode = Mode::ApMixed {
+            has_sta_creds: true,
+        };
+        // Drop the old (failing) association attempt; kick off a fresh
+        // connect against the new creds. Errors are non-fatal — the
+        // supervisor's per-tick reconnect will retry on its own.
+        let _ = self.wifi.disconnect();
+        let _ = self.wifi.connect();
+    }
+
     /// Switch to mixed AP+STA mode. AP serves captive portal, STA keeps retrying.
     pub fn start_ap_mixed(&mut self, creds: Option<&WifiCredentials>) {
         info!("Starting AP: {}", AP_SSID);
