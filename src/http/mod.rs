@@ -5,11 +5,12 @@
 mod captive;
 mod main_server;
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use esp_idf_hal::io::Write;
 use esp_idf_svc::http::server::{
-    Configuration as HttpConfig, EspHttpConnection, EspHttpServer, Request,
+    Configuration as HttpConfig, EspHttpConnection, EspHttpServer, Method, Request,
 };
 use esp_idf_svc::sys::EspError;
 use esp_idf_svc::tls::X509;
@@ -40,6 +41,7 @@ pub(crate) fn create_server(
     EspHttpServer::new(&HttpConfig {
         stack_size,
         max_open_sockets: max_sockets,
+        max_uri_handlers: 16,
         uri_match_wildcard: wildcard,
         session_timeout: Duration::from_secs(2),
         lru_purge_enable: true,
@@ -58,33 +60,31 @@ pub(crate) fn create_server(
 
 pub(crate) fn serve_static(
     server: &mut EspHttpServer<'static>,
-    path: &str,
+    path: &'static str,
     content_type: &'static str,
     cache: &'static str,
     body: &'static [u8],
     gzipped: bool,
 ) {
-    server
-        .fn_handler(path, esp_idf_svc::http::Method::Get, move |req| {
-            let headers: &[(&str, &str)] = if gzipped {
-                &[
-                    ("Content-Type", content_type),
-                    ("Content-Encoding", "gzip"),
-                    ("Cache-Control", cache),
-                    ("Connection", "close"),
-                ]
-            } else {
-                &[
-                    ("Content-Type", content_type),
-                    ("Cache-Control", cache),
-                    ("Connection", "close"),
-                ]
-            };
-            let mut resp = req.into_response(200, None, headers).map_err(|e| e.0)?;
-            resp.write_all(body).map_err(|e| e.0)?;
-            Ok::<(), EspError>(())
-        })
-        .unwrap();
+    mount_get(server, path, move |req| {
+        let headers: &[(&str, &str)] = if gzipped {
+            &[
+                ("Content-Type", content_type),
+                ("Content-Encoding", "gzip"),
+                ("Cache-Control", cache),
+                ("Connection", "close"),
+            ]
+        } else {
+            &[
+                ("Content-Type", content_type),
+                ("Cache-Control", cache),
+                ("Connection", "close"),
+            ]
+        };
+        let mut resp = req.into_response(200, None, headers).map_err(|e| e.0)?;
+        resp.write_all(body).map_err(|e| e.0)?;
+        Ok::<(), EspError>(())
+    });
 }
 
 pub(crate) fn serve_common_assets(server: &mut EspHttpServer<'static>) {
@@ -148,17 +148,45 @@ pub(crate) fn read_to_buf(
     Ok(filled)
 }
 
-/// Send a `Connection: close` plaintext response with the given status and body.
+/// Send a `Connection: close` response with the given status, content-type,
+/// and body.
+fn body_response(
+    req: Request<&mut EspHttpConnection>,
+    status: u16,
+    content_type: Option<&'static str>,
+    body: &[u8],
+) -> Result<(), EspError> {
+    let mut headers: heapless::Vec<(&'static str, &'static str), 2> = heapless::Vec::new();
+    if let Some(ct) = content_type {
+        headers.push(("Content-Type", ct)).unwrap();
+    }
+    headers.push(("Connection", "close")).unwrap();
+    let mut resp = req
+        .into_response(status, None, &headers)
+        .map_err(|e| e.0)?;
+    resp.write_all(body).map_err(|e| e.0)?;
+    Ok(())
+}
+
+/// Plain-text response (no explicit Content-Type — httpd defaults to text/html
+/// which browsers render fine for short status messages).
 pub(crate) fn text_response(
     req: Request<&mut EspHttpConnection>,
     status: u16,
     body: &[u8],
 ) -> Result<(), EspError> {
-    let mut resp = req
-        .into_response(status, None, &[("Connection", "close")])
-        .map_err(|e| e.0)?;
-    resp.write_all(body).map_err(|e| e.0)?;
-    Ok(())
+    body_response(req, status, None, body)
+}
+
+/// JSON response with a caller-chosen status — used by handlers that need
+/// non-200 outcomes (OTA error replies, etc). For the common 200 path with
+/// streaming serialization, use `json_response`.
+pub(crate) fn json_reply(
+    req: Request<&mut EspHttpConnection>,
+    status: u16,
+    body: &[u8],
+) -> Result<(), EspError> {
+    body_response(req, status, Some("application/json"), body)
 }
 
 /// Serialize a value into `buf` and write it as `application/json`. The
@@ -195,4 +223,56 @@ where
         .map_err(|e| e.0)?;
     resp.write_all(&buf[..len]).map_err(|e| e.0)?;
     Ok(())
+}
+
+/// Heap-allocated, mutex-guarded scratch buffer for JSON handlers. Sized at
+/// the type level so each handler picks its own response budget. The buffer
+/// is allocated once at handler-mount time and reused across requests, so
+/// concurrent calls serialize on the lock — fine because esp-idf's httpd
+/// already serializes work to a single task by default.
+pub(crate) struct JsonBuf<const N: usize>(Mutex<Box<[u8; N]>>);
+
+impl<const N: usize> JsonBuf<N> {
+    pub fn new() -> Self {
+        Self(Mutex::new(Box::new([0u8; N])))
+    }
+
+    pub fn with<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let mut guard = self.0.lock().unwrap();
+        let buf: &mut [u8] = &mut **guard;
+        f(buf)
+    }
+}
+
+/// Register a URI handler, panicking with the URI in the message on failure.
+/// Replaces the bare `.unwrap()` on `fn_handler` so a startup failure (URI
+/// table full, bad URI string) points at the offending route.
+pub(crate) fn mount_uri<E, F>(
+    server: &mut EspHttpServer<'static>,
+    uri: &'static str,
+    method: Method,
+    f: F,
+) where
+    F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), E> + Send + 'static,
+    E: core::fmt::Debug,
+{
+    server
+        .fn_handler(uri, method, f)
+        .unwrap_or_else(|e| panic!("failed to mount {} {:?}: {:?}", uri, method, e));
+}
+
+pub(crate) fn mount_get<E, F>(server: &mut EspHttpServer<'static>, uri: &'static str, f: F)
+where
+    F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), E> + Send + 'static,
+    E: core::fmt::Debug,
+{
+    mount_uri(server, uri, Method::Get, f);
+}
+
+pub(crate) fn mount_post<E, F>(server: &mut EspHttpServer<'static>, uri: &'static str, f: F)
+where
+    F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), E> + Send + 'static,
+    E: core::fmt::Debug,
+{
+    mount_uri(server, uri, Method::Post, f);
 }

@@ -3,8 +3,6 @@
 //! Wire format preserves the prior hand-rolled shape so the frontend is unchanged.
 //! History rows use a 5-tuple that serializes as `[t, v, c1, c2, online]`.
 
-use std::sync::Mutex;
-
 use esp_idf_svc::http::server::EspHttpServer;
 use log::debug;
 use serde::Serialize;
@@ -15,7 +13,7 @@ use esp32_battery_logic::data::Sample;
 
 use crate::app_state::SensorDataHandle;
 use crate::clock::uptime_s;
-use crate::http::json_response;
+use crate::http::{JsonBuf, json_response, mount_get};
 use crate::wifi::sta_rssi;
 
 #[derive(Serialize)]
@@ -91,12 +89,10 @@ pub struct ApiResponse<'a> {
 pub const RESPONSE_BUF_SIZE: usize = 16_384;
 
 pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHandle) {
-    let json_buf = Mutex::new(Box::new([0u8; RESPONSE_BUF_SIZE]));
+    let json_buf: JsonBuf<RESPONSE_BUF_SIZE> = JsonBuf::new();
 
-    server
-        .fn_handler("/api", esp_idf_svc::http::Method::Get, move |req| {
-            let mut guard = json_buf.lock().unwrap();
-            let buf: &mut [u8] = &mut **guard;
+    mount_get(server, "/api", move |req| {
+        json_buf.with(|buf| {
             json_response(req, buf, |buf| {
                 // Sensor-data lock held only through serialization — history
                 // is borrowed, not cloned. Lock drops at closure end, before
@@ -133,5 +129,5 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHandle)
                 result
             })
         })
-        .unwrap();
+    });
 }

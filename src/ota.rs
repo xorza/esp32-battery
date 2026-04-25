@@ -1,13 +1,13 @@
 use std::time::{Duration, Instant};
 
-use esp_idf_hal::io::Write;
 use esp_idf_svc::http::server::{EspHttpConnection, EspHttpServer};
 use esp_idf_svc::ota::EspOta;
-use esp_idf_svc::sys::EspError;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use log::{info, warn};
 use serde::Serialize;
 use sha2::Sha256;
+
+use crate::http::{json_reply, mount_post};
 
 /// Wall-clock timeout for the entire OTA upload. A legitimate 1.5 MB firmware
 /// over the local network takes a few seconds; anything approaching this is
@@ -37,25 +37,6 @@ fn decode_key() -> [u8; 32] {
             .expect("OTA_KEY must be valid hex");
     }
     out
-}
-
-fn reply(
-    req: esp_idf_svc::http::server::Request<&mut EspHttpConnection>,
-    status: u16,
-    body: &[u8],
-) -> Result<(), EspError> {
-    let mut resp = req
-        .into_response(
-            status,
-            None,
-            &[
-                ("Content-Type", "application/json"),
-                ("Connection", "close"),
-            ],
-        )
-        .map_err(|e| e.0)?;
-    resp.write_all(body).map_err(|e| e.0)?;
-    Ok(())
 }
 
 fn handle_upload(
@@ -124,25 +105,22 @@ fn handle_upload(
 }
 
 pub fn mount(server: &mut EspHttpServer<'static>) {
-    server
-        .fn_handler("/ota/upload", esp_idf_svc::http::Method::Post, |mut req| {
-            let mut buf = [0u8; 128];
-            match handle_upload(&mut req) {
-                Ok(total) => {
-                    info!("OTA: received {} bytes, signature valid", total);
-                    let len =
-                        serde_json_core::to_slice(&OkResponse { ok: true }, &mut buf).unwrap();
-                    let _ = reply(req, 200, &buf[..len]);
-                    crate::reboot::reboot_after("OTA: rebooting now");
-                }
-                Err(msg) => {
-                    warn!("OTA: {}", msg);
-                    let len =
-                        serde_json_core::to_slice(&ErrorResponse { error: msg }, &mut buf).unwrap();
-                    let _ = reply(req, 403, &buf[..len]);
-                }
+    mount_post(server, "/ota/upload", |mut req| {
+        let mut buf = [0u8; 128];
+        match handle_upload(&mut req) {
+            Ok(total) => {
+                info!("OTA: received {} bytes, signature valid", total);
+                let len = serde_json_core::to_slice(&OkResponse { ok: true }, &mut buf).unwrap();
+                let _ = json_reply(req, 200, &buf[..len]);
+                crate::reboot::reboot_after("OTA: rebooting now");
             }
-            Ok::<(), esp_idf_svc::sys::EspError>(())
-        })
-        .unwrap();
+            Err(msg) => {
+                warn!("OTA: {}", msg);
+                let len =
+                    serde_json_core::to_slice(&ErrorResponse { error: msg }, &mut buf).unwrap();
+                let _ = json_reply(req, 403, &buf[..len]);
+            }
+        }
+        Ok::<(), esp_idf_svc::sys::EspError>(())
+    });
 }

@@ -1,7 +1,8 @@
 //! Captive-portal API: WiFi scan, credential save, captive-detection probe.
 
+use std::sync::Mutex;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
@@ -10,7 +11,7 @@ use log::info;
 
 use esp32_battery_logic::form;
 
-use crate::http::{json_response, read_to_buf, text_response};
+use crate::http::{JsonBuf, json_response, mount_get, mount_post, read_to_buf, text_response};
 use crate::nvs_creds::{self, WifiCredentials};
 use crate::wifi::Wifi;
 
@@ -23,21 +24,18 @@ pub fn mount(
     creds_tx: Sender<WifiCredentials>,
     nvs: Arc<EspNvs<NvsDefault>>,
 ) {
-    let scan_buf = Mutex::new(Box::new([0u8; SCAN_BUF_SIZE]));
-    server
-        .fn_handler("/scan", esp_idf_svc::http::Method::Get, move |req| {
-            let mut guard = scan_buf.lock().unwrap();
-            let buf: &mut [u8] = &mut **guard;
+    let scan_buf: JsonBuf<SCAN_BUF_SIZE> = JsonBuf::new();
+    mount_get(server, "/scan", move |req| {
+        scan_buf.with(|buf| {
             json_response(req, buf, |buf| {
                 let entries = wifi.lock().unwrap().scan();
                 let rows: Vec<(&str, i8)> = entries.iter().map(|(s, r)| (s.as_str(), *r)).collect();
                 serde_json_core::to_slice(&rows, buf)
             })
         })
-        .unwrap();
+    });
 
-    server
-        .fn_handler("/save", esp_idf_svc::http::Method::Post, move |mut req| {
+    mount_post(server, "/save", move |mut req| {
             let mut body_buf = [0u8; 256];
             let filled = read_to_buf(&mut req, &mut body_buf)?;
             let body = std::str::from_utf8(&body_buf[..filled]).unwrap_or("");
@@ -70,22 +68,19 @@ pub fn mount(
             info!("Captive: queued new credentials for live STA reconnect");
             text_response(req, 200, b"OK")?;
             Ok::<(), EspError>(())
-        })
-        .unwrap();
+    });
 
     // Android captive portal detection: expects 204, gets 302 → triggers popup.
-    server
-        .fn_handler("/generate_204", esp_idf_svc::http::Method::Get, |req| {
-            req.into_response(
-                302,
-                None,
-                &[
-                    ("Location", "http://192.168.71.1/"),
-                    ("Connection", "close"),
-                ],
-            )
-            .map_err(|e| e.0)?;
-            Ok::<(), EspError>(())
-        })
-        .unwrap();
+    mount_get(server, "/generate_204", |req| {
+        req.into_response(
+            302,
+            None,
+            &[
+                ("Location", "http://192.168.71.1/"),
+                ("Connection", "close"),
+            ],
+        )
+        .map_err(|e| e.0)?;
+        Ok::<(), EspError>(())
+    });
 }

@@ -57,24 +57,22 @@ pub fn snapshot() -> Vec<u8> {
 }
 
 pub fn mount(server: &mut EspHttpServer<'static>) {
-    server
-        .fn_handler("/api/log", esp_idf_svc::http::Method::Get, |req| {
-            let body = snapshot();
-            let mut resp = req
-                .into_response(
-                    200,
-                    None,
-                    &[
-                        ("Content-Type", "text/plain; charset=utf-8"),
-                        ("Cache-Control", "no-store"),
-                        ("Connection", "close"),
-                    ],
-                )
-                .map_err(|e| e.0)?;
-            resp.write_all(&body).map_err(|e| e.0)?;
-            Ok::<(), EspError>(())
-        })
-        .unwrap();
+    crate::http::mount_get(server, "/api/log", |req| {
+        let body = snapshot();
+        let mut resp = req
+            .into_response(
+                200,
+                None,
+                &[
+                    ("Content-Type", "text/plain; charset=utf-8"),
+                    ("Cache-Control", "no-store"),
+                    ("Connection", "close"),
+                ],
+            )
+            .map_err(|e| e.0)?;
+        resp.write_all(&body).map_err(|e| e.0)?;
+        Ok::<(), EspError>(())
+    });
 }
 
 unsafe extern "C" fn vprintf_hook(fmt: *const c_char, args: sys::va_list) -> i32 {

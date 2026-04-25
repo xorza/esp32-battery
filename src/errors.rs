@@ -9,8 +9,6 @@
 //! }
 //! ```
 
-use std::sync::Mutex;
-
 use esp_idf_svc::http::server::EspHttpServer;
 use serde::Serialize;
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -18,7 +16,7 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use esp32_battery_logic::error_log::{Event, EventLog};
 
 use crate::app_state::EventLogHandle;
-use crate::http::json_response;
+use crate::http::{JsonBuf, json_response, mount_get};
 
 /// EventLog is bounded (32 entries × ~40 chars + ~30 small counters), well
 /// under 4 KiB even with worst-case float-ish formatting.
@@ -72,12 +70,10 @@ struct ErrorsResponse<'a> {
 }
 
 pub fn mount(server: &mut EspHttpServer<'static>, event_log: EventLogHandle) {
-    let json_buf = Mutex::new(Box::new([0u8; RESPONSE_BUF_SIZE]));
+    let json_buf: JsonBuf<RESPONSE_BUF_SIZE> = JsonBuf::new();
 
-    server
-        .fn_handler("/api/errors", esp_idf_svc::http::Method::Get, move |req| {
-            let mut guard = json_buf.lock().unwrap();
-            let buf: &mut [u8] = &mut **guard;
+    mount_get(server, "/api/errors", move |req| {
+        json_buf.with(|buf| {
             json_response(req, buf, |buf| {
                 let log = event_log.lock().unwrap();
                 let response = ErrorsResponse {
@@ -88,5 +84,5 @@ pub fn mount(server: &mut EspHttpServer<'static>, event_log: EventLogHandle) {
                 serde_json_core::to_slice(&response, buf)
             })
         })
-        .unwrap();
+    });
 }
