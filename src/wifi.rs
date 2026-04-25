@@ -56,6 +56,29 @@ pub fn sta_rssi() -> i32 {
     }
 }
 
+/// Current STA IPv4 address, or `None` when not associated / DHCP not
+/// yet complete. Reads via the global `esp_netif` registry (key
+/// `WIFI_STA_DEF`) — same "no `Wifi` handle needed" pattern as
+/// `sta_rssi`, so the LCD thread can poll it without touching the
+/// supervisor's state.
+pub fn sta_ip() -> Option<std::net::Ipv4Addr> {
+    let netif = unsafe { esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr()) };
+    if netif.is_null() {
+        return None;
+    }
+    let mut info: esp_idf_svc::sys::esp_netif_ip_info_t = unsafe { std::mem::zeroed() };
+    if unsafe { esp_idf_svc::sys::esp_netif_get_ip_info(netif, &mut info) } != 0 {
+        return None;
+    }
+    if info.ip.addr == 0 {
+        return None;
+    }
+    // esp_ip4_addr_t::addr is the 4 octets packed little-endian (net byte
+    // order), so to_le_bytes() yields [a, b, c, d] in dotted-quad order.
+    let [a, b, c, d] = info.ip.addr.to_le_bytes();
+    Some(std::net::Ipv4Addr::new(a, b, c, d))
+}
+
 fn sta_config(creds: &WifiCredentials) -> ClientConfiguration {
     ClientConfiguration {
         ssid: creds.ssid.as_str().try_into().unwrap(),

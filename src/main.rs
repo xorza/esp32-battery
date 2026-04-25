@@ -106,7 +106,12 @@ fn main() {
     ina::start(board.i2c, sensor_data.clone(), recorder);
 
     #[cfg(feature = "lcd")]
-    lcd::start(board.lcd, sensor_data.clone(), net_status.clone());
+    lcd::start(
+        board.lcd,
+        sensor_data.clone(),
+        event_log.clone(),
+        net_status.clone(),
+    );
 
     // Bootstrap: STA if we have creds, else captive. Per `wifi flow.md`.
     let mut net = match boot_creds {

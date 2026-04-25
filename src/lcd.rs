@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp32_battery_logic::data::{Sample, SensorData};
+use esp32_battery_logic::data::SensorData;
+use esp32_battery_logic::error_log::EventLog;
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Point, Size};
@@ -11,7 +12,7 @@ use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::ascii::{FONT_5X8, FONT_6X10, FONT_10X20};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::Rectangle;
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, Triangle};
 use embedded_graphics::text::Text;
 use esp_idf_hal::gpio::{AnyIOPin, PinDriver};
 use esp_idf_hal::ledc::{LedcDriver, LedcTimerDriver, config::TimerConfig};
@@ -40,13 +41,13 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const COLOR_BG: Rgb565 = Rgb565::BLACK;
 const COLOR_LABEL: Rgb565 = Rgb565::new(18, 36, 18);
 const COLOR_VOLTAGE: Rgb565 = Rgb565::new(0, 63, 0);
-const COLOR_BAT_CURRENT: Rgb565 = Rgb565::new(0, 57, 31); // cyan, matches #00e5ff
 const COLOR_PSU_CURRENT: Rgb565 = Rgb565::new(31, 38, 0); // orange, matches #ff9800
 const COLOR_POWER: Rgb565 = Rgb565::new(31, 20, 0);
-const COLOR_GRID: Rgb565 = Rgb565::new(4, 8, 4);
 const COLOR_CHARGING: Rgb565 = Rgb565::new(6, 55, 10); // green
 const COLOR_DISCHARGING: Rgb565 = Rgb565::new(31, 28, 0); // orange
 const COLOR_IDLE: Rgb565 = Rgb565::new(18, 36, 18); // light gray-green
+const COLOR_IP: Rgb565 = Rgb565::new(0, 57, 31); // cyan
+const COLOR_WARNING: Rgb565 = Rgb565::RED;
 /// Dead-band below which the battery is considered idle (|I| < 50 mA).
 const BATTERY_IDLE_THRESHOLD_A: f32 = 0.05;
 
@@ -194,191 +195,57 @@ fn draw_value<D: DrawTarget<Color = Rgb565>>(
     fb.blit(display, Point::new(screen_pos.x, screen_pos.y - 16));
 }
 
-fn map_to_y(val: f32, min: f32, max: f32, h: u32) -> i32 {
-    if (max - min).abs() < 0.001 {
-        return h as i32 / 2;
-    }
-    let normalized = (val - min) / (max - min);
-    let y = (1.0 - normalized) * (h as f32 - 1.0);
-    y.clamp(0.0, h as f32 - 1.0) as i32
-}
+// --- Host-mode rendering ---
 
-fn draw_line(gb: &mut GraphBuf, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb565, dotted: bool) {
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    let mut x = x0;
-    let mut y = y0;
-    let mut step = 0;
-    loop {
-        if !dotted || step % 6 < 3 {
-            gb.set_pixel(x, y, color);
-            if !dotted {
-                gb.set_pixel(x, y + 1, color);
-            }
-        }
-        if x == x1 && y == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x += sx;
-            step += 1;
-        }
-        if e2 <= dx {
-            err += dx;
-            y += sy;
-        }
-    }
-}
-
-// --- Graph rendering ---
-
-const COLOR_OFFLINE: Rgb565 = Rgb565::new(2, 0, 0); // very dim red background
-
-fn draw_graph(
+fn draw_host(
     gb: &mut GraphBuf,
-    history: &[Sample],
-    interval: u32,
-    buf: &mut heapless::String<16>,
+    ip: Option<std::net::Ipv4Addr>,
+    has_errors: bool,
+    buf: &mut heapless::String<32>,
 ) {
-    let n = history.len();
-    if n < 2 {
-        return;
-    }
+    let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
+    let value = MonoTextStyle::new(&FONT_10X20, COLOR_IP);
 
-    // Gap threshold: if time between samples exceeds 3x the interval, interpolate
-    let gap_threshold = interval * 3;
-
-    // Compute ranges
-    let mut v_min = f32::MAX;
-    let mut v_max = f32::MIN;
-    let mut c_min = f32::MAX;
-    let mut c_max = f32::MIN;
-
-    for s in history {
-        v_min = v_min.min(s.voltage);
-        v_max = v_max.max(s.voltage);
-        c_min = c_min.min(s.battery_current).min(s.ps_current);
-        c_max = c_max.max(s.battery_current).max(s.ps_current);
-    }
-
-    let v_margin = (v_max - v_min).max(0.2) * 0.1;
-    v_min -= v_margin;
-    v_max += v_margin;
-    c_min = c_min.min(0.0);
-    c_max = c_max.max(0.0);
-    let c_margin = (c_max - c_min).max(0.01) * 0.1;
-    c_min -= c_margin;
-    c_max += c_margin;
-
-    // Time-proportional X mapping
-    let t0 = history[0].time_s as f32;
-    let t1 = history[n - 1].time_s as f32;
-    let t_range = (t1 - t0).max(1.0);
-    // History is guaranteed chronologically ordered by SensorData, so
-    // (t - t0) ∈ [0, t_range] and the cast result fits in [0, GRAPH_W-1].
-    let time_to_x = |t: u32| -> i32 { ((t as f32 - t0) / t_range * (GRAPH_W as f32 - 1.0)) as i32 };
-
-    // Power-offline shading (drawn first so grid/labels render on top)
-    // Build a per-column flag array, then fill once.
-    let mut offline_cols = [false; GRAPH_W as usize];
-    for i in 0..n {
-        if history[i].power_online < 0.99 {
-            let x0 = if i > 0 {
-                ((time_to_x(history[i - 1].time_s) + time_to_x(history[i].time_s)) / 2) as usize
-            } else {
-                0
-            };
-            let x1 = if i < n - 1 {
-                ((time_to_x(history[i].time_s) + time_to_x(history[i + 1].time_s)) / 2) as usize
-            } else {
-                GRAPH_W as usize
-            };
-            for col in &mut offline_cols[x0..x1.min(GRAPH_W as usize)] {
-                *col = true;
-            }
+    Text::new("IP", Point::new(20, 24), label).draw(gb).unwrap();
+    buf.clear();
+    match ip {
+        Some(addr) => {
+            let _ = write!(buf, "{addr}");
+        }
+        None => {
+            let _ = write!(buf, "--");
         }
     }
-    for y in 0..GRAPH_H as usize {
-        let row = y * GRAPH_W as usize;
-        for (x, &offline) in offline_cols.iter().enumerate() {
-            if offline {
-                gb.pixels[row + x] = COLOR_OFFLINE;
-            }
-        }
+    Text::new(buf, Point::new(20, 56), value).draw(gb).unwrap();
+
+    if has_errors {
+        draw_warning_triangle(gb);
     }
+}
 
-    // Grid lines
-    for i in 1..4 {
-        let gy = (GRAPH_H as i32 * i) / 4;
-        for gx in (0..GRAPH_W as i32).step_by(4) {
-            gb.set_pixel(gx, gy, COLOR_GRID);
-        }
-    }
-
-    // Scale labels — voltage on left, current on right
-    // Inset from top/bottom to avoid rounded screen corners
-    let label_top_y = 10;
-    let label_bot_y = GRAPH_H as i32 - 4;
-    let label_left_x = 12; // inset from left rounded corner
-    let scale_style = MonoTextStyle::new(&FONT_5X8, COLOR_LABEL);
-    buf.clear();
-    let _ = write!(buf, "{:.1}V", v_max);
-    Text::new(buf, Point::new(label_left_x, label_top_y), scale_style)
-        .draw(gb)
-        .unwrap();
-    buf.clear();
-    let _ = write!(buf, "{:.1}V", v_min);
-    Text::new(buf, Point::new(label_left_x, label_bot_y), scale_style)
-        .draw(gb)
-        .unwrap();
-
-    buf.clear();
-    let _ = write!(buf, "{:.2}A", c_max);
-    let right_x = GRAPH_W as i32 - buf.len() as i32 * 5 - 12;
-    Text::new(buf, Point::new(right_x, label_top_y), scale_style)
-        .draw(gb)
-        .unwrap();
-    buf.clear();
-    let _ = write!(buf, "{:.2}A", c_min);
-    let right_x = GRAPH_W as i32 - buf.len() as i32 * 5 - 12;
-    Text::new(buf, Point::new(right_x, label_bot_y), scale_style)
-        .draw(gb)
-        .unwrap();
-
-    // Traces: voltage on its own scale, both currents share a scale
-    let margin = 2i32;
-    let plot_h = GRAPH_H - margin as u32 * 2;
-
-    let traces: [(f32, f32, Rgb565); 3] = [
-        (v_min, v_max, COLOR_VOLTAGE),
-        (c_min, c_max, COLOR_BAT_CURRENT),
-        (c_min, c_max, COLOR_PSU_CURRENT),
-    ];
-
-    for i in 1..n {
-        let prev = history[i - 1];
-        let curr = history[i];
-        let x0 = time_to_x(prev.time_s);
-        let x1 = time_to_x(curr.time_s);
-        let dt = curr.time_s.saturating_sub(prev.time_s);
-
-        // For large gaps, draw a dotted interpolation line instead of solid
-        let is_gap = dt > gap_threshold;
-
-        let vals_prev = [prev.voltage, prev.battery_current, prev.ps_current];
-        let vals_curr = [curr.voltage, curr.battery_current, curr.ps_current];
-
-        for (j, &(lo, hi, color)) in traces.iter().enumerate() {
-            let y0 = margin + map_to_y(vals_prev[j], lo, hi, plot_h);
-            let y1 = margin + map_to_y(vals_curr[j], lo, hi, plot_h);
-            draw_line(gb, x0, y0, x1, y1, color, is_gap);
-        }
-    }
+/// Filled red warning triangle with a black "!" inside, anchored to the
+/// right side of the lower region. Drawn only when the event log holds
+/// at least one entry — a hint that the user should check `/api/errors`.
+fn draw_warning_triangle(gb: &mut GraphBuf) {
+    let cx = GRAPH_W as i32 - 50;
+    let cy_top = 20;
+    let cy_bot = 84;
+    let half = 32;
+    Triangle::new(
+        Point::new(cx, cy_top),
+        Point::new(cx - half, cy_bot),
+        Point::new(cx + half, cy_bot),
+    )
+    .into_styled(PrimitiveStyle::with_fill(COLOR_WARNING))
+    .draw(gb)
+    .unwrap();
+    Text::new(
+        "!",
+        Point::new(cx - 5, cy_bot - 14),
+        MonoTextStyle::new(&FONT_10X20, Rgb565::BLACK),
+    )
+    .draw(gb)
+    .unwrap();
 }
 
 // --- Captive portal overlay ---
@@ -426,7 +293,12 @@ fn draw_connecting(gb: &mut GraphBuf) {
 
 // --- Main thread ---
 
-pub fn start(pins: LcdPins, sensor_data: Arc<Mutex<SensorData>>, status: NetStatusHandle) {
+pub fn start(
+    pins: LcdPins,
+    sensor_data: Arc<Mutex<SensorData>>,
+    event_log: Arc<Mutex<EventLog>>,
+    status: NetStatusHandle,
+) {
     thread::Builder::new()
         .stack_size(16384)
         .spawn(move || {
@@ -487,27 +359,34 @@ pub fn start(pins: LcdPins, sensor_data: Arc<Mutex<SensorData>>, status: NetStat
 
             let mut fb = FieldBuf::new();
             let mut gb = GraphBuf::new();
-            let mut prev_status = NetStatus::Host;
+            let mut prev_status = NetStatus::Connecting;
+            let mut prev_ip: Option<std::net::Ipv4Addr> = None;
+            let mut prev_has_errors = false;
 
             loop {
                 thread::sleep(REFRESH_INTERVAL);
 
                 let net_status = status.load();
-                let need_redraw = net_status != prev_status || net_status == NetStatus::Host;
-                let mut buf = heapless::String::<16>::new();
+                let ip = if net_status == NetStatus::Host {
+                    crate::wifi::sta_ip()
+                } else {
+                    None
+                };
+                let has_errors = !event_log.lock().unwrap().is_empty();
+                let need_redraw = net_status != prev_status
+                    || (net_status == NetStatus::Host
+                        && (ip != prev_ip || has_errors != prev_has_errors));
+                let mut buf = heapless::String::<32>::new();
 
-                // One lock for live readings + (if needed) graph paint into the
-                // in-RAM framebuffer. `draw_graph` borrows `sd.history()`
-                // directly — no per-frame Vec clone of ~200 samples.
+                // Lock for live readings only — the lower region no longer
+                // borrows history, so the lock window is just the two
+                // `*_reading()` calls.
                 let (r1, r2) = {
                     let sd = sensor_data.lock().unwrap();
-                    let r1 = sd.battery_reading().unwrap_or_default();
-                    let r2 = sd.ps_reading().unwrap_or_default();
-                    if need_redraw && net_status == NetStatus::Host {
-                        gb.clear();
-                        draw_graph(&mut gb, sd.history(), sd.interval(), &mut buf);
-                    }
-                    (r1, r2)
+                    (
+                        sd.battery_reading().unwrap_or_default(),
+                        sd.ps_reading().unwrap_or_default(),
+                    )
                 };
                 let uptime = crate::clock::uptime_s();
                 buf.clear();
@@ -566,25 +445,18 @@ pub fn start(pins: LcdPins, sensor_data: Arc<Mutex<SensorData>>, status: NetStat
                 .unwrap();
                 fb.blit_rows(&mut display, Point::new(UPTIME_X, 0), 12);
 
-                // Graph / Captive portal / Connecting. Host case already
-                // painted into `gb` above under the sensor-data lock; the
-                // others don't need data and are painted here.
+                // Lower region: IP+warning (Host) or captive/connecting overlays.
+                // Repainted only when something visible has changed.
                 if need_redraw {
                     prev_status = net_status;
+                    prev_ip = ip;
+                    prev_has_errors = has_errors;
+                    gb.clear();
                     match net_status {
-                        NetStatus::Captive => {
-                            gb.clear();
-                            draw_captive_portal(&mut gb, false);
-                        }
-                        NetStatus::CaptiveTrying => {
-                            gb.clear();
-                            draw_captive_portal(&mut gb, true);
-                        }
-                        NetStatus::Connecting => {
-                            gb.clear();
-                            draw_connecting(&mut gb);
-                        }
-                        NetStatus::Host => {}
+                        NetStatus::Captive => draw_captive_portal(&mut gb, false),
+                        NetStatus::CaptiveTrying => draw_captive_portal(&mut gb, true),
+                        NetStatus::Connecting => draw_connecting(&mut gb),
+                        NetStatus::Host => draw_host(&mut gb, ip, has_errors, &mut buf),
                     }
                     gb.blit(&mut display, Point::new(0, GRAPH_Y));
                 }
