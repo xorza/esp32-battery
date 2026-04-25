@@ -46,9 +46,8 @@ mod real {
     };
 
     use super::POLL_INTERVAL;
-    use crate::app_state::{EventLogHandle, SensorDataHandle};
+    use crate::app_state::{EventRecorder, SensorDataHandle};
     use crate::board::XyPins;
-    use crate::clock::EspClock;
 
     const SLAVE: u8 = 0x01;
     const REG_V_SET: u16 = 0x0000;
@@ -188,17 +187,7 @@ mod real {
         Ok(())
     }
 
-    fn record(event_log: &EventLogHandle, clock: &EspClock, kind: XyError) {
-        let ts = clock.epoch_s().unwrap_or(0);
-        event_log.lock().unwrap().record(ts, Event::Xy(kind));
-    }
-
-    pub fn start(
-        pins: XyPins,
-        sensor_data: SensorDataHandle,
-        event_log: EventLogHandle,
-        clock: EspClock,
-    ) {
+    pub fn start(pins: XyPins, sensor_data: SensorDataHandle, recorder: EventRecorder) {
         thread::Builder::new()
             .name("xy".into())
             .stack_size(4096)
@@ -209,7 +198,7 @@ mod real {
 
                 if let Err(e) = boot_sequence(&xy, supervisor.target_voltage()) {
                     error!("XY boot failed: {e} — forcing output OFF, will keep polling");
-                    record(&event_log, &clock, XyError::BootSequence);
+                    recorder.record(Event::Xy(XyError::BootSequence));
                     let _ = xy.set_output(false);
                 }
 
@@ -227,7 +216,7 @@ mod real {
                             }
                             Err(e) => {
                                 warn!("XY read_status: {e}");
-                                record(&event_log, &clock, XyError::ReadStatus);
+                                recorder.record(Event::Xy(XyError::ReadStatus));
                                 false
                             }
                         };
@@ -248,7 +237,7 @@ mod real {
                             log::info!("charge phase → {phase}: setting V_set = {v:.2} V");
                             if let Err(e) = xy.set_voltage(v) {
                                 warn!("XY set_voltage({v}): {e}");
-                                record(&event_log, &clock, XyError::SetVoltage);
+                                recorder.record(Event::Xy(XyError::SetVoltage));
                             }
                         }
                         Action::DisableOutput(reason) => {
@@ -267,7 +256,7 @@ mod real {
                                     error!(
                                         "CHARGE FAULT ({reason_str}): set_output(false) failed: {e} — will retry"
                                     );
-                                    record(&event_log, &clock, XyError::SetOutput);
+                                    recorder.record(Event::Xy(XyError::SetOutput));
                                 }
                             }
                         }
@@ -288,9 +277,8 @@ mod fake {
     use esp32_battery_logic::data::PsReading;
 
     use super::POLL_INTERVAL;
-    use crate::app_state::{EventLogHandle, SensorDataHandle};
+    use crate::app_state::{EventRecorder, SensorDataHandle};
     use crate::board::XyPins;
-    use crate::clock::EspClock;
 
     const FAKE_READING: PsReading = PsReading {
         voltage: 13.5,
@@ -298,13 +286,7 @@ mod fake {
         power: 0.0,
     };
 
-    pub fn start(
-        pins: XyPins,
-        sensor_data: SensorDataHandle,
-        _event_log: EventLogHandle,
-        _clock: EspClock,
-    ) {
-        drop(pins);
+    pub fn start(_pins: XyPins, sensor_data: SensorDataHandle, _recorder: EventRecorder) {
         thread::Builder::new()
             .name("xy".into())
             .stack_size(4096)

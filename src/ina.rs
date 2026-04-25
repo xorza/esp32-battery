@@ -6,9 +6,8 @@ use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::BusConfig, config::Devic
 use esp32_battery_logic::data::Ina228Reading;
 use esp32_battery_logic::error_log::{Event, InaError};
 
-use crate::app_state::{EventLogHandle, SensorDataHandle};
+use crate::app_state::{EventRecorder, SensorDataHandle};
 use crate::board::I2cPins;
-use crate::clock::EspClock;
 
 const I2C_SPEED_HZ: u32 = 400_000;
 const BATTERY_INA_ADDR: u8 = 0x40;
@@ -75,17 +74,7 @@ fn read_ina(ina: &mut ina228::Ina228<I2cDev>) -> Result<Ina228Reading, InaError>
     })
 }
 
-fn record(event_log: &EventLogHandle, clock: &EspClock, kind: InaError) {
-    let ts = clock.epoch_s().unwrap_or(0);
-    event_log.lock().unwrap().record(ts, Event::Ina(kind));
-}
-
-pub fn start(
-    pins: I2cPins,
-    sensor_data: SensorDataHandle,
-    event_log: EventLogHandle,
-    clock: EspClock,
-) {
+pub fn start(pins: I2cPins, sensor_data: SensorDataHandle, recorder: EventRecorder) {
     thread::Builder::new()
         .name("ina".into())
         .stack_size(4096)
@@ -109,7 +98,7 @@ pub fn start(
                     // supervisor's BatterySensorStale fault eventually latches the
                     // buck off. No retry: panicking would hide the failure mode
                     // from the dashboard.
-                    record(&event_log, &clock, InaError::Init);
+                    recorder.record(Event::Ina(InaError::Init));
                     log::error!("INA228 did not initialize — battery readings will go stale");
                     return;
                 }
@@ -131,7 +120,7 @@ pub fn start(
                             // Drop the failed sample, log it. Stale-reading
                             // detection in the supervisor is what catches a
                             // sensor that's truly dead.
-                            record(&event_log, &clock, kind);
+                            recorder.record(Event::Ina(kind));
                         }
                     }
                 }

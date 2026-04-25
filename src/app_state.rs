@@ -20,15 +20,37 @@ use esp_idf_svc::http::server::EspHttpServer;
 use log::info;
 
 use esp32_battery_logic::data::SensorData;
-use esp32_battery_logic::error_log::EventLog;
+use esp32_battery_logic::error_log::{Event, EventLog};
 pub use esp32_battery_logic::net_supervisor::NetStatus;
 use esp32_battery_logic::net_supervisor::Phase;
 
+use crate::clock::EspClock;
 use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 
 pub type SensorDataHandle = Arc<std::sync::Mutex<SensorData>>;
 pub type EventLogHandle = Arc<std::sync::Mutex<EventLog>>;
+
+/// Pairs the event log with the wall clock used to timestamp entries.
+/// Sensor threads always need both together — bundling them here removes
+/// the per-thread `record(log, clock, kind)` helper duplicated in `ina.rs`
+/// and `xy.rs`. Cheap to clone (two `Arc`s).
+#[derive(Clone)]
+pub struct EventRecorder {
+    log: EventLogHandle,
+    clock: EspClock,
+}
+
+impl EventRecorder {
+    pub fn new(log: EventLogHandle, clock: EspClock) -> Self {
+        Self { log, clock }
+    }
+
+    pub fn record(&self, event: Event) {
+        let ts = self.clock.epoch_s().unwrap_or(0);
+        self.log.lock().unwrap().record(ts, event);
+    }
+}
 
 #[derive(Clone)]
 pub struct NetStatusHandle(Arc<AtomicU8>);
