@@ -31,6 +31,7 @@ use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler
 use crate::clock::{EventRecorder, uptime};
 use crate::history_store::{HistoryStore, Persister};
 use crate::supervisor::{EventLogHandle, HostTransition, SensorDataHandle, Supervisor};
+use crate::wifi::LinkState;
 
 /// How long `is_connected() == false` may persist before we tear down
 /// the host server and fall back to the captive AP. Covers initial
@@ -142,8 +143,8 @@ fn main() {
             warn!("Captive: STA association timed out; flipping to Failed");
         }
 
-        let connected = wifi.lock().unwrap().tick();
-        if connected {
+        let link = wifi.lock().unwrap().tick();
+        if link == LinkState::Associated {
             // Mark the captive lifecycle Connected on the entry tick so
             // the page (polling /status ~1 Hz) has CAPTIVE_HANDOFF_GRACE
             // of supervisor cadence to observe it before the AP

@@ -25,6 +25,16 @@ const MAX_SCAN_APS: usize = 10;
 
 pub type ScanResult = heapless::Vec<(heapless::String<32>, i8), MAX_SCAN_APS>;
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum LinkState {
+    /// No STA credentials configured — captive portal needs to collect them.
+    NoCreds,
+    /// Have creds but not currently associated — reconnect is worth attempting.
+    Disassociated,
+    /// STA is associated; the host server can run.
+    Associated,
+}
+
 /// Current STA RSSI in dBm, or 0 when not associated. Reads the live AP
 /// record via `esp_wifi_sta_get_ap_info`; the call is cheap and doesn't
 /// require a `Wifi` handle.
@@ -194,12 +204,21 @@ impl<'d> Wifi<'d> {
         info!("AP started");
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.mode.has_sta_creds() && self.wifi.is_connected().unwrap_or(false)
+    /// Distinct STA states the supervisor reasons about. `NoCreds` and
+    /// `Disassociated` both mean "not currently routable", but they take
+    /// different recovery paths — only `Disassociated` is worth retrying.
+    pub fn link_state(&self) -> LinkState {
+        if !self.mode.has_sta_creds() {
+            LinkState::NoCreds
+        } else if self.wifi.is_connected().unwrap_or(false) {
+            LinkState::Associated
+        } else {
+            LinkState::Disassociated
+        }
     }
 
-    pub fn try_reconnect(&mut self) {
-        if !self.mode.has_sta_creds() || self.wifi.is_connected().unwrap_or(false) {
+    fn try_reconnect(&mut self) {
+        if self.link_state() != LinkState::Disassociated {
             return;
         }
         if self.wifi.connect().is_ok() {
@@ -208,11 +227,11 @@ impl<'d> Wifi<'d> {
         }
     }
 
-    /// Supervisor tick: attempt reconnect (no-op if not configured or already
-    /// connected) and report current associated state.
-    pub fn tick(&mut self) -> bool {
+    /// Supervisor tick: try reconnect (no-op unless `Disassociated`) and
+    /// return the post-reconnect link state.
+    pub fn tick(&mut self) -> LinkState {
         self.try_reconnect();
-        self.is_connected()
+        self.link_state()
     }
 
     /// Scan for visible access points, deduplicated by SSID (strongest signal kept),
