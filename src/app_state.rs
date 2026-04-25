@@ -8,7 +8,7 @@
 //! `Receiver` once per tick.
 
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use esp_idf_svc::http::server::EspHttpServer;
@@ -20,16 +20,45 @@ use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 
 /// Cross-thread net status — what readers (LCD, etc.) should display.
-/// Derived from `NetPhase` at every transition.
+/// Derived from `NetPhase` at every transition. Stored as `AtomicU8` since
+/// it's a 3-variant `Copy` enum mutated only on phase transitions.
+#[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum NetStatus {
-    Captive,
-    Connecting,
-    Host,
+    Captive = 0,
+    Connecting = 1,
+    Host = 2,
 }
 
-pub type SensorDataHandle = Arc<Mutex<SensorData>>;
-pub type NetStatusHandle = Arc<Mutex<NetStatus>>;
+impl NetStatus {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => NetStatus::Captive,
+            1 => NetStatus::Connecting,
+            2 => NetStatus::Host,
+            _ => unreachable!("invalid NetStatus discriminant: {v}"),
+        }
+    }
+}
+
+pub type SensorDataHandle = Arc<std::sync::Mutex<SensorData>>;
+
+#[derive(Clone)]
+pub struct NetStatusHandle(Arc<AtomicU8>);
+
+impl NetStatusHandle {
+    fn new(status: NetStatus) -> Self {
+        Self(Arc::new(AtomicU8::new(status as u8)))
+    }
+
+    fn store(&self, status: NetStatus) {
+        self.0.store(status as u8, Ordering::Relaxed);
+    }
+
+    pub fn load(&self) -> NetStatus {
+        NetStatus::from_u8(self.0.load(Ordering::Relaxed))
+    }
+}
 
 /// Single source of truth for network phase + mounted HTTP server.
 ///
@@ -78,7 +107,7 @@ impl Supervisor {
     pub fn new() -> Self {
         let (creds_tx, creds_rx) = channel();
         Self {
-            status: Arc::new(Mutex::new(NetStatus::Connecting)),
+            status: NetStatusHandle::new(NetStatus::Connecting),
             creds_tx,
             creds_rx,
             phase: NetPhase::Bootstrap { ticks: 0 },
@@ -109,7 +138,7 @@ impl Supervisor {
     }
 
     fn set_phase(&mut self, phase: NetPhase) {
-        *self.status.lock().unwrap() = phase.status();
+        self.status.store(phase.status());
         self.phase = phase;
     }
 

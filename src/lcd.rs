@@ -481,7 +481,7 @@ pub fn start(pins: LcdPins, sensor_data: SensorDataHandle, status: NetStatusHand
             loop {
                 thread::sleep(REFRESH_INTERVAL);
 
-                let net_status = *status.lock().unwrap();
+                let net_status = status.load();
                 let need_redraw = net_status != prev_status || net_status == NetStatus::Host;
                 let mut buf = heapless::String::<16>::new();
 
