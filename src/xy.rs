@@ -26,7 +26,9 @@ mod real {
     use esp_idf_hal::units::Hertz;
     use log::{error, warn};
 
-    use esp32_battery_logic::charge_strategy::{ChargeController, Chemistry, Profile};
+    use esp32_battery_logic::charging::{
+        Action, ChargeSupervisor, Chemistry, FaultReason, Profile,
+    };
 
     /// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
     /// absorb / 13.5 V float. Hysteresis: enter absorb at 1 A (C/50), drop
@@ -202,44 +204,65 @@ mod real {
             .stack_size(4096)
             .spawn(move || {
                 let xy = Xy::new(pins);
-                let mut controller = ChargeController::new(PACK_PROFILE);
+                let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
                 thread::sleep(Duration::from_millis(100));
 
-                if let Err(e) = boot_sequence(&xy, controller.target_voltage()) {
+                if let Err(e) = boot_sequence(&xy, supervisor.target_voltage()) {
                     error!("XY boot failed: {e} — forcing output OFF, will keep polling");
                     let _ = xy.set_output(false);
                 }
 
                 loop {
-                    match xy.read_status() {
-                        Ok(s) => {
-                            let reading = PsReading {
-                                voltage: s.v_out,
-                                current: s.i_out,
-                                power: s.p_out,
+                    let (modbus_ok, battery) = {
+                        let mut sd = sensor_data.lock().unwrap();
+                        let modbus_ok = match xy.read_status() {
+                            Ok(s) => {
+                                sd.update_ps(PsReading {
+                                    voltage: s.v_out,
+                                    current: s.i_out,
+                                    power: s.p_out,
+                                });
+                                true
+                            }
+                            Err(e) => {
+                                warn!("XY read_status: {e}");
+                                false
+                            }
+                        };
+                        let battery = sd.battery_reading().map(|b| (b.voltage, b.current));
+                        (modbus_ok, battery)
+                    };
+
+                    match supervisor.tick(modbus_ok, battery) {
+                        Action::None => {}
+                        Action::SetVoltage(v) => {
+                            let phase = match supervisor.phase() {
+                                esp32_battery_logic::charging::Phase::Float => "float",
+                                esp32_battery_logic::charging::Phase::Absorb => "absorb",
                             };
-                            let batt_current = {
-                                let mut sd = sensor_data.lock().unwrap();
-                                sd.update_ps(reading);
-                                sd.battery_reading().map(|b| b.current)
+                            log::info!("charge phase → {phase}: setting V_set = {v:.2} V");
+                            if let Err(e) = xy.set_voltage(v) {
+                                warn!("XY set_voltage({v}): {e}");
+                            }
+                        }
+                        Action::DisableOutput(reason) => {
+                            let reason_str = match reason {
+                                FaultReason::BatterySensorStale => "battery sensor stale",
+                                FaultReason::ModbusErrorBudget => "modbus error budget exceeded",
+                                FaultReason::Overvoltage => "pack overvoltage",
                             };
-                            if let Some(i) = batt_current
-                                && let Some(new_v) = controller.update(i)
-                            {
-                                let phase = controller.phase();
-                                let phase_name = match phase {
-                                    esp32_battery_logic::charge_strategy::Phase::Float => "float",
-                                    esp32_battery_logic::charge_strategy::Phase::Absorb => "absorb",
-                                };
-                                log::info!(
-                                    "charge phase → {phase_name}: setting V_set = {new_v:.2} V (I_batt = {i:.3} A)"
-                                );
-                                if let Err(e) = xy.set_voltage(new_v) {
-                                    warn!("XY set_voltage({new_v}): {e}");
+                            match xy.set_output(false) {
+                                Ok(()) => {
+                                    error!("CHARGE FAULT ({reason_str}): PS output DISABLED");
+                                    supervisor.ack_disable();
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "CHARGE FAULT ({reason_str}): set_output(false) failed: {e} — will retry"
+                                    );
                                 }
                             }
                         }
-                        Err(e) => warn!("XY read_status: {e}"),
                     }
                     thread::sleep(POLL_INTERVAL);
                 }

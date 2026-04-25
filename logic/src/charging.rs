@@ -122,6 +122,130 @@ impl ChargeController {
     }
 }
 
+/// Why the supervisor latched the buck off. Once latched, only a reboot clears it —
+/// auto-recovery on a battery charger means trying again under the same conditions.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum FaultReason {
+    /// No fresh battery reading for `BATTERY_MISSING_TICKS_BUDGET` consecutive ticks.
+    /// Without current/voltage we cannot supervise charging — fail closed.
+    BatterySensorStale,
+    /// `MODBUS_ERR_BUDGET` consecutive failed Modbus reads to the XY7025.
+    /// We've lost closed-loop control over the buck; disable while we still can.
+    ModbusErrorBudget,
+    /// Pack voltage exceeded `absorb_v + OV_MARGIN_V` for `OV_TICKS_BUDGET` ticks.
+    /// Catches drift below the XY's hardware OVP trip but above the profile target.
+    Overvoltage,
+}
+
+/// What the poll loop should do this tick. The supervisor never enables the
+/// output — `boot_sequence` does that once at startup. After a latch, only
+/// `DisableOutput` is ever emitted until the disable is ACKed.
+pub enum Action {
+    None,
+    SetVoltage(f32),
+    DisableOutput(FaultReason),
+}
+
+const BATTERY_MISSING_TICKS_BUDGET: u32 = 10;
+const MODBUS_ERR_BUDGET: u32 = 5;
+const OV_MARGIN_V: f32 = 0.2;
+const OV_TICKS_BUDGET: u32 = 3;
+
+pub struct ChargeSupervisor {
+    controller: ChargeController,
+    profile: Profile,
+    battery_missing_ticks: u32,
+    consec_modbus_errs: u32,
+    ov_ticks: u32,
+    fault: Option<FaultReason>,
+    disable_acked: bool,
+}
+
+impl ChargeSupervisor {
+    pub fn new(profile: Profile) -> Self {
+        Self {
+            controller: ChargeController::new(profile),
+            profile,
+            battery_missing_ticks: 0,
+            consec_modbus_errs: 0,
+            ov_ticks: 0,
+            fault: None,
+            disable_acked: false,
+        }
+    }
+
+    pub fn target_voltage(&self) -> f32 {
+        self.controller.target_voltage()
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.controller.phase()
+    }
+
+    pub fn fault(&self) -> Option<FaultReason> {
+        self.fault
+    }
+
+    /// Caller invokes this after a successful `set_output(false)` Modbus write.
+    /// Until then, the supervisor will keep emitting `DisableOutput` so a
+    /// failed disable write gets retried on every tick.
+    pub fn ack_disable(&mut self) {
+        assert!(self.fault.is_some(), "ack_disable without latched fault");
+        self.disable_acked = true;
+    }
+
+    /// Drive one poll cycle. `modbus_ok` reflects the most recent read attempt
+    /// against the XY7025. `battery` is the latest fresh reading (`None` if
+    /// stale or absent). Returns the action the caller should take.
+    pub fn tick(&mut self, modbus_ok: bool, battery: Option<(f32, f32)>) -> Action {
+        if let Some(reason) = self.fault {
+            return if self.disable_acked {
+                Action::None
+            } else {
+                Action::DisableOutput(reason)
+            };
+        }
+
+        if modbus_ok {
+            self.consec_modbus_errs = 0;
+        } else {
+            self.consec_modbus_errs += 1;
+            if self.consec_modbus_errs >= MODBUS_ERR_BUDGET {
+                return self.latch(FaultReason::ModbusErrorBudget);
+            }
+        }
+
+        let Some((v_batt, i_batt)) = battery else {
+            self.battery_missing_ticks += 1;
+            if self.battery_missing_ticks >= BATTERY_MISSING_TICKS_BUDGET {
+                return self.latch(FaultReason::BatterySensorStale);
+            }
+            return Action::None;
+        };
+        self.battery_missing_ticks = 0;
+
+        if v_batt.is_finite() && v_batt > self.profile.absorb_v + OV_MARGIN_V {
+            self.ov_ticks += 1;
+            if self.ov_ticks >= OV_TICKS_BUDGET {
+                return self.latch(FaultReason::Overvoltage);
+            }
+        } else {
+            self.ov_ticks = 0;
+        }
+
+        match self.controller.update(i_batt) {
+            Some(v) => Action::SetVoltage(v),
+            None => Action::None,
+        }
+    }
+
+    fn latch(&mut self, reason: FaultReason) -> Action {
+        self.fault = Some(reason);
+        self.disable_acked = false;
+        Action::DisableOutput(reason)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +456,178 @@ mod tests {
         for &i in &[-0.05, -0.02, 0.0, -0.4] {
             assert_eq!(c.update(i), None);
         }
+    }
+
+    // --- Supervisor ---
+
+    fn matches_disable(a: &Action, expected: FaultReason) -> bool {
+        matches!(a, Action::DisableOutput(r) if *r == expected)
+    }
+
+    #[test]
+    fn supervisor_passes_setpoint_through_on_phase_transition() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        let a = s.tick(true, Some((13.5, -2.0)));
+        match a {
+            Action::SetVoltage(v) => assert!(approx(v, 14.4)),
+            _ => panic!("expected SetVoltage"),
+        }
+        assert!(matches!(s.phase(), Phase::Absorb));
+        assert!(s.fault().is_none());
+    }
+
+    #[test]
+    fn supervisor_returns_none_on_steady_state() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..50 {
+            assert!(matches!(s.tick(true, Some((13.5, -0.05))), Action::None));
+        }
+        assert!(s.fault().is_none());
+    }
+
+    #[test]
+    fn battery_stale_for_budget_latches() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        // BUDGET-1 ticks of missing battery: still healthy.
+        for _ in 0..(BATTERY_MISSING_TICKS_BUDGET - 1) {
+            assert!(matches!(s.tick(true, None), Action::None));
+        }
+        assert!(s.fault().is_none());
+
+        let a = s.tick(true, None);
+        assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+        assert!(matches!(s.fault(), Some(FaultReason::BatterySensorStale)));
+    }
+
+    #[test]
+    fn battery_recovers_within_budget_no_latch() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..(BATTERY_MISSING_TICKS_BUDGET - 1) {
+            s.tick(true, None);
+        }
+        // One fresh reading clears the counter.
+        s.tick(true, Some((13.5, -0.1)));
+        // Now we should be able to miss BUDGET-1 again without latching.
+        for _ in 0..(BATTERY_MISSING_TICKS_BUDGET - 1) {
+            assert!(matches!(s.tick(true, None), Action::None));
+        }
+        assert!(s.fault().is_none());
+    }
+
+    #[test]
+    fn modbus_errors_for_budget_latches() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..(MODBUS_ERR_BUDGET - 1) {
+            assert!(matches!(s.tick(false, Some((13.5, -0.1))), Action::None));
+        }
+        let a = s.tick(false, Some((13.5, -0.1)));
+        assert!(matches_disable(&a, FaultReason::ModbusErrorBudget));
+    }
+
+    #[test]
+    fn modbus_recovers_within_budget_no_latch() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..(MODBUS_ERR_BUDGET - 1) {
+            s.tick(false, Some((13.5, -0.1)));
+        }
+        s.tick(true, Some((13.5, -0.1))); // good read clears counter
+        for _ in 0..(MODBUS_ERR_BUDGET - 1) {
+            s.tick(false, Some((13.5, -0.1)));
+        }
+        assert!(s.fault().is_none());
+    }
+
+    #[test]
+    fn overvoltage_sustained_latches() {
+        // absorb_v for lfp_4s = 14.4; margin = 0.2; so > 14.6 trips.
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..(OV_TICKS_BUDGET - 1) {
+            assert!(matches!(s.tick(true, Some((14.7, -0.1))), Action::None));
+        }
+        let a = s.tick(true, Some((14.7, -0.1)));
+        assert!(matches_disable(&a, FaultReason::Overvoltage));
+    }
+
+    #[test]
+    fn overvoltage_brief_recovers_no_latch() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        // Two ticks above OV; one tick back below. Counter resets.
+        s.tick(true, Some((14.7, -0.1)));
+        s.tick(true, Some((14.7, -0.1)));
+        s.tick(true, Some((13.5, -0.1)));
+        // Two more above must NOT latch (< budget after reset).
+        s.tick(true, Some((14.7, -0.1)));
+        s.tick(true, Some((14.7, -0.1)));
+        assert!(s.fault().is_none());
+    }
+
+    #[test]
+    fn ov_below_threshold_does_not_trip() {
+        // absorb_v + OV_MARGIN_V ≈ 14.6. 14.55 is unambiguously below in f32.
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..(OV_TICKS_BUDGET + 5) {
+            s.tick(true, Some((14.55, -0.1)));
+        }
+        assert!(s.fault().is_none());
+    }
+
+    #[test]
+    fn nan_voltage_does_not_count_toward_ov() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..(OV_TICKS_BUDGET + 5) {
+            s.tick(true, Some((f32::NAN, -0.1)));
+        }
+        assert!(s.fault().is_none());
+    }
+
+    #[test]
+    fn latch_keeps_emitting_disable_until_acked() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..BATTERY_MISSING_TICKS_BUDGET {
+            s.tick(true, None);
+        }
+        assert!(s.fault().is_some());
+
+        // First tick after latch: still wants disable.
+        let a = s.tick(true, Some((13.5, -0.1)));
+        assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+        // Re-tick with healthy inputs: still disable (caller's set_output failed).
+        let a = s.tick(true, Some((13.5, -0.1)));
+        assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+
+        s.ack_disable();
+        // Now the supervisor goes quiet — no further commands to the buck.
+        for _ in 0..10 {
+            assert!(matches!(s.tick(true, Some((13.5, -2.0))), Action::None));
+        }
+    }
+
+    #[test]
+    fn latched_supervisor_does_not_change_phase() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..MODBUS_ERR_BUDGET {
+            s.tick(false, Some((13.5, -0.1)));
+        }
+        s.ack_disable();
+        // Heavy charging current would normally drive Float→Absorb.
+        s.tick(true, Some((13.5, -5.0)));
+        assert!(matches!(s.phase(), Phase::Float));
+    }
+
+    #[test]
+    #[should_panic]
+    fn ack_disable_without_fault_panics() {
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        s.ack_disable();
+    }
+
+    #[test]
+    fn first_fault_wins_over_simultaneous_conditions() {
+        // Both modbus and battery faulting at once. Modbus is checked first.
+        let mut s = ChargeSupervisor::new(lfp_4s());
+        for _ in 0..MODBUS_ERR_BUDGET {
+            s.tick(false, None);
+        }
+        assert!(matches!(s.fault(), Some(FaultReason::ModbusErrorBudget)));
     }
 }

@@ -1,5 +1,5 @@
 pub mod battery;
-pub mod charge_strategy;
+pub mod charging;
 pub mod data;
 pub mod dns_packet;
 pub mod form;
