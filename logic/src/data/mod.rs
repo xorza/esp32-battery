@@ -78,16 +78,12 @@ impl SensorData {
     /// Restore history from a previously-saved blob. Call at startup
     /// before the first `tick`. Returns `false` if the blob is malformed.
     pub fn load_from_bytes(&mut self, bytes: &[u8]) -> bool {
-        match codec::deserialize(bytes) {
-            Some(h) => {
-                log::info!("Loaded {} samples from blob", h.samples().len());
-                self.history = h;
-                true
-            }
-            None => {
-                log::warn!("Failed to parse history blob ({} bytes)", bytes.len());
-                false
-            }
+        if codec::deserialize(bytes, &mut self.history) {
+            log::info!("Loaded {} samples from blob", self.history.samples().len());
+            true
+        } else {
+            log::warn!("Failed to parse history blob ({} bytes)", bytes.len());
+            false
         }
     }
 

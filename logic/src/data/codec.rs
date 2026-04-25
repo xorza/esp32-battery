@@ -13,7 +13,7 @@
 //! `None`); the firmware then logs a warning and starts fresh — known-good
 //! behavior on every persisted-format change.
 
-use super::history::{HEADER_SIZE, HISTORY_CAPACITY, History, SAMPLE_SIZE};
+use super::history::{HEADER_SIZE, HISTORY_CAPACITY, History, SAMPLE_SIZE, SampleAccum};
 use super::sample::Sample;
 
 const FORMAT_VERSION: u32 = 6;
@@ -62,28 +62,35 @@ pub fn serialize(history: &History) -> Vec<u8> {
     out
 }
 
-/// Restore a `History` from a byte slice. Returns `None` on malformed
-/// input (wrong version, zero count/interval, truncated payload).
+/// Restore a `History` from a byte slice into the caller's slot.
+/// Returns `false` on malformed input (wrong version, zero count/interval,
+/// truncated payload) and leaves `history` untouched in that case.
 /// Truncates to the newest `HISTORY_CAPACITY` if the blob is larger.
-pub fn deserialize(bytes: &[u8]) -> Option<History> {
+///
+/// Takes `&mut History` rather than returning by value because `History`
+/// is ~4 KB and the firmware's `main` task only gets ~12 KB of stack —
+/// a temporary on the return path overflows.
+pub fn deserialize(bytes: &[u8], history: &mut History) -> bool {
     if bytes.len() < HEADER_SIZE {
-        return None;
+        return false;
     }
 
     let mut r = BufReader { buf: bytes, pos: 0 };
     let version = r.u32();
     if version != FORMAT_VERSION {
-        return None;
+        return false;
     }
     let interval = r.u32();
     let count = r.u32() as usize;
 
     if interval == 0 || count == 0 || bytes.len() < HEADER_SIZE + count * SAMPLE_SIZE {
-        return None;
+        return false;
     }
 
-    let mut history = History::new();
+    history.samples.clear();
     history.interval = interval;
+    history.acc = SampleAccum::default();
+    history.acc_count = 0;
     let skip = count.saturating_sub(HISTORY_CAPACITY);
     for i in 0..count {
         let sample = r.sample();
@@ -91,7 +98,7 @@ pub fn deserialize(bytes: &[u8]) -> Option<History> {
             assert!(history.samples.push(sample).is_ok(), "history overflow");
         }
     }
-    Some(history)
+    true
 }
 
 #[cfg(test)]
@@ -121,13 +128,18 @@ mod tests {
         h
     }
 
+    fn fresh() -> History {
+        History::new()
+    }
+
     #[test]
     fn write_read_roundtrip_empty() {
         let h = History::new();
         let blob = serialize(&h);
         assert_eq!(blob.len(), HEADER_SIZE);
         // Empty blob (count=0) is rejected — no useful state to restore.
-        assert!(deserialize(&blob).is_none());
+        let mut out = fresh();
+        assert!(!deserialize(&blob, &mut out));
     }
 
     #[test]
@@ -136,7 +148,8 @@ mod tests {
         let blob = serialize(&h);
         assert_eq!(blob.len(), HEADER_SIZE + 10 * SAMPLE_SIZE);
 
-        let h2 = deserialize(&blob).expect("roundtrip");
+        let mut h2 = fresh();
+        assert!(deserialize(&blob, &mut h2));
         assert_eq!(h2.samples().len(), 10);
         assert_eq!(h2.interval(), 1);
         assert_eq!(h2.samples()[0].time_s, 1000);
@@ -145,31 +158,36 @@ mod tests {
 
     #[test]
     fn read_rejects_truncated() {
-        assert!(deserialize(&[0u8; 10]).is_none());
+        let mut out = fresh();
+        assert!(!deserialize(&[0u8; 10], &mut out));
     }
 
     #[test]
     fn read_rejects_zero_interval() {
         let blob = header_blob(FORMAT_VERSION, 0, 0, HEADER_SIZE);
-        assert!(deserialize(&blob).is_none());
+        let mut out = fresh();
+        assert!(!deserialize(&blob, &mut out));
     }
 
     #[test]
     fn read_rejects_wrong_version() {
         let blob = header_blob(99, 1, 0, HEADER_SIZE);
-        assert!(deserialize(&blob).is_none());
+        let mut out = fresh();
+        assert!(!deserialize(&blob, &mut out));
     }
 
     #[test]
     fn read_rejects_count_without_enough_data() {
         let blob = header_blob(FORMAT_VERSION, 1, HISTORY_CAPACITY as u32 + 1, HEADER_SIZE);
-        assert!(deserialize(&blob).is_none());
+        let mut out = fresh();
+        assert!(!deserialize(&blob, &mut out));
     }
 
     #[test]
     fn read_rejects_truncated_samples() {
         let blob = header_blob(FORMAT_VERSION, 1, 10, HEADER_SIZE + 5 * SAMPLE_SIZE);
-        assert!(deserialize(&blob).is_none());
+        let mut out = fresh();
+        assert!(!deserialize(&blob, &mut out));
     }
 
     #[test]
@@ -181,7 +199,8 @@ mod tests {
         blob[24..28].copy_from_slice(&2.0f32.to_le_bytes());
         blob[28..32].copy_from_slice(&1.0f32.to_le_bytes());
 
-        let h = deserialize(&blob).expect("roundtrip");
+        let mut h = fresh();
+        assert!(deserialize(&blob, &mut h));
         assert_eq!(h.samples().len(), 1);
         assert_eq!(h.samples()[0].time_s, 1000);
         assert!((h.samples()[0].voltage - 13.0).abs() < 0.001);
