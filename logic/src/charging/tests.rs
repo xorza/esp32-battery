@@ -86,11 +86,12 @@ fn regulation_must_exceed_enter() {
 #[test]
 fn safety_limits_match_lfp_4s_known_values() {
     // 4S LFP daily: absorb 14.4 V, float 13.5 V, CC 10 A.
-    // OVP = 14.4 + 0.6 = 15.0; OCP = 10 * 1.5 = 15.0; LVP = 13.5 - 3.5 = 10.0.
+    // OVP = 14.4 + 0.6 = 15.0; OCP = 10 * 1.5 = 15.0.
+    // LVP is input UVLO on the XY7025: 24 V nominal − 2 V margin = 22 V.
     let s = lfp_4s().safety_limits();
     assert!(approx(s.ovp_v, 15.0));
     assert!(approx(s.ocp_a, 15.0));
-    assert!(approx(s.lvp_v, 10.0));
+    assert!(approx(s.lvp_v, 22.0));
 }
 
 #[test]
@@ -107,9 +108,9 @@ fn safety_limits_track_cell_count_change() {
     let s4 = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.1).safety_limits();
     let s8 = Profile::for_pack(Chemistry::LiFePo4, 8, 10.0, 1.0, 0.1).safety_limits();
     assert!(s8.ovp_v > s4.ovp_v, "OVP scales with cell count");
-    assert!(s8.lvp_v > s4.lvp_v, "LVP scales with cell count");
-    // OCP is current-only, no S dependence.
+    // OCP is current-only and LVP is input-side — both independent of S.
     assert!(approx(s4.ocp_a, s8.ocp_a));
+    assert!(approx(s4.lvp_v, s8.lvp_v));
 }
 
 #[test]

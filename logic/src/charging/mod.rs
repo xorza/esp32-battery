@@ -141,7 +141,7 @@ const _: () = assert!(HARDWARE_OVP_MARGIN_V > OV_MARGIN_V);
 /// UVLO (LVP register) — it has nothing to do with the pack profile.
 pub const INPUT_NOMINAL_V: f32 = 24.0;
 /// Headroom below `INPUT_NOMINAL_V` before the buck cuts output on input sag.
-/// 4 V tolerates a ~17% droop and stays well above the XY7025's 12 V minimum.
+/// 2 V tolerates ~8% droop and stays well above the XY7025's 12 V minimum.
 pub const INPUT_LVP_MARGIN_V: f32 = 2.0;
 const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
 /// How long the pack must hold above `absorb_v + OV_MARGIN_V` before tripping.
