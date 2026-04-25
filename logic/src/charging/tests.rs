@@ -124,11 +124,12 @@ fn safety_limits_ovp_clears_supervisor_threshold() {
     ] {
         let p = Profile::for_pack(chem, cells, reg, 1.0, 0.1);
         let s = p.safety_limits();
+        let supervisor_trip = p.absorb_v + OV_MARGIN_V;
         assert!(
-            s.ovp_v > p.absorb_v + 0.2,
-            "ovp {} must exceed absorb + supervisor margin {}",
+            s.ovp_v > supervisor_trip,
+            "ovp {} must exceed supervisor trip {}",
             s.ovp_v,
-            p.absorb_v + 0.2
+            supervisor_trip
         );
     }
 }

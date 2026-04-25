@@ -86,12 +86,13 @@ impl Profile {
 
     /// Derive hard trip thresholds for the buck's own protection. The buck
     /// fires these only when regulation has already failed — the supervisor's
-    /// debounced OV at `absorb_v + 0.2 V` should catch problems first. These
-    /// are the absolute backstops: 0.6 V above absorb, 50% over the CC
-    /// setpoint, 3.5 V below float.
+    /// debounced OV at `absorb_v + OV_MARGIN_V` should catch problems first.
+    /// Hardware OVP sits at 3× that margin so the supervisor always wins
+    /// (the const-block below enforces this at compile time). OCP is 50%
+    /// over the CC setpoint, LVP 3.5 V below float.
     pub const fn safety_limits(&self) -> SafetyLimits {
         SafetyLimits {
-            ovp_v: self.absorb_v + 0.6,
+            ovp_v: self.absorb_v + HARDWARE_OVP_MARGIN_V,
             ocp_a: self.regulation_a * 1.5,
             lvp_v: self.float_v - 3.5,
         }
@@ -126,7 +127,15 @@ pub enum Decision {
     Fault(ChargeFault),
 }
 
-const OV_MARGIN_V: f32 = 0.2;
+/// How far above `absorb_v` the pack must sit before the firmware's
+/// debounced OV trip starts counting. Pub so callers (and the hardware-OVP
+/// derivation below) reference one number, not a literal.
+pub const OV_MARGIN_V: f32 = 0.2;
+/// Margin above `absorb_v` programmed into the buck's own OVP register.
+/// Must strictly exceed `OV_MARGIN_V` so the supervisor's debounced trip
+/// fires first; the const-block below enforces it at compile time.
+pub const HARDWARE_OVP_MARGIN_V: f32 = OV_MARGIN_V * 3.0;
+const _: () = assert!(HARDWARE_OVP_MARGIN_V > OV_MARGIN_V);
 /// How long the pack must hold above `absorb_v + OV_MARGIN_V` before tripping.
 /// Time-based so the debounce isn't sensitive to poll cadence.
 const OV_DURATION: Duration = Duration::from_secs(3);
