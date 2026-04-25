@@ -5,4 +5,5 @@ pub mod dns_packet;
 pub mod form;
 pub mod log_ring;
 pub mod modbus;
+pub mod net_supervisor;
 pub mod save_scheduler;
