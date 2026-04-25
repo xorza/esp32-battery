@@ -109,6 +109,11 @@
             </table>
         </div>
 
+        <div class="card" id="errors_card" style="display:none">
+            <div class="card-title">Errors</div>
+            <ul class="errors-list" id="errors_list"></ul>
+        </div>
+
         <div class="footer">
             <span id="uptime">--</span>
             <span class="wifi-icon" id="wifi_icon">
@@ -364,7 +369,48 @@
                 ctx.fillText("now", W - pad.r, H - 5);
             }
 
+            function formatErrorTime(ts) {
+                if (ts === 0) return "pre-sync";
+                const d = new Date(ts * 1000);
+                return d.toLocaleTimeString();
+            }
+
+            function updateErrors() {
+                fetch("/api/errors")
+                    .then((r) => r.json())
+                    .then((d) => {
+                        const recent = d.recent || [];
+                        const card = $("errors_card");
+                        const list = $("errors_list");
+                        if (recent.length === 0) {
+                            card.style.display = "none";
+                            return;
+                        }
+                        card.style.display = "";
+                        list.innerHTML = "";
+                        // Render newest-first.
+                        for (let i = recent.length - 1; i >= 0; i--) {
+                            const [ts, source, kind] = recent[i];
+                            const li = document.createElement("li");
+                            const t = document.createElement("span");
+                            t.className = "err-time";
+                            t.textContent = formatErrorTime(ts);
+                            const s = document.createElement("span");
+                            s.className = "err-src";
+                            s.textContent = source;
+                            const k = document.createElement("span");
+                            k.className = "err-kind";
+                            k.textContent = kind;
+                            li.append(t, s, k);
+                            list.appendChild(li);
+                        }
+                    })
+                    .catch(() => {})
+                    .finally(() => setTimeout(updateErrors, 5000));
+            }
+
             update();
+            updateErrors();
         </script>
     </body>
 </html>
