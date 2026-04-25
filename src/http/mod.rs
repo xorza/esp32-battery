@@ -206,7 +206,7 @@ where
         Ok(n) => n,
         Err(e) => {
             warn!("JSON serialization failed: {:?}", e);
-            return text_response(req, 500, b"serialization error");
+            return json_reply(req, 500, br#"{"error":"serialization error"}"#);
         }
     };
     let mut resp = req

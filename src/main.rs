@@ -55,6 +55,7 @@ fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     log_ring::init();
+    ota::init();
 
     // Reboot on any thread panic. Without this, a panic in (e.g.) the INA thread
     // poisons the sensor_data mutex; subsequent HTTP / LCD handlers then panic on

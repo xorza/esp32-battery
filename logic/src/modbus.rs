@@ -103,8 +103,6 @@ pub fn parse_write_response(resp: &[u8], req: &[u8; 8]) -> Result<(), ModbusErro
 }
 
 pub enum ModbusError {
-    WriteFailed,
-    ReadFailed,
     ShortResponse(usize),
     BadSlave(u8),
     BadHeader,
@@ -115,8 +113,6 @@ pub enum ModbusError {
 impl std::fmt::Display for ModbusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModbusError::WriteFailed => write!(f, "UART write failed"),
-            ModbusError::ReadFailed => write!(f, "UART read failed"),
             ModbusError::ShortResponse(n) => write!(f, "short response ({n} bytes)"),
             ModbusError::BadSlave(a) => write!(f, "wrong slave id 0x{a:02X}"),
             ModbusError::BadHeader => write!(f, "malformed header"),

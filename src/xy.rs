@@ -48,16 +48,41 @@ struct XyStatus {
     v_in: f32,
 }
 
+/// Transport-level error for the buck. Wraps the pure-codec
+/// `ModbusError` and carries the two UART-side outcomes that don't
+/// belong in the codec module (which is host-testable and has no I/O).
+pub enum XyIoError {
+    UartRead,
+    UartWrite,
+    Modbus(ModbusError),
+}
+
+impl std::fmt::Display for XyIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UartRead => write!(f, "UART read failed"),
+            Self::UartWrite => write!(f, "UART write failed"),
+            Self::Modbus(e) => std::fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl From<ModbusError> for XyIoError {
+    fn from(e: ModbusError) -> Self {
+        Self::Modbus(e)
+    }
+}
+
 /// The set of operations the charging loop needs from the buck. Real
 /// builds get the UART-backed implementation; `xy-fake` builds get an
 /// in-memory canned device. The thread loop is identical for both.
 trait XyDevice {
-    fn read_status(&self) -> Result<XyStatus, ModbusError>;
-    fn set_voltage(&self, volts: f32) -> Result<(), ModbusError>;
-    fn set_current_limit(&self, amps: f32) -> Result<(), ModbusError>;
-    fn set_protection(&self, ovp_v: f32, ocp_a: f32, lvp_v: f32) -> Result<(), ModbusError>;
-    fn set_output(&self, on: bool) -> Result<(), ModbusError>;
-    fn set_power_on_default_off(&self) -> Result<(), ModbusError>;
+    fn read_status(&self) -> Result<XyStatus, XyIoError>;
+    fn set_voltage(&self, volts: f32) -> Result<(), XyIoError>;
+    fn set_current_limit(&self, amps: f32) -> Result<(), XyIoError>;
+    fn set_protection(&self, limits: SafetyLimits) -> Result<(), XyIoError>;
+    fn set_output(&self, on: bool) -> Result<(), XyIoError>;
+    fn set_power_on_default_off(&self) -> Result<(), XyIoError>;
 }
 
 // --- Real device ------------------------------------------------------------
@@ -70,12 +95,12 @@ mod real {
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
+    use esp32_battery_logic::charging::SafetyLimits;
     use esp32_battery_logic::modbus::{
-        ModbusError, build_read_request, build_write_request, parse_read_response,
-        parse_write_response,
+        build_read_request, build_write_request, parse_read_response, parse_write_response,
     };
 
-    use super::{XyDevice, XyStatus};
+    use super::{XyDevice, XyIoError, XyStatus};
     use crate::board::XyPins;
     use crate::clock::uptime;
 
@@ -118,19 +143,19 @@ mod real {
             Self { uart }
         }
 
-        fn read_holding(&self, addr: u16, count: u16) -> Result<Vec<u16>, ModbusError> {
+        fn read_holding(&self, addr: u16, count: u16) -> Result<Vec<u16>, XyIoError> {
             assert!(count > 0 && count <= 125);
             let req = build_read_request(SLAVE, addr, count);
             let mut resp = [0u8; 256];
             let n = self.transact(&req, &mut resp)?;
-            parse_read_response(&resp[..n], SLAVE, count)
+            Ok(parse_read_response(&resp[..n], SLAVE, count)?)
         }
 
-        fn write_holding(&self, addr: u16, value: u16) -> Result<(), ModbusError> {
+        fn write_holding(&self, addr: u16, value: u16) -> Result<(), XyIoError> {
             let req = build_write_request(SLAVE, addr, value);
             let mut resp = [0u8; 8];
             let result = match self.transact(&req, &mut resp) {
-                Ok(n) => parse_write_response(&resp[..n], &req),
+                Ok(n) => parse_write_response(&resp[..n], &req).map_err(XyIoError::from),
                 Err(e) => Err(e),
             };
             thread::sleep(POST_WRITE_GAP);
@@ -139,9 +164,9 @@ mod real {
 
         /// UART transaction: write request, collect reply until quiet-deadline.
         /// Returns the number of response bytes received (>= 1).
-        fn transact(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, ModbusError> {
+        fn transact(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, XyIoError> {
             self.uart.clear_rx().ok();
-            self.uart.write(req).map_err(|_| ModbusError::WriteFailed)?;
+            self.uart.write(req).map_err(|_| XyIoError::UartWrite)?;
             self.uart.wait_tx_done(100).ok();
 
             let mut n = 0usize;
@@ -154,14 +179,14 @@ mod real {
                 }
             }
             if n == 0 {
-                return Err(ModbusError::ReadFailed);
+                return Err(XyIoError::UartRead);
             }
             Ok(n)
         }
     }
 
     impl XyDevice for Xy<'_> {
-        fn read_status(&self) -> Result<XyStatus, ModbusError> {
+        fn read_status(&self) -> Result<XyStatus, XyIoError> {
             let r = self.read_holding(0x0000, 6)?;
             Ok(XyStatus {
                 v_set: r[0] as f32 / 100.0,
@@ -173,26 +198,26 @@ mod real {
             })
         }
 
-        fn set_voltage(&self, volts: f32) -> Result<(), ModbusError> {
+        fn set_voltage(&self, volts: f32) -> Result<(), XyIoError> {
             self.write_holding(REG_V_SET, (volts * 100.0).round() as u16)
         }
 
-        fn set_current_limit(&self, amps: f32) -> Result<(), ModbusError> {
+        fn set_current_limit(&self, amps: f32) -> Result<(), XyIoError> {
             self.write_holding(REG_I_SET, (amps * 100.0).round() as u16)
         }
 
-        fn set_protection(&self, ovp_v: f32, ocp_a: f32, lvp_v: f32) -> Result<(), ModbusError> {
-            self.write_holding(REG_S_OVP, (ovp_v * 100.0).round() as u16)?;
-            self.write_holding(REG_S_OCP, (ocp_a * 100.0).round() as u16)?;
-            self.write_holding(REG_S_LVP, (lvp_v * 100.0).round() as u16)?;
+        fn set_protection(&self, limits: SafetyLimits) -> Result<(), XyIoError> {
+            self.write_holding(REG_S_OVP, (limits.ovp_v * 100.0).round() as u16)?;
+            self.write_holding(REG_S_OCP, (limits.ocp_a * 100.0).round() as u16)?;
+            self.write_holding(REG_S_LVP, (limits.lvp_v * 100.0).round() as u16)?;
             Ok(())
         }
 
-        fn set_output(&self, on: bool) -> Result<(), ModbusError> {
+        fn set_output(&self, on: bool) -> Result<(), XyIoError> {
             self.write_holding(REG_OUTPUT_EN, if on { 1 } else { 0 })
         }
 
-        fn set_power_on_default_off(&self) -> Result<(), ModbusError> {
+        fn set_power_on_default_off(&self) -> Result<(), XyIoError> {
             self.write_holding(REG_S_INI, 0)
         }
     }
@@ -206,9 +231,9 @@ mod real {
 mod fake {
     use std::cell::Cell;
 
-    use esp32_battery_logic::modbus::ModbusError;
+    use esp32_battery_logic::charging::SafetyLimits;
 
-    use super::{XyDevice, XyStatus};
+    use super::{XyDevice, XyIoError, XyStatus};
 
     /// In-memory stand-in for the buck. Tracks the last voltage/output
     /// state set by the supervisor so reads reflect what the supervisor
@@ -250,7 +275,7 @@ mod fake {
         fn set_current_limit(&self, _amps: f32) -> Result<(), ModbusError> {
             Ok(())
         }
-        fn set_protection(&self, _ovp: f32, _ocp: f32, _lvp: f32) -> Result<(), ModbusError> {
+        fn set_protection(&self, _limits: SafetyLimits) -> Result<(), ModbusError> {
             Ok(())
         }
         fn set_output(&self, on: bool) -> Result<(), ModbusError> {
@@ -267,10 +292,10 @@ mod fake {
 
 /// Programs protection + setpoints, then enables output. Any failure
 /// short-circuits — we never enable output with unprogrammed setpoints.
-fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), ModbusError> {
+fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), XyIoError> {
     xy.set_output(false)?;
     xy.set_power_on_default_off()?;
-    xy.set_protection(SAFETY.ovp_v, SAFETY.ocp_a, SAFETY.lvp_v)?;
+    xy.set_protection(SAFETY)?;
     xy.set_voltage(initial_v_set)?;
     xy.set_current_limit(PACK_PROFILE.regulation_a)?;
     xy.set_output(true)?;

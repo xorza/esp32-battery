@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use esp_idf_svc::http::server::{EspHttpConnection, EspHttpServer};
@@ -29,7 +30,7 @@ const OTA_KEY_HEX: &str = env!("OTA_KEY");
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn decode_key() -> [u8; 32] {
+static OTA_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
     let b = OTA_KEY_HEX.as_bytes();
     assert_eq!(b.len(), 64, "OTA_KEY must be 64 hex chars");
     let mut out = [0u8; 32];
@@ -38,6 +39,12 @@ fn decode_key() -> [u8; 32] {
             .expect("OTA_KEY must be valid hex");
     }
     out
+});
+
+/// Force-decode `OTA_KEY` at boot so a malformed value panics early
+/// instead of deferring until the first upload.
+pub fn init() {
+    LazyLock::force(&OTA_KEY);
 }
 
 fn handle_upload(
@@ -51,7 +58,7 @@ fn handle_upload(
         "missing HMAC signature",
     )?;
 
-    let mut mac = HmacSha256::new_from_slice(&decode_key()).expect("HMAC key length must be valid");
+    let mut mac = HmacSha256::new_from_slice(&*OTA_KEY).expect("HMAC key length must be valid");
 
     let mut ota = EspOta::new().map_err(|e| {
         warn!("OTA: init failed: {:?}", e);
