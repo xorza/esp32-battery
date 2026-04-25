@@ -18,7 +18,6 @@ mod wifi;
 mod wifi_reset;
 mod xy;
 
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,7 +29,6 @@ use log::{info, warn};
 use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
 
 use crate::app_state::{EventLogHandle, EventRecorder, SensorDataHandle, Supervisor};
-use crate::captive_api::SaveState;
 use crate::history_store::{HistoryStore, Persister};
 
 /// Number of consecutive 1 Hz ticks with `is_connected() == false` before we
@@ -108,10 +106,6 @@ fn main() {
         wifi.lock().unwrap().start_sta(creds);
     }
 
-    // Wall-clock timestamp of the current "Trying" window. Set on each
-    // captive-portal submission, cleared on success or timeout.
-    let mut trying_since: Option<Instant> = None;
-
     loop {
         thread::sleep(Duration::from_secs(1));
 
@@ -120,26 +114,21 @@ fn main() {
         if let Some(new) = supervisor.take_pending_creds() {
             // /save is the only producer of these creds and it's only
             // mounted while the supervisor is in Captive — so the AP is
-            // up and a live STA-config update is the right move.
-            let state = supervisor
-                .captive_save_state()
-                .expect("creds posted while supervisor isn't in Captive phase");
+            // up and a live STA-config update is the right move. /save
+            // already wrote `Trying { since: now }` into the lifecycle.
             wifi.lock().unwrap().set_sta_creds_live(&new);
-            state.store(SaveState::Trying as u8, Ordering::Relaxed);
-            trying_since = Some(Instant::now());
             creds = Some(new);
         }
 
         // Time out the Trying spinner so the captive page can show a
         // failure and let the user re-enter creds. The AP stays up.
-        if let Some(start) = trying_since
-            && start.elapsed() >= CAPTIVE_TRYING_TIMEOUT
-            && let Some(state) = supervisor.captive_save_state()
-            && state.load(Ordering::Relaxed) == SaveState::Trying as u8
+        if let Some(state) = supervisor.captive_save_state()
+            && state
+                .lock()
+                .unwrap()
+                .tick_timeout(Instant::now(), CAPTIVE_TRYING_TIMEOUT)
         {
             warn!("Captive: STA association timed out; flipping to Failed");
-            state.store(SaveState::Failed as u8, Ordering::Relaxed);
-            trying_since = None;
         }
 
         let connected = wifi.lock().unwrap().tick();
@@ -151,8 +140,7 @@ fn main() {
             // same tick and the page never observes Connected.
             if let Some(state) = supervisor.captive_save_state() {
                 info!("Captive: STA associated — broadcasting Connected");
-                state.store(SaveState::Connected as u8, Ordering::Relaxed);
-                trying_since = None;
+                state.lock().unwrap().mark_connected();
                 thread::sleep(Duration::from_millis(1200));
                 let c = creds.as_ref().expect("captive cannot run without creds");
                 wifi.lock().unwrap().start_sta(c);

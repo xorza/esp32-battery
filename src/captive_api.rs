@@ -1,15 +1,17 @@
 //! Captive-portal API: WiFi scan, credential save, status polling, and the
 //! Android captive-detection probe.
 //!
-//! `SaveState` tracks the lifecycle of a credential submission so the page
-//! can poll `/status` and show "Connecting...", "Failed", or trigger a popup
-//! close on success. The state lives in an `Arc<AtomicU8>` shared with the
-//! main supervisor loop, which is the only writer of `Connected` / `Failed`.
+//! `SaveLifecycle` tracks the lifecycle of a credential submission so the
+//! page can poll `/status` and show "Connecting...", "Failed", or trigger a
+//! popup close on success. It lives inside `CaptiveBundle` (one per captive
+//! phase) so its existence and the captive phase are coextensive. `/save`
+//! is the sole writer of `Trying`; the supervisor drives `Connected` and
+//! the timeout-driven `Failed` via methods on the shared handle.
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
@@ -27,40 +29,48 @@ const SCAN_BUF_SIZE: usize = 1024;
 /// `/status` JSON is tiny — `{"state":"connected"}` is ~21 bytes.
 const STATUS_BUF_SIZE: usize = 64;
 
-#[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum SaveState {
-    Idle = 0,
-    Trying = 1,
-    Connected = 2,
-    Failed = 3,
+pub enum SaveLifecycle {
+    Idle,
+    Trying { since: Instant },
+    Connected,
+    Failed,
 }
 
-impl SaveState {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::Idle,
-            1 => Self::Trying,
-            2 => Self::Connected,
-            3 => Self::Failed,
-            _ => unreachable!("invalid SaveState discriminant: {v}"),
-        }
-    }
-
-    fn name(self) -> &'static str {
+impl SaveLifecycle {
+    fn name(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
-            Self::Trying => "trying",
+            Self::Trying { .. } => "trying",
             Self::Connected => "connected",
             Self::Failed => "failed",
         }
     }
+
+    pub fn begin_trying(&mut self, now: Instant) {
+        *self = Self::Trying { since: now };
+    }
+
+    pub fn mark_connected(&mut self) {
+        *self = Self::Connected;
+    }
+
+    /// If currently `Trying` and the `Trying` window has aged past `timeout`,
+    /// transition to `Failed` and return true. Caller logs on the rising edge.
+    pub fn tick_timeout(&mut self, now: Instant, timeout: Duration) -> bool {
+        if let Self::Trying { since } = self
+            && now.duration_since(*since) >= timeout
+        {
+            *self = Self::Failed;
+            return true;
+        }
+        false
+    }
 }
 
-pub type SaveStateHandle = Arc<AtomicU8>;
+pub type SaveStateHandle = Arc<Mutex<SaveLifecycle>>;
 
 pub fn new_save_state() -> SaveStateHandle {
-    Arc::new(AtomicU8::new(SaveState::Idle as u8))
+    Arc::new(Mutex::new(SaveLifecycle::Idle))
 }
 
 pub fn mount(
@@ -112,10 +122,12 @@ pub fn mount(
             ssid: ssid.to_string(),
             password: password.to_string(),
         });
-        // Flip to Trying immediately. The supervisor sees the queued creds on
-        // its next tick and starts the live STA-credential update; once the
-        // STA actually associates, the supervisor will set `Connected`.
-        state_save.store(SaveState::Trying as u8, Ordering::Relaxed);
+        // Flip to Trying immediately, stamping the window's start. The
+        // supervisor sees the queued creds on its next tick and starts the
+        // live STA-credential update; once the STA actually associates, the
+        // supervisor will call `mark_connected`. If the window ages past
+        // CAPTIVE_TRYING_TIMEOUT, the supervisor flips us to `Failed`.
+        state_save.lock().unwrap().begin_trying(Instant::now());
         info!("Captive: queued new credentials for live STA reconnect");
         text_response(req, 200, b"OK")?;
         Ok::<(), EspError>(())
@@ -126,8 +138,8 @@ pub fn mount(
     mount_get(server, "/status", move |req| {
         status_buf.with(|buf| {
             json_response(req, buf, |buf| {
-                let s = SaveState::from_u8(state_status.load(Ordering::Relaxed));
-                let response = StatusResponse { state: s.name() };
+                let name = state_status.lock().unwrap().name();
+                let response = StatusResponse { state: name };
                 serde_json_core::to_slice(&response, buf)
             })
         })
