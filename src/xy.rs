@@ -236,7 +236,7 @@ mod real {
                         (modbus_ok, battery)
                     };
 
-                    match supervisor.tick(modbus_ok, battery) {
+                    match supervisor.tick(modbus_ok, battery, POLL_INTERVAL) {
                         Action::None => {}
                         Action::SetVoltage(v) => {
                             let phase = match supervisor.phase() {
@@ -251,8 +251,9 @@ mod real {
                         Action::DisableOutput(reason) => {
                             let reason_str = match reason {
                                 FaultReason::BatterySensorStale => "battery sensor stale",
-                                FaultReason::ModbusErrorBudget => "modbus error budget exceeded",
+                                FaultReason::ModbusUnhealthy => "modbus link unhealthy",
                                 FaultReason::Overvoltage => "pack overvoltage",
+                                FaultReason::AbsorbTimeout => "absorb time cap reached",
                             };
                             match xy.set_output(false) {
                                 Ok(()) => {
