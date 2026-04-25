@@ -338,6 +338,88 @@ fn ov_nan_voltage_does_not_count() {
     }
 }
 
+// --- Elapsed honored, not tick count ---
+
+#[test]
+fn ov_fault_honors_sub_second_elapsed() {
+    // 500 ms ticks. Five of them = 2.5 s — under the 3 s budget, no fault.
+    // Sixth tick brings the accumulated time to exactly OV_DURATION → fault.
+    let mut c = ChargeController::new(lfp_4s());
+    let step = Duration::from_millis(500);
+    for _ in 0..5 {
+        assert!(matches!(c.update(14.7, -0.1, step), Decision::NoChange));
+    }
+    assert!(matches!(
+        c.update(14.7, -0.1, step),
+        Decision::Fault(ChargeFault::Overvoltage)
+    ));
+}
+
+#[test]
+fn ov_fault_in_a_single_large_elapsed_tick() {
+    // One call covering the full OV budget — should fault immediately. Catches
+    // a regression that accumulates +1 per call instead of `+= elapsed`.
+    let mut c = ChargeController::new(lfp_4s());
+    assert!(matches!(
+        c.update(14.7, -0.1, OV_DURATION),
+        Decision::Fault(ChargeFault::Overvoltage)
+    ));
+}
+
+#[test]
+fn ov_fault_with_mixed_elapsed_values() {
+    // 1500 ms + 1000 ms + 600 ms = 3100 ms ≥ 3000 ms budget. Trips on the
+    // third tick, not earlier (cumulative time, not tick count).
+    let mut c = ChargeController::new(lfp_4s());
+    assert!(matches!(
+        c.update(14.7, -0.1, Duration::from_millis(1500)),
+        Decision::NoChange
+    ));
+    assert!(matches!(
+        c.update(14.7, -0.1, Duration::from_millis(1000)),
+        Decision::NoChange
+    ));
+    assert!(matches!(
+        c.update(14.7, -0.1, Duration::from_millis(600)),
+        Decision::Fault(ChargeFault::Overvoltage)
+    ));
+}
+
+#[test]
+fn absorb_timeout_in_a_single_large_elapsed_tick() {
+    // After entering Absorb, one tick covering the full cap must fault.
+    // Equivalent to the iteration-based test but proves elapsed is honored.
+    let mut c = ChargeController::new(lfp_4s());
+    enter_absorb(&mut c);
+    assert!(matches!(
+        c.update(OK_V, -1.0, MAX_ABSORB),
+        Decision::Fault(ChargeFault::AbsorbTimeout)
+    ));
+}
+
+#[test]
+fn battery_stale_honors_elapsed() {
+    // One tick with elapsed = BATTERY_MISSING_TIMEOUT must latch.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let a = s.tick(true, None, BATTERY_MISSING_TIMEOUT);
+    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+}
+
+#[test]
+fn modbus_unhealthy_honors_elapsed() {
+    // Same: one big-elapsed tick saturates the modbus error counter.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let a = s.tick(
+        false,
+        Some(BatterySample {
+            voltage: 13.5,
+            current: -0.1,
+        }),
+        MODBUS_UNHEALTHY_TIMEOUT,
+    );
+    assert!(matches_disable(&a, FaultReason::ModbusUnhealthy));
+}
+
 // --- Absorb time cap ---
 
 /// Drive the controller into Absorb. After this, exactly one Absorb tick
