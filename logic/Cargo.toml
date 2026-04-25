@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 heapless = "*"
 log = "*"
+strum = { version = "*", default-features = false, features = ["derive"] }
