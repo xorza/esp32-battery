@@ -20,6 +20,9 @@
 
             "Bash(MCU=* cargo c6:*)",
             "Bash(MCU=* cargo c3:*)",
+            "Bash(MCU=* cargo build:*)",
+            "Bash(MCU=* cargo check:*)",
+            "Bash(MCU=* cargo clippy:*)",
 
             "Bash(MCU=* ./flash.sh:*)",
             "Bash(MCU=* ./deploy.sh:*)",
