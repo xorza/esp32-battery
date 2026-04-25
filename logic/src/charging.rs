@@ -74,9 +74,30 @@ pub enum Phase {
     Absorb,
 }
 
+/// Fault detected by the controller from logic-layer evidence. Distinct from
+/// `FaultReason` (which also covers transport/sensor failures the controller
+/// cannot see).
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ChargeFault {
+    /// Pack voltage exceeded `absorb_v + OV_MARGIN_V` for `OV_TICKS_BUDGET` ticks.
+    Overvoltage,
+}
+
+/// Outcome of one controller `update`. Setpoint changes only on phase
+/// transitions; faults are emitted once the relevant counter reaches budget.
+pub enum Decision {
+    NoChange,
+    Setpoint(f32),
+    Fault(ChargeFault),
+}
+
+const OV_MARGIN_V: f32 = 0.2;
+const OV_TICKS_BUDGET: u32 = 3;
+
 pub struct ChargeController {
     profile: Profile,
     phase: Phase,
+    ov_ticks: u32,
 }
 
 impl ChargeController {
@@ -86,6 +107,7 @@ impl ChargeController {
         Self {
             profile,
             phase: Phase::Float,
+            ov_ticks: 0,
         }
     }
 
@@ -100,14 +122,26 @@ impl ChargeController {
         }
     }
 
-    /// Feed the latest signed battery current. Returns `Some(new_setpoint)`
-    /// on a phase transition, `None` if the phase is unchanged.
-    pub fn update(&mut self, battery_current_a: f32) -> Option<f32> {
-        if !battery_current_a.is_finite() {
-            return None;
+    /// Feed the latest pack voltage and signed battery current. Returns a
+    /// `Decision`: a setpoint on phase transitions, a fault when overvoltage
+    /// has persisted past its budget, otherwise `NoChange`. Non-finite inputs
+    /// are charitable — voltage NaN doesn't count toward OV, current NaN
+    /// holds the current phase.
+    pub fn update(&mut self, v_batt: f32, i_batt_a: f32) -> Decision {
+        if v_batt.is_finite() && v_batt > self.profile.absorb_v + OV_MARGIN_V {
+            self.ov_ticks += 1;
+            if self.ov_ticks >= OV_TICKS_BUDGET {
+                return Decision::Fault(ChargeFault::Overvoltage);
+            }
+        } else {
+            self.ov_ticks = 0;
+        }
+
+        if !i_batt_a.is_finite() {
+            return Decision::NoChange;
         }
         // Charging current as a positive number.
-        let charging_a = -battery_current_a;
+        let charging_a = -i_batt_a;
         let next = match self.phase {
             Phase::Float if charging_a > self.profile.enter_absorb_a => Phase::Absorb,
             Phase::Absorb if charging_a < self.profile.exit_absorb_a => Phase::Float,
@@ -115,9 +149,9 @@ impl ChargeController {
         };
         if next != self.phase {
             self.phase = next;
-            Some(self.target_voltage())
+            Decision::Setpoint(self.target_voltage())
         } else {
-            None
+            Decision::NoChange
         }
     }
 }
@@ -156,15 +190,11 @@ pub struct BatterySample {
 
 const BATTERY_MISSING_TICKS_BUDGET: u32 = 10;
 const MODBUS_ERR_BUDGET: u32 = 5;
-const OV_MARGIN_V: f32 = 0.2;
-const OV_TICKS_BUDGET: u32 = 3;
 
 pub struct ChargeSupervisor {
     controller: ChargeController,
-    profile: Profile,
     battery_missing_ticks: u32,
     consec_modbus_errs: u32,
-    ov_ticks: u32,
     fault: Option<FaultReason>,
     disable_acked: bool,
 }
@@ -173,10 +203,8 @@ impl ChargeSupervisor {
     pub fn new(profile: Profile) -> Self {
         Self {
             controller: ChargeController::new(profile),
-            profile,
             battery_missing_ticks: 0,
             consec_modbus_errs: 0,
-            ov_ticks: 0,
             fault: None,
             disable_acked: false,
         }
@@ -232,18 +260,10 @@ impl ChargeSupervisor {
         };
         self.battery_missing_ticks = 0;
 
-        if b.voltage.is_finite() && b.voltage > self.profile.absorb_v + OV_MARGIN_V {
-            self.ov_ticks += 1;
-            if self.ov_ticks >= OV_TICKS_BUDGET {
-                return self.latch(FaultReason::Overvoltage);
-            }
-        } else {
-            self.ov_ticks = 0;
-        }
-
-        match self.controller.update(b.current) {
-            Some(v) => Action::SetVoltage(v),
-            None => Action::None,
+        match self.controller.update(b.voltage, b.current) {
+            Decision::NoChange => Action::None,
+            Decision::Setpoint(v) => Action::SetVoltage(v),
+            Decision::Fault(ChargeFault::Overvoltage) => self.latch(FaultReason::Overvoltage),
         }
     }
 
@@ -336,12 +356,17 @@ mod tests {
         assert!(approx(c.target_voltage(), 13.5));
     }
 
+    /// Sub-OV-threshold voltage used by tests that only care about phase logic.
+    const OK_V: f32 = 13.5;
+
     #[test]
     fn enters_absorb_when_charging_current_exceeds_threshold() {
         let mut c = ChargeController::new(lfp_4s());
         // charging at 1.5 A → -1.5 A on the bus; threshold is 1.0 A.
-        let v = c.update(-1.5).unwrap();
-        assert!(approx(v, 14.4));
+        assert!(matches!(
+            c.update(OK_V, -1.5),
+            Decision::Setpoint(v) if approx(v, 14.4)
+        ));
         assert!(matches!(c.phase(), Phase::Absorb));
     }
 
@@ -349,36 +374,39 @@ mod tests {
     fn does_not_enter_absorb_at_exact_threshold() {
         // Strictly greater: 1.0 A must NOT trigger; 1.001 A must.
         let mut c = ChargeController::new(lfp_4s());
-        assert_eq!(c.update(-1.0), None);
+        assert!(matches!(c.update(OK_V, -1.0), Decision::NoChange));
         assert!(matches!(c.phase(), Phase::Float));
-        assert!(c.update(-1.001).is_some());
+        assert!(matches!(c.update(OK_V, -1.001), Decision::Setpoint(_)));
     }
 
     #[test]
     fn discharge_current_does_not_enter_absorb() {
         // 5 A discharge (positive). |I| > 1 A but it's NOT charging.
         let mut c = ChargeController::new(lfp_4s());
-        assert_eq!(c.update(5.0), None);
+        assert!(matches!(c.update(OK_V, 5.0), Decision::NoChange));
         assert!(matches!(c.phase(), Phase::Float));
     }
 
     #[test]
     fn stays_in_absorb_above_exit_threshold() {
         let mut c = ChargeController::new(lfp_4s());
-        c.update(-2.0); // → Absorb
+        c.update(OK_V, -2.0); // → Absorb
         // Exit threshold is 0.5 A — anything above keeps us in absorb.
-        assert_eq!(c.update(-1.0), None);
-        assert_eq!(c.update(-0.6), None);
-        assert_eq!(c.update(-0.5), None); // strictly less-than, so 0.5 stays
+        assert!(matches!(c.update(OK_V, -1.0), Decision::NoChange));
+        assert!(matches!(c.update(OK_V, -0.6), Decision::NoChange));
+        assert!(matches!(c.update(OK_V, -0.5), Decision::NoChange)); // strictly less-than, so 0.5 stays
         assert!(matches!(c.phase(), Phase::Absorb));
     }
 
     #[test]
     fn exits_absorb_when_taper_drops_below_threshold() {
         let mut c = ChargeController::new(lfp_4s());
-        c.update(-2.0); // → Absorb
-        let v = c.update(-0.4).unwrap(); // 0.4 A charging — below 0.5 A exit.
-        assert!(approx(v, 13.5));
+        c.update(OK_V, -2.0); // → Absorb
+        // 0.4 A charging — below 0.5 A exit.
+        assert!(matches!(
+            c.update(OK_V, -0.4),
+            Decision::Setpoint(v) if approx(v, 13.5)
+        ));
         assert!(matches!(c.phase(), Phase::Float));
     }
 
@@ -387,21 +415,23 @@ mod tests {
         // Battery starts discharging mid-absorb (charger off / heavy load).
         // charging_a is negative → certainly < 0.1 A → drop to float.
         let mut c = ChargeController::new(lfp_4s());
-        c.update(-2.0);
-        let v = c.update(3.0).unwrap();
-        assert!(approx(v, 13.5));
+        c.update(OK_V, -2.0);
+        assert!(matches!(
+            c.update(OK_V, 3.0),
+            Decision::Setpoint(v) if approx(v, 13.5)
+        ));
     }
 
     #[test]
     fn hysteresis_no_flap_between_thresholds() {
         let mut c = ChargeController::new(lfp_4s());
         for _ in 0..10 {
-            assert_eq!(c.update(-0.5), None);
+            assert!(matches!(c.update(OK_V, -0.5), Decision::NoChange));
         }
         assert!(matches!(c.phase(), Phase::Float));
-        c.update(-2.0);
+        c.update(OK_V, -2.0);
         for _ in 0..10 {
-            assert_eq!(c.update(-0.5), None);
+            assert!(matches!(c.update(OK_V, -0.5), Decision::NoChange));
         }
         assert!(matches!(c.phase(), Phase::Absorb));
     }
@@ -410,24 +440,27 @@ mod tests {
     fn returns_none_on_steady_state() {
         let mut c = ChargeController::new(lfp_4s());
         for _ in 0..100 {
-            assert_eq!(c.update(-0.05), None);
+            assert!(matches!(c.update(OK_V, -0.05), Decision::NoChange));
         }
     }
 
     #[test]
     fn transition_only_emits_setpoint_once() {
         let mut c = ChargeController::new(lfp_4s());
-        assert!(c.update(-2.0).is_some()); // first crossing → write
-        assert_eq!(c.update(-2.0), None); // already absorb → silent
-        assert_eq!(c.update(-3.0), None);
+        assert!(matches!(c.update(OK_V, -2.0), Decision::Setpoint(_))); // first crossing → write
+        assert!(matches!(c.update(OK_V, -2.0), Decision::NoChange)); // already absorb → silent
+        assert!(matches!(c.update(OK_V, -3.0), Decision::NoChange));
     }
 
     #[test]
-    fn nan_and_inf_are_ignored() {
+    fn nan_and_inf_current_are_ignored() {
         let mut c = ChargeController::new(lfp_4s());
-        assert_eq!(c.update(f32::NAN), None);
-        assert_eq!(c.update(f32::INFINITY), None);
-        assert_eq!(c.update(f32::NEG_INFINITY), None);
+        assert!(matches!(c.update(OK_V, f32::NAN), Decision::NoChange));
+        assert!(matches!(c.update(OK_V, f32::INFINITY), Decision::NoChange));
+        assert!(matches!(
+            c.update(OK_V, f32::NEG_INFINITY),
+            Decision::NoChange
+        ));
         assert!(matches!(c.phase(), Phase::Float));
     }
 
@@ -435,8 +468,12 @@ mod tests {
     fn different_chemistries_yield_different_setpoints() {
         let mut lfp = ChargeController::new(Profile::for_pack(Chemistry::LiFePo4, 4, 1.0, 0.1));
         let mut liion = ChargeController::new(Profile::for_pack(Chemistry::LiIon, 3, 1.0, 0.1));
-        let v_lfp = lfp.update(-2.0).unwrap();
-        let v_liion = liion.update(-2.0).unwrap();
+        let Decision::Setpoint(v_lfp) = lfp.update(OK_V, -2.0) else {
+            panic!("expected setpoint")
+        };
+        let Decision::Setpoint(v_liion) = liion.update(12.0, -2.0) else {
+            panic!("expected setpoint")
+        };
         assert!(approx(v_lfp, 14.4));
         assert!(approx(v_liion, 12.3));
     }
@@ -446,23 +483,63 @@ mod tests {
         // 1S LFP charger — float 3.375 V, absorb 3.60 V (daily).
         let mut c = ChargeController::new(Profile::for_pack(Chemistry::LiFePo4, 1, 1.0, 0.1));
         assert!(approx(c.target_voltage(), 3.375));
-        let v = c.update(-1.5).unwrap();
-        assert!(approx(v, 3.60));
+        assert!(matches!(
+            c.update(3.4, -1.5),
+            Decision::Setpoint(v) if approx(v, 3.60)
+        ));
     }
 
     #[test]
     fn full_charge_cycle() {
         let mut c = ChargeController::new(lfp_4s());
         // Exit threshold is 0.5 A — design taper around that.
-        let v_absorb = c.update(-8.0).unwrap();
-        assert!(approx(v_absorb, 14.4));
+        assert!(matches!(
+            c.update(OK_V, -8.0),
+            Decision::Setpoint(v) if approx(v, 14.4)
+        ));
         for &i in &[-7.0, -5.0, -3.0, -1.0, -0.6] {
-            assert_eq!(c.update(i), None);
+            assert!(matches!(c.update(OK_V, i), Decision::NoChange));
         }
-        let v_float = c.update(-0.4).unwrap();
-        assert!(approx(v_float, 13.5));
+        assert!(matches!(
+            c.update(OK_V, -0.4),
+            Decision::Setpoint(v) if approx(v, 13.5)
+        ));
         for &i in &[-0.05, -0.02, 0.0, -0.4] {
-            assert_eq!(c.update(i), None);
+            assert!(matches!(c.update(OK_V, i), Decision::NoChange));
+        }
+    }
+
+    // --- Controller-level overvoltage detection ---
+
+    #[test]
+    fn ov_emits_fault_after_budget() {
+        // absorb_v for lfp_4s = 14.4; margin = 0.2; so > 14.6 trips after BUDGET ticks.
+        let mut c = ChargeController::new(lfp_4s());
+        for _ in 0..(OV_TICKS_BUDGET - 1) {
+            assert!(matches!(c.update(14.7, -0.1), Decision::NoChange));
+        }
+        assert!(matches!(
+            c.update(14.7, -0.1),
+            Decision::Fault(ChargeFault::Overvoltage)
+        ));
+    }
+
+    #[test]
+    fn ov_counter_resets_when_voltage_drops() {
+        let mut c = ChargeController::new(lfp_4s());
+        c.update(14.7, -0.1);
+        c.update(14.7, -0.1);
+        c.update(13.5, -0.1); // resets
+        // Two more above must NOT fault — counter started over.
+        assert!(matches!(c.update(14.7, -0.1), Decision::NoChange));
+        assert!(matches!(c.update(14.7, -0.1), Decision::NoChange));
+    }
+
+    #[test]
+    fn ov_nan_voltage_does_not_count() {
+        let mut c = ChargeController::new(lfp_4s());
+        for _ in 0..(OV_TICKS_BUDGET + 5) {
+            assert!(matches!(c.update(f32::NAN, -0.1), Decision::NoChange));
         }
     }
 
