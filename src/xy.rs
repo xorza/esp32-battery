@@ -196,7 +196,7 @@ mod real {
                 i_set: r[1] as f32 / 100.0,
                 v_out: r[2] as f32 / 100.0,
                 i_out: r[3] as f32 / 100.0,
-                p_out: r[4] as f32 / 100.0,
+                p_out: r[4] as f32 / 10.0,
                 v_in: r[5] as f32 / 100.0,
             })
         }
