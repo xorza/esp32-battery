@@ -1,0 +1,114 @@
+//! GET /api/errors: structured snapshot of the event log.
+//!
+//! Wire shape:
+//! ```json
+//! {
+//!   "ina_counts": { "init": 0, "bus_voltage_read": 3, ... },
+//!   "xy_counts":  { "read_status": 5, ... },
+//!   "recent":     [ [ts, "ina"|"xy", "<kind>"], ... ]   // oldest-first
+//! }
+//! ```
+
+use std::sync::Mutex;
+
+use esp_idf_hal::io::Write;
+use esp_idf_svc::http::server::EspHttpServer;
+use esp_idf_svc::sys::EspError;
+use log::warn;
+use serde::Serialize;
+use serde::ser::{SerializeMap, SerializeSeq};
+
+use esp32_battery_logic::error_log::{Event, EventLog};
+
+use crate::app_state::EventLogHandle;
+use crate::http::text_response;
+
+/// EventLog is bounded (32 entries × ~40 chars + ~30 small counters), well
+/// under 4 KiB even with worst-case float-ish formatting.
+const RESPONSE_BUF_SIZE: usize = 4096;
+
+struct InaCountsView<'a>(&'a EventLog);
+
+impl Serialize for InaCountsView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(None)?;
+        for (name, count) in self.0.ina_counts_iter() {
+            map.serialize_entry(name, &count)?;
+        }
+        map.end()
+    }
+}
+
+struct XyCountsView<'a>(&'a EventLog);
+
+impl Serialize for XyCountsView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(None)?;
+        for (name, count) in self.0.xy_counts_iter() {
+            map.serialize_entry(name, &count)?;
+        }
+        map.end()
+    }
+}
+
+struct RecentView<'a>(&'a EventLog);
+
+impl Serialize for RecentView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.0.len()))?;
+        for e in self.0.recent() {
+            let (source, kind) = match e.event {
+                Event::Ina(k) => ("ina", k.name()),
+                Event::Xy(k) => ("xy", k.name()),
+            };
+            seq.serialize_element(&(e.ts, source, kind))?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorsResponse<'a> {
+    ina_counts: InaCountsView<'a>,
+    xy_counts: XyCountsView<'a>,
+    recent: RecentView<'a>,
+}
+
+pub fn register(server: &mut EspHttpServer<'static>, event_log: EventLogHandle) {
+    let json_buf = Mutex::new(Box::new([0u8; RESPONSE_BUF_SIZE]));
+
+    server
+        .fn_handler("/api/errors", esp_idf_svc::http::Method::Get, move |req| {
+            let log = event_log.lock().unwrap();
+            let response = ErrorsResponse {
+                ina_counts: InaCountsView(&log),
+                xy_counts: XyCountsView(&log),
+                recent: RecentView(&log),
+            };
+
+            let mut guard = json_buf.lock().unwrap();
+            let buf: &mut [u8] = &mut **guard;
+            let len = match serde_json_core::to_slice(&response, buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("API/errors: JSON serialization failed ({:?})", e);
+                    return text_response(req, 500, b"serialization error");
+                }
+            };
+            drop(log);
+
+            let mut resp = req
+                .into_response(
+                    200,
+                    None,
+                    &[
+                        ("Content-Type", "application/json"),
+                        ("Connection", "close"),
+                    ],
+                )
+                .map_err(|e| e.0)?;
+            resp.write_all(&buf[..len]).map_err(|e| e.0)?;
+            Ok::<(), EspError>(())
+        })
+        .unwrap();
+}

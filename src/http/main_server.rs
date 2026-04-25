@@ -8,13 +8,14 @@ use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::sys::EspError;
 
-use crate::app_state::SensorDataHandle;
+use crate::app_state::{EventLogHandle, SensorDataHandle};
 use crate::nvs_creds;
 
 use super::{create_server, serve_common_assets, serve_static, text_response};
 
 pub fn start(
     sensor_data: SensorDataHandle,
+    event_log: EventLogHandle,
     nvs: Arc<EspNvs<NvsDefault>>,
 ) -> EspHttpServer<'static> {
     let mut server = create_server(10240, false, 4, Some(Duration::from_secs(0)), true);
@@ -38,6 +39,7 @@ pub fn start(
     );
 
     crate::api::register(&mut server, sensor_data);
+    crate::errors::register(&mut server, event_log);
     crate::log_ring::register(&mut server);
     register_wifi_reset(&mut server, nvs);
     crate::ota::register(&mut server);

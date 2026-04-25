@@ -3,6 +3,7 @@ mod app_state;
 mod board;
 mod clock;
 mod dns;
+mod errors;
 mod history_store;
 mod http;
 mod ina;
@@ -119,7 +120,8 @@ fn main() {
         let connected = wifi.lock().unwrap().tick();
         if connected {
             let sd = sensor_data.clone();
-            supervisor.on_tick_connected(|| http::start_main(sd, nvs.clone()));
+            let el = event_log.clone();
+            supervisor.on_tick_connected(|| http::start_main(sd, el, nvs.clone()));
         } else {
             let creds_tx = supervisor.creds_sender();
             supervisor.on_tick_disconnected(creds.is_some(), CAPTIVE_AFTER_FAILURES, || {

@@ -5,7 +5,7 @@
 //! epoch timestamp; logic does no I/O and no clock access.
 
 use heapless::Deque;
-use strum::{EnumCount, EnumIter, IntoStaticStr};
+use strum::{EnumCount, EnumIter, IntoEnumIterator, IntoStaticStr};
 
 /// Failures from the INA228 / I²C bus path.
 #[derive(Copy, Clone, PartialEq, Eq, EnumCount, EnumIter, IntoStaticStr)]
@@ -125,6 +125,16 @@ impl EventLog {
 
     pub fn xy_count(&self, k: XyError) -> u32 {
         self.xy_counts[k.index()]
+    }
+
+    /// Iterate `(name, count)` pairs for every INA error kind. Lets API
+    /// callers serialize without depending on `strum` themselves.
+    pub fn ina_counts_iter(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
+        InaError::iter().map(|k| (k.name(), self.ina_count(k)))
+    }
+
+    pub fn xy_counts_iter(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
+        XyError::iter().map(|k| (k.name(), self.xy_count(k)))
     }
 
     pub fn len(&self) -> usize {
