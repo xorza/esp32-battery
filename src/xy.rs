@@ -50,6 +50,11 @@ mod real {
     const REG_S_LVP: u16 = 0x0052;
     const REG_S_OVP: u16 = 0x0053;
     const REG_S_OCP: u16 = 0x0054;
+    /// S-INI: power-on default for the output switch. 0 = OFF on power-up,
+    /// 1 = ON. Persists in EEPROM. Set OFF so a brown-out / MCU crash never
+    /// leaves the buck silently sourcing into the pack while we're not
+    /// supervising.
+    const REG_S_INI: u16 = 0x005D;
     const BAUD: u32 = 115200;
     const RESPONSE_TIMEOUT_MS: u64 = 500;
     /// Silence enforced after every write so the XY has time to process the
@@ -153,6 +158,10 @@ mod real {
             self.write_holding(REG_OUTPUT_EN, if on { 1 } else { 0 })
         }
 
+        fn set_power_on_default_off(&self) -> Result<(), ModbusError> {
+            self.write_holding(REG_S_INI, 0)
+        }
+
         fn read_status(&self) -> Result<XyStatus, ModbusError> {
             let r = self.read_holding(0x0000, 6)?;
             Ok(XyStatus {
@@ -180,6 +189,7 @@ mod real {
     /// short-circuits — we never enable output with unprogrammed setpoints.
     fn boot_sequence(xy: &Xy, initial_v_set: f32) -> Result<(), ModbusError> {
         xy.set_output(false)?;
+        xy.set_power_on_default_off()?;
         xy.set_protection(BOOT_OVP, BOOT_OCP, BOOT_LVP)?;
         xy.set_voltage(initial_v_set)?;
         xy.set_current_limit(BOOT_I_SET)?;
