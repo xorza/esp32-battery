@@ -9,9 +9,6 @@
 //! bundle (AP goes down, page's `/status` poll fails — the page treats
 //! that as success).
 
-use std::sync::Arc;
-use std::sync::Mutex;
-
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::sys::EspError;
 use log::info;
@@ -22,22 +19,26 @@ use crate::clock::uptime;
 use crate::http::{JsonBuf, json_response, mount_get, mount_post, read_to_buf, text_response};
 use crate::net::{CaptiveStateHandle, Submission};
 use crate::nvs_creds::WifiCredentials;
-use crate::wifi::Wifi;
+use crate::wifi::ScanCache;
 
 const SCAN_BUF_SIZE: usize = 1024;
 const STATUS_BUF_SIZE: usize = 64;
 
 pub fn mount(
     server: &mut EspHttpServer<'static>,
-    wifi: Arc<Mutex<Wifi<'static>>>,
+    scan_cache: ScanCache,
     state: CaptiveStateHandle,
 ) {
     let scan_buf: JsonBuf<SCAN_BUF_SIZE> = JsonBuf::new();
     mount_get(server, "/scan", move |req| {
         scan_buf.with(|buf| {
             json_response(req, buf, |buf| {
-                let entries = wifi.lock().unwrap().scan();
-                let rows: Vec<(&str, i8)> = entries.iter().map(|(s, r)| (s.as_str(), *r)).collect();
+                let cached = scan_cache.lock().unwrap();
+                let rows: Vec<(&str, i8)> = cached
+                    .entries
+                    .iter()
+                    .map(|(s, r)| (s.as_str(), *r))
+                    .collect();
                 serde_json_core::to_slice(&rows, buf)
             })
         })

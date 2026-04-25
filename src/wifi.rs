@@ -15,6 +15,8 @@ use log::{info, warn};
 use crate::nvs_creds::WifiCredentials;
 
 use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const HOSTNAME: &str = "battery-esp32";
 const HTTP_PORT: u16 = 80;
@@ -22,8 +24,23 @@ pub const AP_SSID: &str = "Battery-Setup";
 pub const AP_PASS: &str = "01010101";
 pub const AP_GATEWAY: [u8; 4] = [192, 168, 71, 1];
 const MAX_SCAN_APS: usize = 10;
+/// Max staleness before `refresh_scan_if_stale` runs another `scan_n`.
+/// The supervisor pays the cost (during its captive-arm tick); `/scan`
+/// reads only the cache and returns instantly.
+const SCAN_CACHE_TTL: Duration = Duration::from_secs(10);
 
 pub type ScanResult = heapless::Vec<(heapless::String<32>, i8), MAX_SCAN_APS>;
+
+/// Cache of the most recent scan, refreshed by the supervisor and read
+/// (without touching the `Wifi` mutex) by the `/scan` handler.
+/// `at == None` means "never scanned this session" — the next supervisor
+/// tick refreshes immediately.
+pub struct CachedScan {
+    pub at: Option<Duration>,
+    pub entries: ScanResult,
+}
+
+pub type ScanCache = Arc<Mutex<CachedScan>>;
 
 /// Current STA RSSI in dBm, or 0 when not associated. Reads the live AP
 /// record via `esp_wifi_sta_get_ap_info`; the call is cheap and doesn't
@@ -48,6 +65,7 @@ fn sta_config(creds: &WifiCredentials) -> ClientConfiguration {
 pub struct Wifi<'d> {
     wifi: BlockingWifi<EspWifi<'d>>,
     mdns: Option<EspMdns>,
+    scan_cache: ScanCache,
 }
 
 impl<'d> Wifi<'d> {
@@ -91,7 +109,39 @@ impl<'d> Wifi<'d> {
         )
         .unwrap();
 
-        Self { wifi, mdns: None }
+        Self {
+            wifi,
+            mdns: None,
+            scan_cache: Arc::new(Mutex::new(CachedScan {
+                at: None,
+                entries: ScanResult::new(),
+            })),
+        }
+    }
+
+    /// Handle to the shared scan cache. The captive `/scan` handler reads
+    /// it without locking the `Wifi` mutex, so a long `scan_n` cannot
+    /// stall the supervisor's per-second tick (and vice versa).
+    pub fn scan_cache(&self) -> ScanCache {
+        self.scan_cache.clone()
+    }
+
+    /// Re-run `scan_n` if the cached result is older than `SCAN_CACHE_TTL`.
+    /// Caller decides when scanning is safe — currently only the captive
+    /// arm of the supervisor, when STA isn't mid-association (scanning
+    /// disrupts an in-flight associate).
+    pub fn refresh_scan_if_stale(&mut self, now: Duration) {
+        let stale = {
+            let c = self.scan_cache.lock().unwrap();
+            c.at.is_none_or(|t| now.saturating_sub(t) >= SCAN_CACHE_TTL)
+        };
+        if !stale {
+            return;
+        }
+        let entries = self.scan_now();
+        let mut c = self.scan_cache.lock().unwrap();
+        c.at = Some(now);
+        c.entries = entries;
     }
 
     fn start_with(&mut self, config: Configuration) {
@@ -170,8 +220,10 @@ impl<'d> Wifi<'d> {
     }
 
     /// Scan for visible access points, deduplicated by SSID (strongest signal kept),
-    /// sorted by signal strength descending.
-    pub fn scan(&mut self) -> ScanResult {
+    /// sorted by signal strength descending. Private — callers go through
+    /// `refresh_scan_if_stale` so the cost is paid at most once per
+    /// `SCAN_CACHE_TTL`.
+    fn scan_now(&mut self) -> ScanResult {
         let mut entries = ScanResult::new();
 
         match self.wifi.scan_n::<MAX_SCAN_APS>() {

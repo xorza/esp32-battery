@@ -141,7 +141,17 @@ fn main() {
         let step = match &mut net {
             Net::Captive { bundle } => {
                 let captive_status = drain_submission(bundle, &wifi, &mut creds, now);
-                let connected = wifi.lock().unwrap().tick(creds.is_some());
+                let mut w = wifi.lock().unwrap();
+                let connected = w.tick(creds.is_some());
+                // Only refresh while we're not mid-association: a fresh
+                // `scan_n` competes with an in-flight associate and can
+                // tank the user's submitted creds. `Captive` covers the
+                // Idle/Failed sub-states; `CaptiveTrying` (Pending/Trying)
+                // is excluded.
+                if !connected && captive_status == NetStatus::Captive {
+                    w.refresh_scan_if_stale(now);
+                }
+                drop(w);
                 if connected {
                     Step::Promote
                 } else {
@@ -253,8 +263,12 @@ fn start_captive_session(
     wifi: &Arc<Mutex<wifi::Wifi<'static>>>,
     creds: Option<&nvs_creds::WifiCredentials>,
 ) -> Net {
-    wifi.lock().unwrap().start_ap_mixed(creds);
+    let scan_cache = {
+        let mut w = wifi.lock().unwrap();
+        w.start_ap_mixed(creds);
+        w.scan_cache()
+    };
     let state = Arc::new(Mutex::new(Submission::Idle));
-    let bundle = http::start_captive(wifi.clone(), state);
+    let bundle = http::start_captive(scan_cache, state);
     Net::Captive { bundle }
 }
