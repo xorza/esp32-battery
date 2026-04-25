@@ -40,21 +40,19 @@ impl NetStatus {
 /// Single source of truth for network phase + mounted HTTP server. Lives on
 /// the main thread — `EspHttpServer` is `!Send`.
 ///
-/// `Connecting` carries an optional leftover Host server so a brief WiFi
-/// blip doesn't tear down the dashboard; the server is reused on
-/// reassociation, or dropped once the grace window expires and we fall back
-/// to `Captive`.
+/// `Host.grace` carries a tick counter when the WiFi link has dropped but
+/// we're keeping the dashboard server mounted in case the link comes back
+/// within the grace window. `None` means actively hosting; `Some(n)` means
+/// disconnected for `n` ticks and about to tear down. `Bootstrap` covers the
+/// pre-server state (boot + post-creds reapply) with its own tick counter
+/// so a slow first associate doesn't immediately flap to captive.
 pub enum NetPhase {
-    /// Bootstrap: no server mounted, STA not yet configured.
-    Idle,
-    Connecting {
+    Bootstrap {
         ticks: u32,
-        #[allow(dead_code)] // held for Drop during the grace window
-        host_server: Option<EspHttpServer<'static>>,
     },
     Host {
-        #[allow(dead_code)]
         server: EspHttpServer<'static>,
+        grace: Option<u32>,
     },
     Captive {
         #[allow(dead_code)]
@@ -67,8 +65,10 @@ pub enum NetPhase {
 impl NetPhase {
     fn status(&self) -> NetStatus {
         match self {
-            NetPhase::Idle | NetPhase::Connecting { .. } => NetStatus::Connecting,
-            NetPhase::Host { .. } => NetStatus::Host,
+            NetPhase::Bootstrap { .. } | NetPhase::Host { grace: Some(_), .. } => {
+                NetStatus::Connecting
+            }
+            NetPhase::Host { grace: None, .. } => NetStatus::Host,
             NetPhase::Captive { .. } => NetStatus::Captive,
         }
     }
@@ -104,7 +104,7 @@ impl AppState {
                 status: AtomicU8::new(NetStatus::Connecting as u8),
             }),
             history_store,
-            phase: NetPhase::Idle,
+            phase: NetPhase::Bootstrap { ticks: 0 },
         }
     }
 
@@ -116,47 +116,53 @@ impl AppState {
     }
 
     /// New credentials applied to the WiFi hardware (boot load, or captive
-    /// `/save`). Drops any live server and enters `Connecting` so the
+    /// `/save`). Drops any live server and resets to `Bootstrap` so the
     /// supervisor begins the grace count from zero.
     pub fn on_creds_applied(&mut self) {
-        self.set_phase(NetPhase::Connecting {
-            ticks: 0,
-            host_server: None,
-        });
+        self.set_phase(NetPhase::Bootstrap { ticks: 0 });
     }
 
-    /// Supervisor tick: WiFi reports associated. Idempotent in `Host`;
-    /// reuses the leftover server from a grace-window `Connecting` so a
-    /// brief blip doesn't rebuild HTTPS state.
+    /// Supervisor tick: WiFi reports associated. No-op when actively
+    /// hosting; clears `grace` (reusing the existing server) when within
+    /// the post-disconnect grace window; otherwise builds a fresh server.
     pub fn on_tick_connected(&mut self, build_host: impl FnOnce() -> EspHttpServer<'static>) {
-        if matches!(self.phase, NetPhase::Host { .. }) {
-            return;
-        }
-        let current = std::mem::replace(&mut self.phase, NetPhase::Idle);
+        let current = std::mem::replace(&mut self.phase, NetPhase::Bootstrap { ticks: 0 });
         let server = match current {
-            NetPhase::Connecting {
-                host_server: Some(s),
-                ..
+            NetPhase::Host {
+                server,
+                grace: None,
+            } => {
+                self.phase = NetPhase::Host {
+                    server,
+                    grace: None,
+                };
+                return;
+            }
+            NetPhase::Host {
+                server,
+                grace: Some(_),
             } => {
                 info!("WiFi reassociated within grace window, reusing main server");
-                s
+                server
             }
-            _ => {
+            NetPhase::Bootstrap { .. } | NetPhase::Captive { .. } => {
                 info!("WiFi connected, starting main server");
                 build_host()
             }
         };
-        self.set_phase(NetPhase::Host { server });
+        self.set_phase(NetPhase::Host {
+            server,
+            grace: None,
+        });
     }
 
     /// Supervisor tick: WiFi is not associated. Drives the transitions
-    /// between Host (via Connecting grace) and Captive.
+    /// between Host (via grace) and Captive.
     ///
     /// - No creds: mount captive (or stay in it).
-    /// - `Host` → `Connecting { ticks: 1, host_server: Some(..) }`.
-    /// - `Connecting`: bump ticks; fall through to Captive once `grace_ticks`
-    ///   is reached, dropping the leftover server.
-    /// - `Idle` / unhandled: mount captive.
+    /// - `Host { grace: None }` → `Host { grace: Some(1) }`.
+    /// - `Host { grace: Some(n) }` / `Bootstrap`: bump ticks; mount captive
+    ///   once `grace_ticks` is reached, dropping the leftover server.
     pub fn on_tick_disconnected(
         &mut self,
         has_creds: bool,
@@ -169,31 +175,30 @@ impl AppState {
             }
             return;
         }
-        let current = std::mem::replace(&mut self.phase, NetPhase::Idle);
+        let current = std::mem::replace(&mut self.phase, NetPhase::Bootstrap { ticks: 0 });
         match current {
-            NetPhase::Host { server } => {
-                self.set_phase(NetPhase::Connecting {
-                    ticks: 1,
-                    host_server: Some(server),
-                });
-            }
-            NetPhase::Connecting { ticks, host_server } => {
-                let next = ticks.saturating_add(1);
+            NetPhase::Host { server, grace } => {
+                let next = grace.unwrap_or(0).saturating_add(1);
                 if next >= grace_ticks {
-                    drop(host_server);
+                    drop(server);
                     self.mount_captive(build_captive);
                 } else {
-                    self.set_phase(NetPhase::Connecting {
-                        ticks: next,
-                        host_server,
+                    self.set_phase(NetPhase::Host {
+                        server,
+                        grace: Some(next),
                     });
+                }
+            }
+            NetPhase::Bootstrap { ticks } => {
+                let next = ticks.saturating_add(1);
+                if next >= grace_ticks {
+                    self.mount_captive(build_captive);
+                } else {
+                    self.set_phase(NetPhase::Bootstrap { ticks: next });
                 }
             }
             NetPhase::Captive { server, dns } => {
                 self.set_phase(NetPhase::Captive { server, dns });
-            }
-            NetPhase::Idle => {
-                self.mount_captive(build_captive);
             }
         }
     }
