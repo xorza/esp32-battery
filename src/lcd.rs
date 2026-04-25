@@ -72,26 +72,24 @@ const UPTIME_X: i32 = 240;
 
 const VALUE_W: u32 = 150;
 const VALUE_H: u32 = 22;
-const VALUE_PIXELS: usize = (VALUE_W * VALUE_H) as usize;
 
 const GRAPH_Y: i32 = 68;
 const GRAPH_W: u32 = 320;
 const GRAPH_H: u32 = 104;
-const GRAPH_PIXELS: usize = (GRAPH_W * GRAPH_H) as usize;
 
 /// Backlight brightness 0–100%.
 const BACKLIGHT_PERCENT: u32 = 50;
 
 // --- Framebuffer ---
 
-struct Framebuf<const W: u32, const H: u32, const N: usize> {
-    pixels: Box<[Rgb565; N]>,
+struct Framebuf<const W: u32, const H: u32> {
+    pixels: Box<[Rgb565]>,
 }
 
-impl<const W: u32, const H: u32, const N: usize> Framebuf<W, H, N> {
+impl<const W: u32, const H: u32> Framebuf<W, H> {
     fn new() -> Self {
         Self {
-            pixels: Box::new([COLOR_BG; N]),
+            pixels: vec![COLOR_BG; (W * H) as usize].into_boxed_slice(),
         }
     }
 
@@ -127,13 +125,13 @@ impl<const W: u32, const H: u32, const N: usize> Framebuf<W, H, N> {
     }
 }
 
-impl<const W: u32, const H: u32, const N: usize> OriginDimensions for Framebuf<W, H, N> {
+impl<const W: u32, const H: u32> OriginDimensions for Framebuf<W, H> {
     fn size(&self) -> Size {
         Size::new(W, H)
     }
 }
 
-impl<const W: u32, const H: u32, const N: usize> DrawTarget for Framebuf<W, H, N> {
+impl<const W: u32, const H: u32> DrawTarget for Framebuf<W, H> {
     type Color = Rgb565;
     type Error = core::convert::Infallible;
 
@@ -161,8 +159,8 @@ impl<const W: u32, const H: u32, const N: usize> DrawTarget for Framebuf<W, H, N
     }
 }
 
-type FieldBuf = Framebuf<VALUE_W, VALUE_H, VALUE_PIXELS>;
-type GraphBuf = Framebuf<GRAPH_W, GRAPH_H, GRAPH_PIXELS>;
+type FieldBuf = Framebuf<VALUE_W, VALUE_H>;
+type GraphBuf = Framebuf<GRAPH_W, GRAPH_H>;
 
 // --- Drawing helpers ---
 

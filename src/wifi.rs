@@ -25,6 +25,18 @@ const MAX_SCAN_APS: usize = 10;
 
 pub type ScanResult = heapless::Vec<(heapless::String<32>, i8), MAX_SCAN_APS>;
 
+/// Current STA RSSI in dBm, or 0 when not associated. Reads the live AP
+/// record via `esp_wifi_sta_get_ap_info`; the call is cheap and doesn't
+/// require a `Wifi` handle.
+pub fn sta_rssi() -> i32 {
+    let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
+    if unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) } == 0 {
+        ap_info.rssi as i32
+    } else {
+        0
+    }
+}
+
 fn sta_config(creds: &WifiCredentials) -> ClientConfiguration {
     ClientConfiguration {
         ssid: creds.ssid.as_str().try_into().unwrap(),

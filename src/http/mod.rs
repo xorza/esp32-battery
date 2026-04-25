@@ -106,6 +106,48 @@ pub(crate) fn serve_common_assets(server: &mut EspHttpServer<'static>) {
     );
 }
 
+/// Read exactly `buf.len()` bytes from the request body. Errors on EOF
+/// before the buffer fills (`short`) or on any underlying read error
+/// (`err_msg`). Used by handlers that expect a fixed-size prefix (OTA
+/// HMAC tag, etc.).
+pub(crate) fn read_exact(
+    req: &mut Request<&mut EspHttpConnection>,
+    buf: &mut [u8],
+    err_msg: &'static str,
+    short: &'static str,
+) -> Result<(), &'static str> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = req.read(&mut buf[filled..]).map_err(|e| {
+            log::warn!("read_exact: {:?}", e);
+            err_msg
+        })?;
+        if n == 0 {
+            return Err(short);
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
+/// Read up to `buf.len()` bytes from the request body, returning the
+/// number actually read. Treats short reads (EOF) as success — for
+/// handlers parsing variable-size form bodies into a bounded buffer.
+pub(crate) fn read_to_buf(
+    req: &mut Request<&mut EspHttpConnection>,
+    buf: &mut [u8],
+) -> Result<usize, EspError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = req.read(&mut buf[filled..]).map_err(|e| e.0)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
 /// Send a `Connection: close` plaintext response with the given status and body.
 pub(crate) fn text_response(
     req: Request<&mut EspHttpConnection>,

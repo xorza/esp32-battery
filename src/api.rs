@@ -16,6 +16,7 @@ use esp32_battery_logic::data::Sample;
 use crate::app_state::SensorDataHandle;
 use crate::clock::uptime_s;
 use crate::http::json_response;
+use crate::wifi::sta_rssi;
 
 #[derive(Serialize)]
 pub struct BatteryReading {
@@ -89,15 +90,6 @@ pub struct ApiResponse<'a> {
 /// so 16 KiB leaves margin. If serialization still overflows we return 500 instead of panicking.
 pub const RESPONSE_BUF_SIZE: usize = 16_384;
 
-fn get_rssi() -> i32 {
-    let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
-    if unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) } == 0 {
-        ap_info.rssi as i32
-    } else {
-        0
-    }
-}
-
 pub fn register(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHandle) {
     let json_buf = Mutex::new(Box::new([0u8; RESPONSE_BUF_SIZE]));
 
@@ -114,7 +106,7 @@ pub fn register(server: &mut EspHttpServer<'static>, sensor_data: SensorDataHand
                 let ps = store.ps_reading().unwrap_or_default();
                 let response = ApiResponse {
                     uptime: uptime_s(),
-                    rssi: get_rssi(),
+                    rssi: sta_rssi(),
                     voltage: bat.voltage,
                     power_online: store.power_online(),
                     heap: HeapInfo::new(),

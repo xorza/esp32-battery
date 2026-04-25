@@ -58,29 +58,16 @@ fn reply(
     Ok(())
 }
 
-fn read_exact(
-    req: &mut esp_idf_svc::http::server::Request<&mut EspHttpConnection>,
-    buf: &mut [u8],
-) -> Result<(), &'static str> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = req.read(&mut buf[filled..]).map_err(|e| {
-            warn!("OTA: read error: {:?}", e);
-            "failed to read HMAC"
-        })?;
-        if n == 0 {
-            return Err("missing HMAC signature");
-        }
-        filled += n;
-    }
-    Ok(())
-}
-
 fn handle_upload(
     req: &mut esp_idf_svc::http::server::Request<&mut EspHttpConnection>,
 ) -> Result<usize, &'static str> {
     let mut expected_hmac = [0u8; 32];
-    read_exact(req, &mut expected_hmac)?;
+    crate::http::read_exact(
+        req,
+        &mut expected_hmac,
+        "failed to read HMAC",
+        "missing HMAC signature",
+    )?;
 
     let mut mac = HmacSha256::new_from_slice(&decode_key()).expect("HMAC key length must be valid");
 

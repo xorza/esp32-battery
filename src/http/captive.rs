@@ -15,7 +15,9 @@ use crate::dns::DnsHandle;
 use crate::nvs_creds::WifiCredentials;
 use crate::wifi::Wifi;
 
-use super::{create_server, json_response, serve_common_assets, serve_static, text_response};
+use super::{
+    create_server, json_response, read_to_buf, serve_common_assets, serve_static, text_response,
+};
 
 /// Max JSON size for /scan: 10 APs × ~40 bytes (quoted 32-char SSID + rssi) + brackets.
 const SCAN_BUF_SIZE: usize = 1024;
@@ -47,17 +49,7 @@ pub fn start(
     server
         .fn_handler("/save", esp_idf_svc::http::Method::Post, move |mut req| {
             let mut body_buf = [0u8; 256];
-            let mut filled = 0;
-            loop {
-                let n = req.read(&mut body_buf[filled..]).map_err(|e| e.0)?;
-                if n == 0 {
-                    break;
-                }
-                filled += n;
-                if filled >= body_buf.len() {
-                    break;
-                }
-            }
+            let filled = read_to_buf(&mut req, &mut body_buf)?;
             let body = std::str::from_utf8(&body_buf[..filled]).unwrap_or("");
 
             let Some((ssid_raw, pass_raw)) = form::parse_form(body) else {
