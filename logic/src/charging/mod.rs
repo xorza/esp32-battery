@@ -19,6 +19,61 @@
 
 use std::time::Duration;
 
+// ─── Tunables ────────────────────────────────────────────────────────────────
+
+/// CC charge rate as a fraction of pack capacity. 0.2C is the
+/// longevity-tuned value; manufacturer max is 0.5C. Stay conservative.
+pub const REGULATION_C: f32 = 0.2;
+/// Tail-current threshold for ending Absorb, as a fraction of capacity.
+/// 0.05C (= C/20) is the cell-manufacturer-standard termination current
+/// for LFP — consensus across Battle Born, Victron, and Nordkyn Design
+/// references.
+pub const EXIT_ABSORB_C: f32 = 0.05;
+/// Threshold for entering Absorb. Sits just above `EXIT_ABSORB_C` so the
+/// hysteresis band straddles the manufacturer tail current — no flap once
+/// the pack tapers near 0.05C.
+pub const ENTER_ABSORB_C: f32 = 0.06;
+const _: () = assert!(REGULATION_C > ENTER_ABSORB_C);
+const _: () = assert!(ENTER_ABSORB_C > EXIT_ABSORB_C);
+
+/// How far above `absorb_v` the pack must sit before the firmware's
+/// debounced OV trip starts counting. Pub so callers (and the hardware-OVP
+/// derivation below) reference one number, not a literal.
+pub const OV_MARGIN_V: f32 = 0.2;
+/// Margin above `absorb_v` programmed into the buck's own OVP register.
+/// Must strictly exceed `OV_MARGIN_V` so the supervisor's debounced trip
+/// fires first; the const-block below enforces it at compile time.
+pub const HARDWARE_OVP_MARGIN_V: f32 = OV_MARGIN_V * 3.0;
+const _: () = assert!(HARDWARE_OVP_MARGIN_V > OV_MARGIN_V);
+
+/// Nominal DC input feeding the XY7025 buck. Used to derive the buck's input
+/// UVLO (LVP register) — it has nothing to do with the pack profile.
+pub const INPUT_NOMINAL_V: f32 = 24.0;
+/// Headroom below `INPUT_NOMINAL_V` before the buck cuts output on input sag.
+/// 2 V tolerates ~8% droop and stays well above the XY7025's 12 V minimum.
+pub const INPUT_LVP_MARGIN_V: f32 = 2.0;
+const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
+
+/// How long the pack must hold above `absorb_v + OV_MARGIN_V` before tripping.
+/// Time-based so the debounce isn't sensitive to poll cadence.
+const OV_DURATION: Duration = Duration::from_secs(3);
+/// Cap on how long absorb can run continuously. With the manufacturer-spec
+/// 0.05C tail (`EXIT_ABSORB_C`), a healthy pack tapers under 30 min — 2 h
+/// is generous headroom while keeping a stuck-current scenario from sitting
+/// at CV indefinitely.
+const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long charging current must hold below `exit_absorb_a` before the
+/// supervisor accepts the taper as real and drops back to Float. Filters
+/// brief sags from switching noise or transient loads that would otherwise
+/// finish absorb prematurely.
+const EXIT_DEBOUNCE: Duration = Duration::from_secs(60);
+/// How long battery readings can stay absent before we fail closed.
+const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long Modbus reads to the XY can keep failing before we fail closed.
+const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
 #[derive(Copy, Clone)]
 pub enum Chemistry {
     /// Daily-cycling LFP: 3.60 V/cell absorb, 3.375 V/cell float.
@@ -31,17 +86,6 @@ pub enum Chemistry {
     /// Longevity-tuned Li-ion (NMC/LCO): 4.10 V/cell absorb, 4.00 V/cell float.
     /// 4.10 V trades ~15% capacity for dramatically more cycles vs. 4.20 V.
     LiIon,
-}
-
-impl Chemistry {
-    /// Per-cell (absorb_v, float_v). Scaled by cell count in `Profile::for_pack`.
-    const fn per_cell(self) -> (f32, f32) {
-        match self {
-            Chemistry::LiFePo4 => (3.60, 3.375),
-            Chemistry::LiFePo4TopBalance => (3.65, 3.375),
-            Chemistry::LiIon => (4.10, 4.00),
-        }
-    }
 }
 
 #[derive(Copy, Clone)]
@@ -63,96 +107,11 @@ pub struct SafetyLimits {
     pub lvp_v: f32,
 }
 
-/// CC charge rate as a fraction of pack capacity. 0.2C is the
-/// longevity-tuned value; manufacturer max is 0.5C. Stay conservative.
-pub const REGULATION_C: f32 = 0.2;
-/// Tail-current threshold for ending Absorb, as a fraction of capacity.
-/// 0.05C (= C/20) is the cell-manufacturer-standard termination current
-/// for LFP — consensus across Battle Born, Victron, and Nordkyn Design
-/// references.
-pub const EXIT_ABSORB_C: f32 = 0.05;
-/// Threshold for entering Absorb. Sits just above `EXIT_ABSORB_C` so the
-/// hysteresis band straddles the manufacturer tail current — no flap once
-/// the pack tapers near 0.05C.
-pub const ENTER_ABSORB_C: f32 = 0.06;
-const _: () = assert!(REGULATION_C > ENTER_ABSORB_C);
-const _: () = assert!(ENTER_ABSORB_C > EXIT_ABSORB_C);
-
-impl Profile {
-    /// Build a pack-level profile from chemistry, series cell count, and
-    /// pack capacity. Voltages scale with `cells`; charge/taper currents
-    /// scale with `capacity_ah` via the `*_C` constants above. Same C-rates
-    /// across chemistries — the LFP literature is the basis, but the
-    /// fractions are conservative enough that NMC/LCO are also safe.
-    pub const fn for_pack(chemistry: Chemistry, cells: u8, capacity_ah: f32) -> Self {
-        assert!(cells > 0);
-        assert!(capacity_ah > 0.0);
-        let (av, fv) = chemistry.per_cell();
-        let s = cells as f32;
-        Self {
-            absorb_v: av * s,
-            float_v: fv * s,
-            regulation_a: capacity_ah * REGULATION_C,
-            enter_absorb_a: capacity_ah * ENTER_ABSORB_C,
-            exit_absorb_a: capacity_ah * EXIT_ABSORB_C,
-        }
-    }
-
-    /// Derive hard trip thresholds for the buck's own protection. The buck
-    /// fires these only when regulation has already failed — the supervisor's
-    /// debounced OV at `absorb_v + OV_MARGIN_V` should catch problems first.
-    /// Hardware OVP sits at 3× that margin so the supervisor always wins
-    /// (the const-block below enforces this at compile time). OCP is 50%
-    /// over the CC setpoint. LVP on the XY7025 is **input** UVLO, not a
-    /// pack-side cutoff — it's tied to the supply rail, not the profile.
-    pub const fn safety_limits(&self) -> SafetyLimits {
-        SafetyLimits {
-            ovp_v: self.absorb_v + HARDWARE_OVP_MARGIN_V,
-            ocp_a: self.regulation_a * 1.5,
-            lvp_v: INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V,
-        }
-    }
-}
-
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Phase {
     Float,
     Absorb,
 }
-
-/// How far above `absorb_v` the pack must sit before the firmware's
-/// debounced OV trip starts counting. Pub so callers (and the hardware-OVP
-/// derivation below) reference one number, not a literal.
-pub const OV_MARGIN_V: f32 = 0.2;
-/// Margin above `absorb_v` programmed into the buck's own OVP register.
-/// Must strictly exceed `OV_MARGIN_V` so the supervisor's debounced trip
-/// fires first; the const-block below enforces it at compile time.
-pub const HARDWARE_OVP_MARGIN_V: f32 = OV_MARGIN_V * 3.0;
-const _: () = assert!(HARDWARE_OVP_MARGIN_V > OV_MARGIN_V);
-/// Nominal DC input feeding the XY7025 buck. Used to derive the buck's input
-/// UVLO (LVP register) — it has nothing to do with the pack profile.
-pub const INPUT_NOMINAL_V: f32 = 24.0;
-/// Headroom below `INPUT_NOMINAL_V` before the buck cuts output on input sag.
-/// 2 V tolerates ~8% droop and stays well above the XY7025's 12 V minimum.
-pub const INPUT_LVP_MARGIN_V: f32 = 2.0;
-const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
-/// How long the pack must hold above `absorb_v + OV_MARGIN_V` before tripping.
-/// Time-based so the debounce isn't sensitive to poll cadence.
-const OV_DURATION: Duration = Duration::from_secs(3);
-/// Cap on how long absorb can run continuously. With the manufacturer-spec
-/// 0.05C tail (`EXIT_ABSORB_C`), a healthy pack tapers under 30 min — 2 h
-/// is generous headroom while keeping a stuck-current scenario from sitting
-/// at CV indefinitely.
-const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
-/// How long charging current must hold below `exit_absorb_a` before the
-/// supervisor accepts the taper as real and drops back to Float. Filters
-/// brief sags from switching noise or transient loads that would otherwise
-/// finish absorb prematurely.
-const EXIT_DEBOUNCE: Duration = Duration::from_secs(60);
-/// How long battery readings can stay absent before we fail closed.
-const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long Modbus reads to the XY can keep failing before we fail closed.
-const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why the supervisor latched the buck off. Once latched, only a reboot
 /// clears it — auto-recovery on a battery charger means trying again
@@ -200,15 +159,86 @@ enum LatchState {
     Tripped { reason: FaultReason, acked: bool },
 }
 
+/// Time-based debouncer: counts elapsed while `cond` holds, resets when it
+/// doesn't. One per condition we care about (OV, absorb cap, exit taper,
+/// missing battery, modbus errors).
+#[derive(Default)]
+struct Debounce {
+    elapsed: Duration,
+}
+
+impl Debounce {
+    /// Add `dt` if `cond`, else reset. Returns `true` once accumulated
+    /// `>= timeout`.
+    fn step(&mut self, cond: bool, dt: Duration, timeout: Duration) -> bool {
+        if cond {
+            self.elapsed = self.elapsed.saturating_add(dt);
+            self.elapsed >= timeout
+        } else {
+            self.elapsed = Duration::ZERO;
+            false
+        }
+    }
+}
+
 pub struct ChargeSupervisor {
     profile: Profile,
     phase: Phase,
-    ov_elapsed: Duration,
-    absorb_elapsed: Duration,
-    exit_elapsed: Duration,
-    battery_missing_elapsed: Duration,
-    modbus_err_elapsed: Duration,
+    ov: Debounce,
+    absorb: Debounce,
+    exit: Debounce,
+    battery_missing: Debounce,
+    modbus_err: Debounce,
     latch: LatchState,
+}
+
+// ─── Impls ───────────────────────────────────────────────────────────────────
+
+impl Chemistry {
+    /// Per-cell (absorb_v, float_v). Scaled by cell count in `Profile::for_pack`.
+    const fn per_cell(self) -> (f32, f32) {
+        match self {
+            Chemistry::LiFePo4 => (3.60, 3.375),
+            Chemistry::LiFePo4TopBalance => (3.65, 3.375),
+            Chemistry::LiIon => (4.10, 4.00),
+        }
+    }
+}
+
+impl Profile {
+    /// Build a pack-level profile from chemistry, series cell count, and
+    /// pack capacity. Voltages scale with `cells`; charge/taper currents
+    /// scale with `capacity_ah` via the `*_C` constants above. Same C-rates
+    /// across chemistries — the LFP literature is the basis, but the
+    /// fractions are conservative enough that NMC/LCO are also safe.
+    pub const fn for_pack(chemistry: Chemistry, cells: u8, capacity_ah: f32) -> Self {
+        assert!(cells > 0);
+        assert!(capacity_ah > 0.0);
+        let (av, fv) = chemistry.per_cell();
+        let s = cells as f32;
+        Self {
+            absorb_v: av * s,
+            float_v: fv * s,
+            regulation_a: capacity_ah * REGULATION_C,
+            enter_absorb_a: capacity_ah * ENTER_ABSORB_C,
+            exit_absorb_a: capacity_ah * EXIT_ABSORB_C,
+        }
+    }
+
+    /// Derive hard trip thresholds for the buck's own protection. The buck
+    /// fires these only when regulation has already failed — the supervisor's
+    /// debounced OV at `absorb_v + OV_MARGIN_V` should catch problems first.
+    /// Hardware OVP sits at 3× that margin so the supervisor always wins
+    /// (the const-block above enforces this at compile time). OCP is 50%
+    /// over the CC setpoint. LVP on the XY7025 is **input** UVLO, not a
+    /// pack-side cutoff — it's tied to the supply rail, not the profile.
+    pub const fn safety_limits(&self) -> SafetyLimits {
+        SafetyLimits {
+            ovp_v: self.absorb_v + HARDWARE_OVP_MARGIN_V,
+            ocp_a: self.regulation_a * 1.5,
+            lvp_v: INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V,
+        }
+    }
 }
 
 impl ChargeSupervisor {
@@ -220,11 +250,11 @@ impl ChargeSupervisor {
         Self {
             profile,
             phase: Phase::Float,
-            ov_elapsed: Duration::ZERO,
-            absorb_elapsed: Duration::ZERO,
-            exit_elapsed: Duration::ZERO,
-            battery_missing_elapsed: Duration::ZERO,
-            modbus_err_elapsed: Duration::ZERO,
+            ov: Debounce::default(),
+            absorb: Debounce::default(),
+            exit: Debounce::default(),
+            battery_missing: Debounce::default(),
+            modbus_err: Debounce::default(),
             latch: LatchState::Active,
         }
     }
@@ -279,31 +309,23 @@ impl ChargeSupervisor {
             LatchState::Active => {}
         }
 
-        if modbus_ok {
-            self.modbus_err_elapsed = Duration::ZERO;
-        } else {
-            self.modbus_err_elapsed = self.modbus_err_elapsed.saturating_add(elapsed);
-            if self.modbus_err_elapsed >= MODBUS_UNHEALTHY_TIMEOUT {
-                return self.latch(FaultReason::ModbusUnhealthy);
-            }
+        if self.modbus_err.step(!modbus_ok, elapsed, MODBUS_UNHEALTHY_TIMEOUT) {
+            return self.latch(FaultReason::ModbusUnhealthy);
         }
 
+        if self
+            .battery_missing
+            .step(battery.is_none(), elapsed, BATTERY_MISSING_TIMEOUT)
+        {
+            return self.latch(FaultReason::BatterySensorStale);
+        }
         let Some(b) = battery else {
-            self.battery_missing_elapsed = self.battery_missing_elapsed.saturating_add(elapsed);
-            if self.battery_missing_elapsed >= BATTERY_MISSING_TIMEOUT {
-                return self.latch(FaultReason::BatterySensorStale);
-            }
             return Action::None;
         };
-        self.battery_missing_elapsed = Duration::ZERO;
 
-        if b.voltage.is_finite() && b.voltage > self.profile.absorb_v + OV_MARGIN_V {
-            self.ov_elapsed = self.ov_elapsed.saturating_add(elapsed);
-            if self.ov_elapsed >= OV_DURATION {
-                return self.latch(FaultReason::Overvoltage);
-            }
-        } else {
-            self.ov_elapsed = Duration::ZERO;
+        let ov = b.voltage.is_finite() && b.voltage > self.profile.absorb_v + OV_MARGIN_V;
+        if self.ov.step(ov, elapsed, OV_DURATION) {
+            return self.latch(FaultReason::Overvoltage);
         }
 
         if !b.current.is_finite() {
@@ -311,33 +333,26 @@ impl ChargeSupervisor {
         }
         // Charging current as a positive number.
         let charging_a = -b.current;
-        // Exit-debounce: only count time toward Float transition while in
-        // Absorb and below the tail threshold. Anywhere else the counter
-        // resets, so a brief sag back above `exit_absorb_a` starts the
-        // wait over.
         let below_exit = self.phase == Phase::Absorb && charging_a < self.profile.exit_absorb_a;
-        if below_exit {
-            self.exit_elapsed = self.exit_elapsed.saturating_add(elapsed);
-        } else {
-            self.exit_elapsed = Duration::ZERO;
-        }
+        let exit_done = self.exit.step(below_exit, elapsed, EXIT_DEBOUNCE);
+
         let next = match self.phase {
             Phase::Float if charging_a > self.profile.enter_absorb_a => Phase::Absorb,
-            Phase::Absorb if below_exit && self.exit_elapsed >= EXIT_DEBOUNCE => Phase::Float,
+            Phase::Absorb if exit_done => Phase::Float,
             p => p,
         };
         if next != self.phase {
             self.phase = next;
-            self.absorb_elapsed = Duration::ZERO;
-            self.exit_elapsed = Duration::ZERO;
+            // Reset both timers explicitly: a Float→Absorb transition can
+            // immediately follow an Absorb→Float, with no intervening Float
+            // dwell to clear stale counts.
+            self.absorb.elapsed = Duration::ZERO;
+            self.exit.elapsed = Duration::ZERO;
             return Action::SetVoltage(self.target_voltage());
         }
 
-        if self.phase == Phase::Absorb {
-            self.absorb_elapsed = self.absorb_elapsed.saturating_add(elapsed);
-            if self.absorb_elapsed >= MAX_ABSORB {
-                return self.latch(FaultReason::AbsorbTimeout);
-            }
+        if self.phase == Phase::Absorb && self.absorb.step(true, elapsed, MAX_ABSORB) {
+            return self.latch(FaultReason::AbsorbTimeout);
         }
         Action::None
     }
