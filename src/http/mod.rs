@@ -101,7 +101,7 @@ pub(crate) fn serve_common_assets(server: &mut EspHttpServer<'static>) {
         "/favicon.ico",
         "image/x-icon",
         "max-age=86400",
-        include_bytes!("../favicon.ico"),
+        include_bytes!("../../assets/favicon.ico"),
         false,
     );
 }

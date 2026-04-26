@@ -6,10 +6,10 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 
 const WEB_ASSETS: &[&str] = &[
-    "src/index.html",
-    "src/ota.html",
-    "src/captive_portal.html",
-    "src/style.css",
+    "assets/index.html",
+    "assets/ota.html",
+    "assets/captive_portal.html",
+    "assets/style.css",
 ];
 
 fn gzip_web_assets() {
