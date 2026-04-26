@@ -16,6 +16,7 @@ mod net;
 mod nvs_creds;
 mod ota;
 mod reboot;
+mod task_wdt;
 mod wifi;
 mod wifi_reset;
 mod xy;

@@ -30,6 +30,7 @@ use esp32_battery_logic::modbus::RtuError;
 
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
+use crate::task_wdt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -378,6 +379,15 @@ fn verify(what: &'static str, expected: f32, actual: f32) -> Result<(), BootErro
 const BOOT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const BOOT_RETRY_COUNT: u32 = 10;
 
+/// Task watchdog timeout for the xy supervisor thread. Must comfortably
+/// exceed `POLL_INTERVAL` (1 s) plus the worst-case Modbus retry budget
+/// (~500 ms response timeout × a few transactions per tick). 10 s gives
+/// generous headroom — long enough that a single slow tick never trips
+/// the WDT, short enough that a wedged loop reboots within ~10 s and
+/// `S_INI=OFF` brings the buck back up disabled.
+const WDT_TIMEOUT: Duration = Duration::from_secs(10);
+const _: () = assert!(WDT_TIMEOUT.as_secs() > POLL_INTERVAL.as_secs() * 2);
+
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     let mut boot_err = None;
     for attempt in 0..BOOT_RETRY_COUNT {
@@ -407,14 +417,18 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
     }
 
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
+    task_wdt::init_and_subscribe(WDT_TIMEOUT);
 
     // Wrap the supervisor loop so a panic anywhere inside (poisoned mutex,
     // unexpected None, etc.) doesn't leave the buck sourcing unsupervised.
     // On panic we force output OFF and let the thread die — no respawn,
-    // since whatever invariant just broke would likely break again.
+    // since whatever invariant just broke would likely break again. If
+    // the loop *hangs* instead of panicking, the task WDT reboots us
+    // after WDT_TIMEOUT and S_INI=OFF brings the buck up disabled.
     // The loop body diverges, so catch_unwind only ever returns on panic.
     let Err(panic) = catch_unwind(AssertUnwindSafe(|| -> ! {
         loop {
+            task_wdt::reset();
             let p = poll(&xy, &sensor_data, &recorder);
             let action = supervisor.tick(p, POLL_INTERVAL);
             apply_action(&xy, &mut supervisor, action, &recorder);

@@ -64,8 +64,13 @@ CONFIG_LWIP_TCP_FIN_WAIT_TIMEOUT=2000
 # Disable WiFi power save to avoid missed packets causing half-open connections
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
 
-# Disable task watchdog (OTA flash writes block IDLE task for >5s, triggering it)
-CONFIG_ESP_TASK_WDT_EN=n
+# Task watchdog: enabled for explicit subscription (xy supervisor only).
+# Idle tasks are NOT auto-subscribed — OTA flash writes block IDLE >5s and
+# would otherwise trip it. Auto-init is also off so the xy thread owns
+# init/timeout (see src/xy.rs).
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 
 # HTTPS server support
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
