@@ -38,6 +38,7 @@ impl NetStatusHandle {
         self.0.store(s as u8, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)] // consumed by the lcd thread
     pub fn load(&self) -> NetStatus {
         let v = self.0.load(Ordering::Relaxed);
         NetStatus::from_repr(v).expect("invalid NetStatus discriminant")

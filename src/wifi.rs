@@ -61,6 +61,7 @@ pub fn sta_rssi() -> i32 {
 /// `WIFI_STA_DEF`) — same "no `Wifi` handle needed" pattern as
 /// `sta_rssi`, so the LCD thread can poll it without touching the
 /// supervisor's state.
+#[allow(dead_code)] // consumed by the lcd thread
 pub fn sta_ip() -> Option<std::net::Ipv4Addr> {
     let netif =
         unsafe { esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr()) };
