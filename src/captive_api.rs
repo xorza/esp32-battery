@@ -1,13 +1,13 @@
 //! Captive-portal API: WiFi scan, credential save, status polling, and
 //! the Android captive-detection probe.
 //!
-//! `/save` parks the submitted creds in `Submission::Pending` and the
-//! main loop drains them on its next tick — applying them live via
-//! `wifi.set_sta_creds_live` and persisting to NVS only after STA
-//! actually associates. Bad creds therefore never overwrite a known-good
-//! pair on flash. On association the main loop drops the whole captive
-//! bundle (AP goes down, page's `/status` poll fails — the page treats
-//! that as success).
+//! `/save` parks parsed creds in the single-slot mailbox and flips the
+//! status atomic to `Pending`. The supervisor drains the mailbox on its
+//! next captive-arm tick, applies creds via `set_sta_creds`, and (on
+//! association) persists to NVS — bad creds therefore never overwrite a
+//! known-good pair on flash. On success the supervisor drops the captive
+//! bundle; the page's `/status` poll then errors, which it treats as
+//! success.
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::sys::EspError;
@@ -15,9 +15,8 @@ use log::info;
 
 use esp32_battery_logic::form;
 
-use crate::clock::uptime;
 use crate::http::{JsonBuf, mount_get, mount_json_get, mount_post, read_to_buf, text_response};
-use crate::net::{CaptiveStateHandle, Submission};
+use crate::net::{CredsMailbox, SubmissionStatus, SubmissionStatusHandle};
 use crate::nvs_creds::WifiCredentials;
 use crate::wifi::ScanCache;
 
@@ -27,7 +26,8 @@ const STATUS_BUF_SIZE: usize = 64;
 pub fn mount(
     server: &mut EspHttpServer<'static>,
     scan_cache: ScanCache,
-    state: CaptiveStateHandle,
+    mailbox: CredsMailbox,
+    status: SubmissionStatusHandle,
 ) {
     mount_json_get(
         server,
@@ -44,7 +44,7 @@ pub fn mount(
         },
     );
 
-    let save_state = state.clone();
+    let save_status = status.clone();
     mount_post(server, "/save", move |mut req| {
         let mut body_buf = [0u8; 256];
         let filled = read_to_buf(&mut req, &mut body_buf)?;
@@ -75,23 +75,23 @@ pub fn mount(
             password: password.to_string(),
         };
 
-        *save_state.lock().unwrap() = Submission::Pending {
-            creds,
-            since: uptime(),
-        };
+        // Latest-wins: a second /save before the supervisor drains
+        // overwrites the first.
+        *mailbox.lock().unwrap() = Some(creds);
+        save_status.store(SubmissionStatus::Pending);
 
         info!("Captive: queued new credentials for live STA reconnect");
         text_response(req, 200, b"OK")?;
         Ok::<(), EspError>(())
     });
 
-    let status_state = state;
+    let status_state = status;
     mount_json_get(
         server,
         "/status",
         JsonBuf::<STATUS_BUF_SIZE>::new(),
         move |buf| {
-            let name: &'static str = (&*status_state.lock().unwrap()).into();
+            let name: &'static str = status_state.load().into();
             let response = StatusResponse { state: name };
             serde_json_core::to_slice(&response, buf)
         },

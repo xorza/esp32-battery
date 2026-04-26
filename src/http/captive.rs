@@ -8,17 +8,19 @@ use log::info;
 
 use crate::captive_api;
 use crate::dns::DnsHandle;
-use crate::net::{CaptiveBundle, CaptiveStateHandle};
+use crate::net::{CaptiveBundle, SubmissionStatusHandle, new_creds_mailbox};
 use crate::wifi::ScanCache;
 
 use super::{create_server, serve_common_assets, serve_static};
 
-pub fn start(scan_cache: ScanCache, state: CaptiveStateHandle) -> CaptiveBundle {
+pub fn start(scan_cache: ScanCache) -> CaptiveBundle {
     let dns = DnsHandle::start();
+    let mailbox = new_creds_mailbox();
+    let status = SubmissionStatusHandle::new();
 
     let mut server = create_server(8192, true, 4, Some(Duration::from_secs(2)), false);
 
-    captive_api::mount(&mut server, scan_cache, state.clone());
+    captive_api::mount(&mut server, scan_cache, mailbox.clone(), status.clone());
     serve_common_assets(&mut server);
 
     // Wildcard fallback — must be the last fn_handler call so the named
@@ -37,6 +39,7 @@ pub fn start(scan_cache: ScanCache, state: CaptiveStateHandle) -> CaptiveBundle 
     CaptiveBundle {
         _server: server,
         _dns: dns,
-        state,
+        mailbox,
+        status,
     }
 }
