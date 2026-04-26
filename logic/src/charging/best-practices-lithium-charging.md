@@ -1,49 +1,109 @@
 # Best Practices for Charging LFP and Li-ion Batteries
 
-This document outlines the standard procedures and technical requirements for safely and efficiently charging Lithium Iron Phosphate (LFP) and Lithium-ion (NCM/NCA) batteries.
+Reference document describing standard CC/CV charging for Lithium Iron Phosphate (LFP) and Lithium-ion (NCM/NCA) batteries, and how this firmware implements them.
 
 ## 1. The CC/CV Charging Profile
-Both LFP and Li-ion batteries utilize a Constant Current / Constant Voltage (CC/CV) algorithm.
 
-### Phase 1: Constant Current (CC)
-The charger provides a fixed current (the "Bulk" stage). The battery voltage rises as it accepts the charge. This phase usually lasts until the battery reaches roughly 80–90% State of Charge (SOC).
+Both chemistries use a Constant Current / Constant Voltage (CC/CV) algorithm:
 
-### Phase 2: Constant Voltage (CV)
-Once the target absorption voltage is reached, the charger holds that voltage constant. The current naturally tapers down as the battery reaches full saturation.
+- **Phase 1 — Constant Current (CC):** charger sources a fixed current ("Bulk"). Battery voltage rises as it accepts charge. Lasts until ~80–90% SoC.
+- **Phase 2 — Constant Voltage (CV):** target absorption voltage is held constant. Charging current naturally tapers as the pack saturates.
+
+**This implementation:** the CC/CV transition is enforced **in hardware** by the XY7025 buck (`REG_I_SET` = `regulation_a` = capacity × `REGULATION_C`). The firmware-level supervisor doesn't run a separate CC stage — it operates two CV setpoints and switches between them based on observed current:
+
+- **Float CV** (`float_v`, e.g. 13.5 V for 4S LFP) when charging current < `enter_absorb_a`.
+- **Absorb CV** (`absorb_v`, e.g. 14.4 V for 4S LFP) once charging current crosses `enter_absorb_a`.
+
+The buck's internal CC limit caps current during bulk; the supervisor's job is choosing **which** CV setpoint the buck regulates to.
 
 ---
 
-## 2. Recommended Voltage Thresholds
+## 2. Voltage Thresholds
 
-| Battery Type | Nominal Cell Voltage | Max Charge Voltage (Cell) | Typical 4S/3S Pack Target |
+| Chemistry variant | Per-cell absorb | Per-cell float | 4S pack absorb |
 | :--- | :--- | :--- | :--- |
-| **LiFePO4 (LFP)** | 3.2V | 3.65V | 14.4V - 14.6V (4S) |
-| **Li-ion (NCM)** | 3.6V / 3.7V | 4.20V | 12.6V (3S) |
+| `Chemistry::LiFePo4` (daily) | 3.60 V | 3.375 V | **14.4 V** |
+| `Chemistry::LiFePo4TopBalance` | 3.65 V | 3.375 V | 14.6 V |
+| `Chemistry::LiIon` (longevity-tuned) | 4.10 V | 4.00 V | — (3S = 12.3 V) |
 
-**Note:** For LFP, charging to 3.60V per cell (14.4V for a 12V pack) is often preferred to 3.65V to maximize cycle life with negligible capacity loss.
-
----
-
-## 3. Termination Current (Cut-off)
-The termination current (or "tail current") determines when the charger stops the CV phase. This is critical for cell balancing.
-
-* **Standard Cut-off (0.05C):** Recommended for daily use where speed is preferred. For a 100Ah battery, this is 5A.
-* **Balancing Cut-off (0.02C):** Recommended for "Top Balancing." A lower current keeps the battery in the CV stage longer, allowing the BMS's passive balancers more time to bleed off high-voltage cells. For a 100Ah battery, this is 2A.
-* **Precision Cut-off (0.01C):** Used for initial commissioning or recovering out-of-balance packs.
+**Notes:**
+- Daily-cycling LFP at 14.4 V matches Victron / Battle Born consensus — gentler on cells than 14.6 V, reaches ~99% SoC either way.
+- `LiFePo4TopBalance` (14.6 V) is the manufacturer max — use sparingly when the BMS needs the headroom to balance cells.
+- Standard NCM Li-ion charges to 4.20 V/cell (12.6 V on 3S). This implementation uses 4.10 V instead: trades ~15% capacity for dramatically more cycles. If you need maximum capacity, add a `LiIonStandard` variant.
 
 ---
 
-## 4. Implementation for Programmable Chargers
-When developing firmware for a custom charger, the following logic should be implemented:
+## 3. Termination Current (Tail Current)
 
-1.  **Filtering:** Apply a moving average filter to ADC current readings to prevent noise from triggering a premature termination.
-2.  **Safety Timeout:** Implement a "Maximum Absorption Timer" (e.g., 2 hours). If the termination current isn't reached within this window, stop charging to prevent damage.
-3.  **BMS Handshaking:** The logic must account for the BMS disconnecting the charge circuit. If current drops to zero instantly while voltage is at the setpoint, the charger should transition to a standby state rather than cycling the power stage.
-4.  **Backflow Protection:** Use a blocking diode or an ideal diode controller (MOSFET) to prevent the battery from discharging back into the charger when it is powered down.
+The CV stage ends once charging current taper drops below a fraction of pack capacity:
+
+| Mode | C-rate | Use case | Implemented? |
+| :--- | :--- | :--- | :--- |
+| Standard | **0.05C** | Daily use, manufacturer-spec | ✓ `EXIT_ABSORB_C = 0.05` |
+| Balancing | 0.02C | Top-balancing — keeps pack at CV longer for BMS bleed | ✗ Not exposed |
+| Precision | 0.01C | Initial commissioning / out-of-balance recovery | ✗ Not exposed |
+
+The shipped firmware implements only the standard (0.05C) tail. Adding a balance mode would require a new `Chemistry` variant or a per-profile override.
+
+A second threshold, `ENTER_ABSORB_C = 0.06`, sits just above the tail and provides hysteresis — entering Absorb only when charging current exceeds 0.06C, exiting when it drops below 0.05C, so the pack doesn't flap at the boundary.
 
 ---
 
-## 5. Temperature and Safety
-* **Cold Charging:** **Never** charge lithium batteries below 0°C (32°F). Doing so causes permanent lithium plating on the anode, which is a fire hazard.
-* **Storage:** If the battery will not be used for more than 30 days, store it at 40–60% SOC in a cool environment.
-* **Cell Balancing:** LFP batteries should be charged to 100% (reaching the CV stage) at least once every few cycles to allow the BMS to calibrate its SOC estimation and balance the cells.
+## 4. Implementation Details
+
+### 4.1 Noise rejection
+
+Sensor noise from the switching regulator and transient loads can briefly push current under the tail threshold. The firmware rejects this with a **time-based debounce**: charging current must stay below `exit_absorb_a` for `EXIT_DEBOUNCE = 60 s` continuously before the supervisor accepts the taper as real.
+
+A moving average on the ADC would also work; the time-debounce is simpler and lets the same pattern apply uniformly to OV detection (`OV_DURATION = 3 s`), Modbus-unhealthy (`MODBUS_UNHEALTHY_TIMEOUT = 5 s`), and battery-stale (`BATTERY_MISSING_TIMEOUT = 10 s`).
+
+### 4.2 Maximum Absorption Timer
+
+`MAX_ABSORB = 2 h`. If charging current never tapers below `exit_absorb_a` within this window, the supervisor latches `FaultReason::AbsorbTimeout` and disables the buck. Catches stuck-current scenarios (parasitic load pinning current above the tail, BMS balancer drawing continuously, etc.) before the pack sits at CV indefinitely.
+
+A healthy 50 Ah pack at 0.05C tail typically taper-finishes in well under 30 min — the 2 h cap is generous headroom, not a typical operating point.
+
+### 4.3 BMS Handshaking
+
+**Not implemented.** If the BMS opens its charge FET (high-voltage disconnect / cell fault), the supervisor sees current drop to ~0 while the buck holds the CV setpoint. There's no dedicated detection — the eventual `MAX_ABSORB` timeout is the backstop (latches `AbsorbTimeout` after 2 h).
+
+A dedicated detector would fire faster and produce better diagnostics: "current < 0.01C for > 30 s while in Absorb at setpoint" → fault as `BmsTripped`. Worth adding only if BMS HVD events become a real operational concern.
+
+### 4.4 Hardware-side OV / OCP / LVP backstops
+
+The XY7025 has its own protection registers (OVP / OCP / input-LVP). The supervisor programs these via `Profile::safety_limits`:
+
+- **OVP** = `absorb_v + 0.6 V` — sits 3× the supervisor's debounced OV margin (0.2 V) above absorb, so the supervisor's faster trip catches the issue first.
+- **OCP** = `regulation_a × 1.5` — last-ditch over-current.
+- **LVP** = `INPUT_NOMINAL_V − 2 V` = 22 V — input UVLO (tied to the XY7025's 24 V supply rail, **not** a pack-side cutoff).
+
+### 4.5 Backflow protection
+
+Hardware concern; firmware doesn't address it. Use a blocking diode or an ideal-diode MOSFET on the pack side so the battery can't backfeed a powered-down charger.
+
+---
+
+## 5. Faults & Latch Behavior
+
+The supervisor latches the buck off on any of these conditions:
+
+| `FaultReason` | Trigger | Time budget |
+| :--- | :--- | :--- |
+| `BatterySensorStale` | No fresh INA228 reading | `BATTERY_MISSING_TIMEOUT` = 10 s |
+| `ModbusUnhealthy` | Continuous Modbus failures to the XY7025 | `MODBUS_UNHEALTHY_TIMEOUT` = 5 s |
+| `Overvoltage` | `v_batt > absorb_v + OV_MARGIN_V` | `OV_DURATION` = 3 s |
+| `AbsorbTimeout` | Stuck in Absorb without tapering | `MAX_ABSORB` = 2 h |
+
+After latching, the supervisor emits `Action::DisableOutput` on every `tick()` until the caller successfully writes `set_output(false)` to the buck and calls `ack_disable()`. Once acked, the supervisor goes silent — only a reboot clears the latch.
+
+After a reboot, the supervisor always boots in **Float**, regardless of the previous phase. Conservative by design: re-derive phase from observed current rather than persist it across resets.
+
+---
+
+## 6. Temperature & Operational Safety
+
+These are **not** enforced by firmware; they're operating constraints on the physical pack:
+
+- **Cold charging:** never charge a lithium pack below 0 °C (32 °F) — causes permanent lithium plating and fire risk. This firmware has no temperature sensor wired in. If freezing temps are possible, add a thermistor + a `BatteryTooCold` fault path.
+- **Storage:** if unused > 30 days, store at 40–60% SoC in a cool environment.
+- **Periodic full charge:** for LFP, charge to 100% (let the supervisor reach Absorb and complete the taper) at least once every few cycles so the BMS can re-balance and recalibrate its SoC estimate.
