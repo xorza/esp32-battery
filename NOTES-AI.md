@@ -5,7 +5,7 @@ Implementation notes for AI assistants. Tracks current state only — see git hi
 ## Hardware
 
 - MCU: ESP32-C6 (default) or ESP32-C3, selected via Cargo features (`board.rs` enforces exactly one).
-- Sensors: 2× INA228 over I2C (0x40 battery, 0x41 power-supply), 2 mΩ shunt, 15 A.
+- Battery sensor: 1× INA228 over I2C @ 0x40, 2 mΩ shunt, 15 A. Supply-side V/I/P comes from the XY7025 over Modbus (no second INA).
 - Charger: XY7025 buck on UART1, Modbus-RTU @ 115200 8N1, slave 0x01.
 - Battery: 4S LiFePO4 (12 V nominal). Other chemistries defined in `logic/src/charging`.
 - Optional ST7789 LCD via SPI (`lcd` feature).

@@ -1,11 +1,12 @@
 # ESP32 Battery Monitor
 
-Off-grid battery monitor and charger controller built on the ESP32-C6 (ESP32-C3 also supported). Reads two INA228 sensors (battery + power-supply rail) over I2C, drives an XY7025 programmable buck converter over Modbus-RTU for two-phase CV charging, and serves a real-time dashboard over HTTPS.
+Off-grid battery monitor and charger controller built on the ESP32-C6 (ESP32-C3 also supported). Reads battery V/I/P from an INA228 over I2C, drives an XY7025 programmable buck converter over Modbus-RTU for two-phase CV charging (which also reports the supply-side V/I/P), and serves a real-time dashboard over HTTPS.
 
 ## Hardware
 
 - **MCU**: ESP32-C6 (default) or ESP32-C3 — selected via the `esp32c6` / `esp32c3` Cargo features
-- **Sensors**: 2× INA228 current/voltage/power monitors, I2C addresses 0x40 (battery) and 0x41 (power supply)
+- **Battery sensor**: INA228 current/voltage/power monitor on I2C, address 0x40
+- **Power supply**: XY7025 reports its own V/I/P over Modbus (no second INA needed)
 - **Shunt**: 2 mΩ, 15 A max
 - **I2C**: SDA/SCL pins per `src/board.rs`, 400 kHz
 - **Charger**: XY7025 programmable buck converter on UART1, Modbus-RTU @ 115200 8N1, slave 0x01
