@@ -42,31 +42,16 @@ after `boot_sequence` returns and the loop spins.
 enable if `b.voltage > absorb_v + OV_MARGIN_V` (or `!is_finite()`).
 Costs at most one POLL_INTERVAL of latency.
 
-### Boot-failure path discards the disable write
+### Boot-failure path discards the disable write — FIXED
 
-`src/xy.rs:389` — after `BOOT_RETRY_COUNT` failed boot attempts:
-
-```rust
-let _ = xy.set_output(false);
-return;
-```
-
-If `boot_sequence` failed because the buck is unreachable, this final
-disable likely fails too — and the result is discarded. The thread then
-exits, leaving no further supervision.
-
-**Effect**: if the buck's `S-INI` register is 1 (factory default, or
-written by a previous firmware), the buck sources into the pack with no
-firmware-side cutoff. Only hardware OVP/OCP/LVP protect — and those
-registers may carry stale values from a prior firmware that used a
-different chemistry/cell-count profile.
-
-**Fix options**:
-- Log the disable result (cheap, observable).
-- Replace `return;` with a degraded loop that retries `set_output(false)`
-  every few seconds — keeps trying to fail-closed instead of giving up.
-- Document explicitly that the only safety net here is the hardware
-  registers + S-INI=0 from a *previous* successful boot.
+**Status: fixed.** The boot-fail branch now falls through to the
+supervisor loop instead of `return`-ing, and the eager `set_output(false)`
+result is logged on both Ok and Err. The supervisor keeps retrying the
+disable forever via the `ModbusUnhealthy` latch path; if Modbus
+recovers, the disable goes through and the latch acks. The supervisor
+never emits an enable action, so a recovered Modbus link can't
+inadvertently re-energize the buck. Drift detection catches the case
+where the buck somehow has stale setpoints from a prior boot cycle.
 
 ---
 

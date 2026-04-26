@@ -383,11 +383,16 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
     if !booted {
         let e = last_err.expect("retry loop ran at least once");
         error!(
-            "XY boot failed after {BOOT_RETRY_COUNT} attempts: {e} — forcing output OFF, exiting thread"
+            "XY boot failed after {BOOT_RETRY_COUNT} attempts: {e} — falling through to supervisor for fail-closed retries"
         );
         recorder.record(Event::Xy(XyError::BootSequence));
-        let _ = xy.set_output(false);
-        return;
+        // Eager disable. The supervisor will keep retrying via the
+        // ModbusUnhealthy latch path anyway, but doing it now cuts
+        // time-to-OFF by ~5 s (the modbus-debounce window).
+        match xy.set_output(false) {
+            Ok(()) => error!("XY post-boot-fail set_output(false) succeeded"),
+            Err(e) => error!("XY post-boot-fail set_output(false) FAILED: {e}"),
+        }
     }
 
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
