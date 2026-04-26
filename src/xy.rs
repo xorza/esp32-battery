@@ -259,11 +259,11 @@ mod fake {
 
 /// Programs protection + setpoints, then enables output. Any failure
 /// short-circuits — we never enable output with unprogrammed setpoints.
-fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), RtuError> {
+fn boot_sequence<D: XyDevice>(xy: &D) -> Result<(), RtuError> {
     xy.set_output(false)?;
     xy.set_power_on_default_off()?;
     xy.set_protection(SAFETY)?;
-    xy.set_voltage(initial_v_set)?;
+    xy.set_voltage(PACK_PROFILE.float_v)?;
     xy.set_current_limit(PACK_PROFILE.regulation_a)?;
     xy.set_output(true)?;
     Ok(())
@@ -278,14 +278,12 @@ const BOOT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const BOOT_RETRY_COUNT: u32 = 10;
 
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
-    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
-
     let mut last_err = None;
     let booted = (0..BOOT_RETRY_COUNT).any(|attempt| {
         if attempt > 0 {
             thread::sleep(BOOT_RETRY_DELAY);
         }
-        match boot_sequence(&xy, supervisor.target_voltage()) {
+        match boot_sequence(&xy) {
             Ok(()) => true,
             Err(e) => {
                 last_err = Some(e);
@@ -301,6 +299,8 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         recorder.record(Event::Xy(XyError::BootSequence));
         let _ = xy.set_output(false);
     }
+
+    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
     loop {
         let (modbus_ok, battery) = {
