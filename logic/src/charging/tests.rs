@@ -248,7 +248,11 @@ fn stays_in_absorb_above_exit_threshold() {
 fn exits_absorb_when_taper_drops_below_threshold() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     s.tick(true, b(OK_V, -4.0), TICK); // → Absorb
-    // 2.4 A charging — below 2.5 A exit.
+    // Sustained taper below 2.5 A for the debounce window. BUDGET-1 ticks
+    // hold absorb; one more crosses → drop to float.
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+    }
     assert!(matches!(
         s.tick(true, b(OK_V, -2.4), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
@@ -258,14 +262,69 @@ fn exits_absorb_when_taper_drops_below_threshold() {
 
 #[test]
 fn exits_absorb_when_load_pulls_current() {
-    // Battery starts discharging mid-absorb (charger off / heavy load).
-    // charging_a is negative → certainly < 2.5 A → drop to float.
+    // Battery discharging mid-absorb (charger off / heavy load) for the
+    // debounce window. Same path as a real taper — counter accumulates,
+    // transition fires once it crosses.
     let mut s = ChargeSupervisor::new(lfp_4s());
     s.tick(true, b(OK_V, -4.0), TICK);
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(s.tick(true, b(OK_V, 3.0), TICK), Action::None));
+    }
     assert!(matches!(
         s.tick(true, b(OK_V, 3.0), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
     ));
+}
+
+#[test]
+fn brief_taper_dip_does_not_exit_absorb() {
+    // Pack flickers below the tail current for half the debounce window,
+    // then comes back. Counter must reset — no transition.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    s.tick(true, b(OK_V, -4.0), TICK);
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() / 2) {
+        assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+    }
+    // Sag recovers — current back above the tail.
+    assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
+    // Must now sit through another full debounce window without transitioning.
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+    }
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn exit_debounce_does_not_accumulate_in_float() {
+    // Sub-tail current while in Float must not arm the exit debounce.
+    // Otherwise a Float→Absorb transition followed by an immediate dip
+    // could fire a spurious Absorb→Float on the very next tick.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    // Sit in Float at sub-tail current well past the debounce window.
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() * 2) {
+        assert!(matches!(s.tick(true, b(OK_V, -1.0), TICK), Action::None));
+    }
+    // Enter Absorb, then dip below tail. Counter must start fresh — one
+    // tick is not enough to transition out.
+    assert!(matches!(
+        s.tick(true, b(OK_V, -4.0), TICK),
+        Action::SetVoltage(_)
+    ));
+    assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn exit_debounce_honors_elapsed() {
+    // One big-elapsed tick crossing the full debounce window must transition.
+    // Mirrors the equivalent OV / absorb-timeout tests.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    s.tick(true, b(OK_V, -4.0), TICK);
+    assert!(matches!(
+        s.tick(true, b(OK_V, -2.4), EXIT_DEBOUNCE),
+        Action::SetVoltage(v) if approx(v, 13.5)
+    ));
+    assert!(matches!(s.phase(), Phase::Float));
 }
 
 #[test]
@@ -360,7 +419,10 @@ fn full_charge_cycle() {
     for &i in &[-7.0, -5.0, -3.5, -3.0, -2.7] {
         assert!(matches!(s.tick(true, b(OK_V, i), TICK), Action::None));
     }
-    // Crosses below 2.5 A → drop to float.
+    // Sustained sub-tail current for the debounce window → drop to float.
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+    }
     assert!(matches!(
         s.tick(true, b(OK_V, -2.4), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
@@ -484,11 +546,16 @@ fn float_does_not_accumulate_absorb_ticks() {
 fn absorb_counter_resets_on_taper_back_to_float() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     enter_absorb(&mut s);
-    // Spend most of the budget in absorb…
-    for _ in 0..(MAX_ABSORB.as_secs() - 10) {
+    // Spend most of the budget in absorb, leaving room for a full exit
+    // debounce window before the absorb timeout would fire.
+    for _ in 0..(MAX_ABSORB.as_secs() - EXIT_DEBOUNCE.as_secs() - 10) {
         s.tick(true, b(OK_V, -3.0), TICK);
     }
-    // …then taper to Float. Counter must reset.
+    // …then taper to Float. Sub-tail current for the debounce window
+    // before the transition fires, then absorb_elapsed resets.
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(s.tick(true, b(OK_V, -0.1), TICK), Action::None));
+    }
     assert!(matches!(
         s.tick(true, b(OK_V, -0.1), TICK),
         Action::SetVoltage(_)

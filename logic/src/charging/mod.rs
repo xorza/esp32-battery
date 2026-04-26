@@ -144,6 +144,11 @@ const OV_DURATION: Duration = Duration::from_secs(3);
 /// is generous headroom while keeping a stuck-current scenario from sitting
 /// at CV indefinitely.
 const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long charging current must hold below `exit_absorb_a` before the
+/// supervisor accepts the taper as real and drops back to Float. Filters
+/// brief sags from switching noise or transient loads that would otherwise
+/// finish absorb prematurely.
+const EXIT_DEBOUNCE: Duration = Duration::from_secs(60);
 /// How long battery readings can stay absent before we fail closed.
 const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long Modbus reads to the XY can keep failing before we fail closed.
@@ -200,6 +205,7 @@ pub struct ChargeSupervisor {
     phase: Phase,
     ov_elapsed: Duration,
     absorb_elapsed: Duration,
+    exit_elapsed: Duration,
     battery_missing_elapsed: Duration,
     modbus_err_elapsed: Duration,
     latch: LatchState,
@@ -216,6 +222,7 @@ impl ChargeSupervisor {
             phase: Phase::Float,
             ov_elapsed: Duration::ZERO,
             absorb_elapsed: Duration::ZERO,
+            exit_elapsed: Duration::ZERO,
             battery_missing_elapsed: Duration::ZERO,
             modbus_err_elapsed: Duration::ZERO,
             latch: LatchState::Active,
@@ -304,14 +311,25 @@ impl ChargeSupervisor {
         }
         // Charging current as a positive number.
         let charging_a = -b.current;
+        // Exit-debounce: only count time toward Float transition while in
+        // Absorb and below the tail threshold. Anywhere else the counter
+        // resets, so a brief sag back above `exit_absorb_a` starts the
+        // wait over.
+        let below_exit = self.phase == Phase::Absorb && charging_a < self.profile.exit_absorb_a;
+        if below_exit {
+            self.exit_elapsed = self.exit_elapsed.saturating_add(elapsed);
+        } else {
+            self.exit_elapsed = Duration::ZERO;
+        }
         let next = match self.phase {
             Phase::Float if charging_a > self.profile.enter_absorb_a => Phase::Absorb,
-            Phase::Absorb if charging_a < self.profile.exit_absorb_a => Phase::Float,
+            Phase::Absorb if below_exit && self.exit_elapsed >= EXIT_DEBOUNCE => Phase::Float,
             p => p,
         };
         if next != self.phase {
             self.phase = next;
             self.absorb_elapsed = Duration::ZERO;
+            self.exit_elapsed = Duration::ZERO;
             return Action::SetVoltage(self.target_voltage());
         }
 
