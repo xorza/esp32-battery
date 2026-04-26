@@ -55,27 +55,46 @@ Triggers:
 
 States 1/2/5/6 and 7/9 with no listed trigger simply stay put.
 
+## Credential ownership
+
+Credentials live in **NVS** (`nvs_creds::{load, save, clear}`) and on
+the **radio config** (set via `MixedWifi::set_sta_creds` /
+`into_sta`). The FSM only carries an in-memory copy during the
+*un-persisted window* — between `/save` and the success that writes
+them to NVS. Outside that window, the FSM reads from NVS or the radio,
+not from a variant field.
+
+| Variant | Creds in variant? | Source of truth |
+|---|---|---|
+| `BootNoCreds`, `CaptiveAwaitingUser`, `CaptiveFailed` | no | — |
+| `CaptiveSubmitted`, `CaptiveTrying` | **yes** | variant (not yet in NVS) |
+| `CaptiveFallbackRetrying` | no | NVS + radio |
+| `StaConnecting`, `StaHost`, `StaReassociating` | no | NVS + radio |
+
+On `CaptiveTrying → StaHost`: take the creds out of the variant,
+`nvs_creds::save(...)`, then construct `StaHost` without them.
+
 ## Sketch
 
 ```rust
 enum NetState {
     BootNoCreds              { wifi: MixedWifi, bundle: CaptiveBundle },
-    CaptiveAwaitingUser      { wifi: MixedWifi, bundle: CaptiveBundle, creds: Option<Creds> },
+    CaptiveAwaitingUser      { wifi: MixedWifi, bundle: CaptiveBundle },
     CaptiveSubmitted         { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds, since: Duration },
     CaptiveTrying            { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds, since: Duration },
-    CaptiveFailed            { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds },
-    CaptiveFallbackRetrying  { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds, since: Duration },
-    StaConnecting            { wifi: StaWifi,   creds: Creds, session_start: Duration },
-    StaHost                  { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, creds: Creds, last_assoc: Duration },
-    StaReassociating         { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, creds: Creds, last_assoc: Duration },
+    CaptiveFailed            { wifi: MixedWifi, bundle: CaptiveBundle },
+    CaptiveFallbackRetrying  { wifi: MixedWifi, bundle: CaptiveBundle, since: Duration },
+    StaConnecting            { wifi: StaWifi,   session_start: Duration },
+    StaHost                  { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, last_assoc: Duration },
+    StaReassociating         { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, last_assoc: Duration },
 }
 ```
 
 Each tick: `match` on `state`, run that arm's logic, return the next
 `NetState`. The variant *is* the state machine — no separate
-`Submission` enum, no shared mutex with HTTP, no `Option<mdns>` /
-`Option<creds>` flags. `/save` writes to an MPSC channel; the
-supervisor drains it during the relevant captive-arm ticks.
+`Submission` enum, no shared mutex with HTTP, no `Option`-as-flag
+fields. `/save` writes to an MPSC channel; the supervisor drains it
+during the relevant captive-arm ticks.
 
 ## Constants
 
