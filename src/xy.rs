@@ -17,10 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use log::{error, warn};
+use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    Action, BatterySample, ChargeSupervisor, Chemistry, FaultReason, Profile, SafetyLimits,
+    Action, BatterySample, ChargeSupervisor, Chemistry, Phase, PollResult, Profile, SafetyLimits,
+    Setpoints,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
@@ -382,91 +383,89 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
     if !booted {
         let e = last_err.expect("retry loop ran at least once");
         error!(
-            "XY boot failed after {BOOT_RETRY_COUNT} attempts: {e} — forcing output OFF, will keep polling"
+            "XY boot failed after {BOOT_RETRY_COUNT} attempts: {e} — forcing output OFF, exiting thread"
         );
         recorder.record(Event::Xy(XyError::BootSequence));
         let _ = xy.set_output(false);
+        return;
     }
 
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
     loop {
-        let (modbus_ok, battery) = {
-            let mut sd = sensor_data.lock().unwrap();
-            let modbus_ok = match xy.read_status() {
-                Ok(s) => {
-                    sd.update_ps(PsReading {
-                        voltage: s.v_out,
-                        current: s.i_out,
-                        power: s.p_out,
-                    });
-                    // Setpoint drift = buck is sourcing under unknown
-                    // settings. Latch SettingsDrift; the next supervisor
-                    // tick will emit DisableOutput.
-                    let want_v = supervisor.target_voltage();
-                    let want_i = PACK_PROFILE.regulation_a;
-                    let v_drift = (s.v_set - want_v).abs() >= 0.02;
-                    let i_drift = (s.i_set - want_i).abs() >= 0.02;
-                    if v_drift || i_drift {
-                        error!(
-                            "XY setpoint drift: V_SET want {want_v:.2} got {:.2}, I_SET want {want_i:.2} got {:.2}",
-                            s.v_set, s.i_set
-                        );
-                        supervisor.force_fault(FaultReason::SettingsDrift);
-                    }
-                    true
-                }
-                Err(e) => {
-                    warn!("XY read_status: {e}");
-                    recorder.record(Event::Xy(XyError::ReadStatus));
-                    false
-                }
-            };
+        let p = poll(&xy, &sensor_data, &recorder);
+        let action = supervisor.tick(p, POLL_INTERVAL);
+        apply_action(&xy, &mut supervisor, action, &recorder);
+        thread::sleep(POLL_INTERVAL);
+    }
+}
 
-            let battery = sd.battery_reading().map(|b| BatterySample {
-                voltage: b.voltage,
-                current: b.current,
+/// One read cycle: poll the buck, push readings into shared sensor data,
+/// snapshot the latest battery sample, and return the supervisor's
+/// per-tick view of the world.
+fn poll<D: XyDevice>(
+    xy: &D,
+    sensor_data: &Mutex<SensorData>,
+    recorder: &EventRecorder,
+) -> PollResult {
+    let mut sd = sensor_data.lock().unwrap();
+    let setpoints = match xy.read_status() {
+        Ok(s) => {
+            sd.update_ps(PsReading {
+                voltage: s.v_out,
+                current: s.i_out,
+                power: s.p_out,
             });
+            Some(Setpoints {
+                v_set: s.v_set,
+                i_set: s.i_set,
+            })
+        }
+        Err(e) => {
+            warn!("XY read_status: {e}");
+            recorder.record(Event::Xy(XyError::ReadStatus));
+            None
+        }
+    };
+    let battery = sd.battery_reading().map(|b| BatterySample {
+        voltage: b.voltage,
+        current: b.current,
+    });
+    PollResult { setpoints, battery }
+}
 
-            (modbus_ok, battery)
-        };
-
-        match supervisor.tick(modbus_ok, battery, POLL_INTERVAL) {
-            Action::None => {}
-            Action::SetVoltage(v) => {
-                let phase = match supervisor.phase() {
-                    esp32_battery_logic::charging::Phase::Float => "float",
-                    esp32_battery_logic::charging::Phase::Absorb => "absorb",
-                };
-                log::info!("charge phase → {phase}: setting V_set = {v:.2} V");
-                if let Err(e) = xy.set_voltage(v) {
-                    warn!("XY set_voltage({v}): {e}");
-                    recorder.record(Event::Xy(XyError::SetVoltage));
-                }
-            }
-            Action::DisableOutput(reason) => {
-                let reason_str = match reason {
-                    FaultReason::BatterySensorStale => "battery sensor stale",
-                    FaultReason::ModbusUnhealthy => "modbus link unhealthy",
-                    FaultReason::Overvoltage => "pack overvoltage",
-                    FaultReason::AbsorbTimeout => "absorb time cap reached",
-                    FaultReason::SettingsDrift => "setpoint readback drift",
-                };
-                match xy.set_output(false) {
-                    Ok(()) => {
-                        error!("CHARGE FAULT ({reason_str}): PS output DISABLED");
-                        supervisor.ack_disable();
-                    }
-                    Err(e) => {
-                        error!(
-                            "CHARGE FAULT ({reason_str}): set_output(false) failed: {e} — will retry"
-                        );
-                        recorder.record(Event::Xy(XyError::SetOutput));
-                    }
-                }
+fn apply_action<D: XyDevice>(
+    xy: &D,
+    supervisor: &mut ChargeSupervisor,
+    action: Action,
+    recorder: &EventRecorder,
+) {
+    match action {
+        Action::None => {}
+        Action::SetVoltage(v) => {
+            let phase = match supervisor.phase() {
+                Phase::Float => "float",
+                Phase::Absorb => "absorb",
+            };
+            info!("charge phase → {phase}: setting V_set = {v:.2} V");
+            if let Err(e) = xy.set_voltage(v) {
+                warn!("XY set_voltage({v}): {e}");
+                recorder.record(Event::Xy(XyError::SetVoltage));
             }
         }
-        thread::sleep(POLL_INTERVAL);
+        Action::DisableOutput(reason) => match xy.set_output(false) {
+            Ok(()) => {
+                error!("CHARGE FAULT ({}): PS output DISABLED", reason.label());
+                supervisor.ack_disable();
+            }
+            Err(e) => {
+                error!(
+                    "CHARGE FAULT ({}): set_output(false) failed: {e} — will retry",
+                    reason.label()
+                );
+                recorder.record(Event::Xy(XyError::SetOutput));
+            }
+        },
     }
 }
 

@@ -25,6 +25,33 @@ fn matches_disable(a: &Action, expected: FaultReason) -> bool {
     matches!(a, Action::DisableOutput(r) if *r == expected)
 }
 
+/// Tick with a successful, drift-free Modbus readback — the common case.
+/// Builds Setpoints from the supervisor's current expectation so phase
+/// transitions don't fire spurious `SettingsDrift`.
+fn ok_tick(s: &mut ChargeSupervisor, battery: Option<BatterySample>, elapsed: Duration) -> Action {
+    let p = PollResult {
+        setpoints: Some(s.expected_setpoints()),
+        battery,
+    };
+    s.tick(p, elapsed)
+}
+
+/// Tick where the Modbus read failed — `setpoints = None` exercises the
+/// modbus-unhealthy debounce path.
+fn fail_tick(
+    s: &mut ChargeSupervisor,
+    battery: Option<BatterySample>,
+    elapsed: Duration,
+) -> Action {
+    s.tick(
+        PollResult {
+            setpoints: None,
+            battery,
+        },
+        elapsed,
+    )
+}
+
 // --- Profile construction ---
 
 #[test]
@@ -206,7 +233,7 @@ fn enters_absorb_when_charging_current_exceeds_threshold() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // Charging at 4 A → -4 A on the bus; threshold is 3 A.
     assert!(matches!(
-        s.tick(true, b(OK_V, -4.0), TICK),
+        ok_tick(&mut s,b(OK_V, -4.0), TICK),
         Action::SetVoltage(v) if approx(v, 14.4)
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
@@ -216,10 +243,10 @@ fn enters_absorb_when_charging_current_exceeds_threshold() {
 fn does_not_enter_absorb_at_exact_threshold() {
     // Strictly greater: 3.0 A must NOT trigger; 3.001 A must.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Float));
     assert!(matches!(
-        s.tick(true, b(OK_V, -3.001), TICK),
+        ok_tick(&mut s, b(OK_V, -3.001), TICK),
         Action::SetVoltage(_)
     ));
 }
@@ -228,33 +255,33 @@ fn does_not_enter_absorb_at_exact_threshold() {
 fn discharge_current_does_not_enter_absorb() {
     // 5 A discharge (positive). |I| > 3 A but it's NOT charging.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    assert!(matches!(s.tick(true, b(OK_V, 5.0), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, 5.0), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Float));
 }
 
 #[test]
 fn stays_in_absorb_above_exit_threshold() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.tick(true, b(OK_V, -4.0), TICK); // → Absorb
+    ok_tick(&mut s, b(OK_V, -4.0), TICK); // → Absorb
     // Exit threshold is 2.5 A — anything above keeps us in absorb.
-    assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
-    assert!(matches!(s.tick(true, b(OK_V, -2.7), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     // Strictly less-than, so 2.5 stays.
-    assert!(matches!(s.tick(true, b(OK_V, -2.5), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -2.5), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Absorb));
 }
 
 #[test]
 fn exits_absorb_when_taper_drops_below_threshold() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.tick(true, b(OK_V, -4.0), TICK); // → Absorb
+    ok_tick(&mut s, b(OK_V, -4.0), TICK); // → Absorb
     // Sustained taper below 2.5 A for the debounce window. BUDGET-1 ticks
     // hold absorb; one more crosses → drop to float.
     for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
-        assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     }
     assert!(matches!(
-        s.tick(true, b(OK_V, -2.4), TICK),
+        ok_tick(&mut s,b(OK_V, -2.4), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
     ));
     assert!(matches!(s.phase(), Phase::Float));
@@ -266,12 +293,12 @@ fn exits_absorb_when_load_pulls_current() {
     // debounce window. Same path as a real taper — counter accumulates,
     // transition fires once it crosses.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.tick(true, b(OK_V, -4.0), TICK);
+    ok_tick(&mut s, b(OK_V, -4.0), TICK);
     for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
-        assert!(matches!(s.tick(true, b(OK_V, 3.0), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, 3.0), TICK), Action::None));
     }
     assert!(matches!(
-        s.tick(true, b(OK_V, 3.0), TICK),
+        ok_tick(&mut s,b(OK_V, 3.0), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
     ));
 }
@@ -281,15 +308,15 @@ fn brief_taper_dip_does_not_exit_absorb() {
     // Pack flickers below the tail current for half the debounce window,
     // then comes back. Counter must reset — no transition.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.tick(true, b(OK_V, -4.0), TICK);
+    ok_tick(&mut s, b(OK_V, -4.0), TICK);
     for _ in 0..(EXIT_DEBOUNCE.as_secs() / 2) {
-        assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     }
     // Sag recovers — current back above the tail.
-    assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
     // Must now sit through another full debounce window without transitioning.
     for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
-        assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     }
     assert!(matches!(s.phase(), Phase::Absorb));
 }
@@ -302,15 +329,15 @@ fn exit_debounce_does_not_accumulate_in_float() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // Sit in Float at sub-tail current well past the debounce window.
     for _ in 0..(EXIT_DEBOUNCE.as_secs() * 2) {
-        assert!(matches!(s.tick(true, b(OK_V, -1.0), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -1.0), TICK), Action::None));
     }
     // Enter Absorb, then dip below tail. Counter must start fresh — one
     // tick is not enough to transition out.
     assert!(matches!(
-        s.tick(true, b(OK_V, -4.0), TICK),
+        ok_tick(&mut s, b(OK_V, -4.0), TICK),
         Action::SetVoltage(_)
     ));
-    assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Absorb));
 }
 
@@ -319,9 +346,9 @@ fn exit_debounce_honors_elapsed() {
     // One big-elapsed tick crossing the full debounce window must transition.
     // Mirrors the equivalent OV / absorb-timeout tests.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.tick(true, b(OK_V, -4.0), TICK);
+    ok_tick(&mut s, b(OK_V, -4.0), TICK);
     assert!(matches!(
-        s.tick(true, b(OK_V, -2.4), EXIT_DEBOUNCE),
+        ok_tick(&mut s,b(OK_V, -2.4), EXIT_DEBOUNCE),
         Action::SetVoltage(v) if approx(v, 13.5)
     ));
     assert!(matches!(s.phase(), Phase::Float));
@@ -332,12 +359,12 @@ fn hysteresis_no_flap_between_thresholds() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // 2.7 A sits in the hysteresis band: > exit (2.5) but < enter (3.0).
     for _ in 0..10 {
-        assert!(matches!(s.tick(true, b(OK_V, -2.7), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     }
     assert!(matches!(s.phase(), Phase::Float));
-    s.tick(true, b(OK_V, -4.0), TICK);
+    ok_tick(&mut s, b(OK_V, -4.0), TICK);
     for _ in 0..10 {
-        assert!(matches!(s.tick(true, b(OK_V, -2.7), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     }
     assert!(matches!(s.phase(), Phase::Absorb));
 }
@@ -346,7 +373,10 @@ fn hysteresis_no_flap_between_thresholds() {
 fn returns_none_on_steady_state() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..100 {
-        assert!(matches!(s.tick(true, b(OK_V, -0.05), TICK), Action::None));
+        assert!(matches!(
+            ok_tick(&mut s, b(OK_V, -0.05), TICK),
+            Action::None
+        ));
     }
 }
 
@@ -355,27 +385,27 @@ fn transition_only_emits_setpoint_once() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // First crossing → write.
     assert!(matches!(
-        s.tick(true, b(OK_V, -4.0), TICK),
+        ok_tick(&mut s, b(OK_V, -4.0), TICK),
         Action::SetVoltage(_)
     ));
     // Already absorb → silent.
-    assert!(matches!(s.tick(true, b(OK_V, -4.0), TICK), Action::None));
-    assert!(matches!(s.tick(true, b(OK_V, -5.0), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -4.0), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -5.0), TICK), Action::None));
 }
 
 #[test]
 fn nan_and_inf_current_are_ignored() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     assert!(matches!(
-        s.tick(true, b(OK_V, f32::NAN), TICK),
+        ok_tick(&mut s, b(OK_V, f32::NAN), TICK),
         Action::None
     ));
     assert!(matches!(
-        s.tick(true, b(OK_V, f32::INFINITY), TICK),
+        ok_tick(&mut s, b(OK_V, f32::INFINITY), TICK),
         Action::None
     ));
     assert!(matches!(
-        s.tick(true, b(OK_V, f32::NEG_INFINITY), TICK),
+        ok_tick(&mut s, b(OK_V, f32::NEG_INFINITY), TICK),
         Action::None
     ));
     assert!(matches!(s.phase(), Phase::Float));
@@ -385,10 +415,10 @@ fn nan_and_inf_current_are_ignored() {
 fn different_chemistries_yield_different_setpoints() {
     let mut lfp = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiFePo4, 4, 50.0));
     let mut liion = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiIon, 3, 50.0));
-    let Action::SetVoltage(v_lfp) = lfp.tick(true, b(OK_V, -4.0), TICK) else {
+    let Action::SetVoltage(v_lfp) = ok_tick(&mut lfp, b(OK_V, -4.0), TICK) else {
         panic!("expected SetVoltage")
     };
-    let Action::SetVoltage(v_liion) = liion.tick(true, b(12.0, -4.0), TICK) else {
+    let Action::SetVoltage(v_liion) = ok_tick(&mut liion, b(12.0, -4.0), TICK) else {
         panic!("expected SetVoltage")
     };
     assert!(approx(v_lfp, 14.4));
@@ -402,7 +432,7 @@ fn single_cell_lfp_works() {
     let mut s = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiFePo4, 1, 50.0));
     assert!(approx(s.target_voltage(), 3.375));
     assert!(matches!(
-        s.tick(true, b(3.4, -4.0), TICK),
+        ok_tick(&mut s,b(3.4, -4.0), TICK),
         Action::SetVoltage(v) if approx(v, 3.60)
     ));
 }
@@ -412,24 +442,24 @@ fn full_charge_cycle() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // Bulk → absorb on heavy current.
     assert!(matches!(
-        s.tick(true, b(OK_V, -8.0), TICK),
+        ok_tick(&mut s,b(OK_V, -8.0), TICK),
         Action::SetVoltage(v) if approx(v, 14.4)
     ));
     // Hold absorb across a realistic taper — all values stay above 2.5 A.
     for &i in &[-7.0, -5.0, -3.5, -3.0, -2.7] {
-        assert!(matches!(s.tick(true, b(OK_V, i), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, i), TICK), Action::None));
     }
     // Sustained sub-tail current for the debounce window → drop to float.
     for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
-        assert!(matches!(s.tick(true, b(OK_V, -2.4), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     }
     assert!(matches!(
-        s.tick(true, b(OK_V, -2.4), TICK),
+        ok_tick(&mut s,b(OK_V, -2.4), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
     ));
     // Sit at float without retriggering absorb (all below 3 A enter).
     for &i in &[-0.05, -0.02, 0.0, -2.0] {
-        assert!(matches!(s.tick(true, b(OK_V, i), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, i), TICK), Action::None));
     }
 }
 
@@ -442,10 +472,10 @@ fn ov_fault_honors_sub_second_elapsed() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     let step = Duration::from_millis(500);
     for _ in 0..5 {
-        assert!(matches!(s.tick(true, b(14.7, -0.1), step), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(14.7, -0.1), step), Action::None));
     }
     assert!(matches_disable(
-        &s.tick(true, b(14.7, -0.1), step),
+        &ok_tick(&mut s, b(14.7, -0.1), step),
         FaultReason::Overvoltage,
     ));
 }
@@ -456,7 +486,7 @@ fn ov_fault_in_a_single_large_elapsed_tick() {
     // a regression that accumulates +1 per call instead of `+= elapsed`.
     let mut s = ChargeSupervisor::new(lfp_4s());
     assert!(matches_disable(
-        &s.tick(true, b(14.7, -0.1), OV_DURATION),
+        &ok_tick(&mut s, b(14.7, -0.1), OV_DURATION),
         FaultReason::Overvoltage,
     ));
 }
@@ -467,15 +497,15 @@ fn ov_fault_with_mixed_elapsed_values() {
     // third tick, not earlier (cumulative time, not tick count).
     let mut s = ChargeSupervisor::new(lfp_4s());
     assert!(matches!(
-        s.tick(true, b(14.7, -0.1), Duration::from_millis(1500)),
+        ok_tick(&mut s, b(14.7, -0.1), Duration::from_millis(1500)),
         Action::None
     ));
     assert!(matches!(
-        s.tick(true, b(14.7, -0.1), Duration::from_millis(1000)),
+        ok_tick(&mut s, b(14.7, -0.1), Duration::from_millis(1000)),
         Action::None
     ));
     assert!(matches_disable(
-        &s.tick(true, b(14.7, -0.1), Duration::from_millis(600)),
+        &ok_tick(&mut s, b(14.7, -0.1), Duration::from_millis(600)),
         FaultReason::Overvoltage,
     ));
 }
@@ -487,7 +517,7 @@ fn absorb_timeout_in_a_single_large_elapsed_tick() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     enter_absorb(&mut s);
     assert!(matches_disable(
-        &s.tick(true, b(OK_V, -3.0), MAX_ABSORB),
+        &ok_tick(&mut s, b(OK_V, -3.0), MAX_ABSORB),
         FaultReason::AbsorbTimeout,
     ));
 }
@@ -496,7 +526,7 @@ fn absorb_timeout_in_a_single_large_elapsed_tick() {
 fn battery_stale_honors_elapsed() {
     // One tick with elapsed = BATTERY_MISSING_TIMEOUT must latch.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let a = s.tick(true, None, BATTERY_MISSING_TIMEOUT);
+    let a = ok_tick(&mut s, None, BATTERY_MISSING_TIMEOUT);
     assert!(matches_disable(&a, FaultReason::BatterySensorStale));
 }
 
@@ -504,7 +534,7 @@ fn battery_stale_honors_elapsed() {
 fn modbus_unhealthy_honors_elapsed() {
     // Same: one big-elapsed tick saturates the modbus error counter.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let a = s.tick(false, b(13.5, -0.1), MODBUS_UNHEALTHY_TIMEOUT);
+    let a = fail_tick(&mut s, b(13.5, -0.1), MODBUS_UNHEALTHY_TIMEOUT);
     assert!(matches_disable(&a, FaultReason::ModbusUnhealthy));
 }
 
@@ -514,7 +544,7 @@ fn modbus_unhealthy_honors_elapsed() {
 /// has elapsed (the transition itself).
 fn enter_absorb(s: &mut ChargeSupervisor) {
     assert!(matches!(
-        s.tick(true, b(OK_V, -4.0), TICK),
+        ok_tick(s, b(OK_V, -4.0), TICK),
         Action::SetVoltage(_)
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
@@ -527,7 +557,7 @@ fn absorb_does_not_time_out_below_budget() {
     // Hold absorb just shy of the cap. Current pinned above exit threshold
     // (2.5 A) so we never drop to Float on our own.
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
-        assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
     }
     assert!(s.fault().is_none());
 }
@@ -537,7 +567,7 @@ fn float_does_not_accumulate_absorb_ticks() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // Sit in Float for far longer than the absorb cap — must never fault.
     for _ in 0..(MAX_ABSORB.as_secs() + 10) {
-        assert!(matches!(s.tick(true, b(OK_V, -0.1), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -0.1), TICK), Action::None));
     }
     assert!(matches!(s.phase(), Phase::Float));
 }
@@ -549,15 +579,15 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     // Spend most of the budget in absorb, leaving room for a full exit
     // debounce window before the absorb timeout would fire.
     for _ in 0..(MAX_ABSORB.as_secs() - EXIT_DEBOUNCE.as_secs() - 10) {
-        s.tick(true, b(OK_V, -3.0), TICK);
+        ok_tick(&mut s, b(OK_V, -3.0), TICK);
     }
     // …then taper to Float. Sub-tail current for the debounce window
     // before the transition fires, then absorb_elapsed resets.
     for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
-        assert!(matches!(s.tick(true, b(OK_V, -0.1), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -0.1), TICK), Action::None));
     }
     assert!(matches!(
-        s.tick(true, b(OK_V, -0.1), TICK),
+        ok_tick(&mut s, b(OK_V, -0.1), TICK),
         Action::SetVoltage(_)
     ));
     assert!(matches!(s.phase(), Phase::Float));
@@ -566,7 +596,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     // No fault yet — counter started over.
     enter_absorb(&mut s);
     for _ in 0..20 {
-        assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
     }
     assert!(s.fault().is_none());
 }
@@ -576,7 +606,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
 #[test]
 fn supervisor_passes_setpoint_through_on_phase_transition() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let a = s.tick(true, b(13.5, -4.0), TICK);
+    let a = ok_tick(&mut s, b(13.5, -4.0), TICK);
     match a {
         Action::SetVoltage(v) => assert!(approx(v, 14.4)),
         _ => panic!("expected SetVoltage"),
@@ -589,7 +619,10 @@ fn supervisor_passes_setpoint_through_on_phase_transition() {
 fn supervisor_returns_none_on_steady_state() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..50 {
-        assert!(matches!(s.tick(true, b(13.5, -0.05), TICK), Action::None));
+        assert!(matches!(
+            ok_tick(&mut s, b(13.5, -0.05), TICK),
+            Action::None
+        ));
     }
     assert!(s.fault().is_none());
 }
@@ -599,11 +632,11 @@ fn battery_stale_for_budget_latches() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // BUDGET-1 ticks of missing battery: still healthy.
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
-        assert!(matches!(s.tick(true, None, TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, None, TICK), Action::None));
     }
     assert!(s.fault().is_none());
 
-    let a = s.tick(true, None, TICK);
+    let a = ok_tick(&mut s, None, TICK);
     assert!(matches_disable(&a, FaultReason::BatterySensorStale));
     assert!(matches!(s.fault(), Some(FaultReason::BatterySensorStale)));
 }
@@ -612,13 +645,13 @@ fn battery_stale_for_budget_latches() {
 fn battery_recovers_within_budget_no_latch() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
-        s.tick(true, None, TICK);
+        ok_tick(&mut s, None, TICK);
     }
     // One fresh reading clears the counter.
-    s.tick(true, b(13.5, -0.1), TICK);
+    ok_tick(&mut s, b(13.5, -0.1), TICK);
     // Now we should be able to miss BUDGET-1 again without latching.
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
-        assert!(matches!(s.tick(true, None, TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, None, TICK), Action::None));
     }
     assert!(s.fault().is_none());
 }
@@ -627,9 +660,12 @@ fn battery_recovers_within_budget_no_latch() {
 fn modbus_errors_for_budget_latches() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {
-        assert!(matches!(s.tick(false, b(13.5, -0.1), TICK), Action::None));
+        assert!(matches!(
+            fail_tick(&mut s, b(13.5, -0.1), TICK),
+            Action::None
+        ));
     }
-    let a = s.tick(false, b(13.5, -0.1), TICK);
+    let a = fail_tick(&mut s, b(13.5, -0.1), TICK);
     assert!(matches_disable(&a, FaultReason::ModbusUnhealthy));
 }
 
@@ -637,11 +673,11 @@ fn modbus_errors_for_budget_latches() {
 fn modbus_recovers_within_budget_no_latch() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {
-        s.tick(false, b(13.5, -0.1), TICK);
+        fail_tick(&mut s, b(13.5, -0.1), TICK);
     }
-    s.tick(true, b(13.5, -0.1), TICK); // good read clears counter
+    ok_tick(&mut s, b(13.5, -0.1), TICK); // good read clears counter
     for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {
-        s.tick(false, b(13.5, -0.1), TICK);
+        fail_tick(&mut s, b(13.5, -0.1), TICK);
     }
     assert!(s.fault().is_none());
 }
@@ -651,9 +687,9 @@ fn overvoltage_sustained_latches() {
     // absorb_v for lfp_4s = 14.4; margin = 0.2; so > 14.6 trips.
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..(OV_DURATION.as_secs() - 1) {
-        assert!(matches!(s.tick(true, b(14.7, -0.1), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(14.7, -0.1), TICK), Action::None));
     }
-    let a = s.tick(true, b(14.7, -0.1), TICK);
+    let a = ok_tick(&mut s, b(14.7, -0.1), TICK);
     assert!(matches_disable(&a, FaultReason::Overvoltage));
 }
 
@@ -661,12 +697,12 @@ fn overvoltage_sustained_latches() {
 fn overvoltage_brief_recovers_no_latch() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // Two ticks above OV; one tick back below. Counter resets.
-    s.tick(true, b(14.7, -0.1), TICK);
-    s.tick(true, b(14.7, -0.1), TICK);
-    s.tick(true, b(13.5, -0.1), TICK);
+    ok_tick(&mut s, b(14.7, -0.1), TICK);
+    ok_tick(&mut s, b(14.7, -0.1), TICK);
+    ok_tick(&mut s, b(13.5, -0.1), TICK);
     // Two more above must NOT latch (< budget after reset).
-    s.tick(true, b(14.7, -0.1), TICK);
-    s.tick(true, b(14.7, -0.1), TICK);
+    ok_tick(&mut s, b(14.7, -0.1), TICK);
+    ok_tick(&mut s, b(14.7, -0.1), TICK);
     assert!(s.fault().is_none());
 }
 
@@ -675,7 +711,7 @@ fn ov_below_threshold_does_not_trip() {
     // absorb_v + OV_MARGIN_V ≈ 14.6. 14.55 is unambiguously below in f32.
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..(OV_DURATION.as_secs() + 5) {
-        s.tick(true, b(14.55, -0.1), TICK);
+        ok_tick(&mut s, b(14.55, -0.1), TICK);
     }
     assert!(s.fault().is_none());
 }
@@ -684,7 +720,7 @@ fn ov_below_threshold_does_not_trip() {
 fn nan_voltage_does_not_count_toward_ov() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..(OV_DURATION.as_secs() + 5) {
-        s.tick(true, b(f32::NAN, -0.1), TICK);
+        ok_tick(&mut s, b(f32::NAN, -0.1), TICK);
     }
     assert!(s.fault().is_none());
 }
@@ -693,21 +729,21 @@ fn nan_voltage_does_not_count_toward_ov() {
 fn latch_keeps_emitting_disable_until_acked() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..BATTERY_MISSING_TIMEOUT.as_secs() {
-        s.tick(true, None, TICK);
+        ok_tick(&mut s, None, TICK);
     }
     assert!(s.fault().is_some());
 
     // First tick after latch: still wants disable.
-    let a = s.tick(true, b(13.5, -0.1), TICK);
+    let a = ok_tick(&mut s, b(13.5, -0.1), TICK);
     assert!(matches_disable(&a, FaultReason::BatterySensorStale));
     // Re-tick with healthy inputs: still disable (caller's set_output failed).
-    let a = s.tick(true, b(13.5, -0.1), TICK);
+    let a = ok_tick(&mut s, b(13.5, -0.1), TICK);
     assert!(matches_disable(&a, FaultReason::BatterySensorStale));
 
     s.ack_disable();
     // Now the supervisor goes quiet — no further commands to the buck.
     for _ in 0..10 {
-        assert!(matches!(s.tick(true, b(13.5, -4.0), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(13.5, -4.0), TICK), Action::None));
     }
 }
 
@@ -715,11 +751,11 @@ fn latch_keeps_emitting_disable_until_acked() {
 fn latched_supervisor_does_not_change_phase() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
-        s.tick(false, b(13.5, -0.1), TICK);
+        fail_tick(&mut s, b(13.5, -0.1), TICK);
     }
     s.ack_disable();
     // Heavy charging current would normally drive Float→Absorb.
-    s.tick(true, b(13.5, -5.0), TICK);
+    ok_tick(&mut s, b(13.5, -5.0), TICK);
     assert!(matches!(s.phase(), Phase::Float));
 }
 
@@ -735,7 +771,7 @@ fn first_fault_wins_over_simultaneous_conditions() {
     // Both modbus and battery faulting at once. Modbus is checked first.
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
-        s.tick(false, None, TICK);
+        fail_tick(&mut s, None, TICK);
     }
     assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
 }
@@ -744,37 +780,93 @@ fn first_fault_wins_over_simultaneous_conditions() {
 fn supervisor_latches_on_absorb_timeout() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // Drive into Absorb.
-    let _ = s.tick(true, b(13.5, -4.0), TICK);
+    let _ = ok_tick(&mut s, b(13.5, -4.0), TICK);
     // Hold Absorb until just before the cap. Current pinned above exit
     // threshold so the controller can't taper out on its own.
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
-        s.tick(true, b(13.5, -3.0), TICK);
+        ok_tick(&mut s, b(13.5, -3.0), TICK);
     }
     assert!(s.fault().is_none());
 
-    let a = s.tick(true, b(13.5, -3.0), TICK);
+    let a = ok_tick(&mut s, b(13.5, -3.0), TICK);
     assert!(matches_disable(&a, FaultReason::AbsorbTimeout));
 }
 
 #[test]
-fn force_fault_latches_immediately() {
+fn setpoint_drift_v_set_latches_immediately() {
+    // Float target is 13.5 V; pretend the buck reports 12.0 V — well past
+    // the 0.02 V tolerance.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.force_fault(FaultReason::SettingsDrift);
-    assert!(matches!(s.fault(), Some(FaultReason::SettingsDrift)));
-    // Next tick emits DisableOutput regardless of healthy inputs.
-    let a = s.tick(true, b(13.5, -1.0), TICK);
+    let bad = Some(Setpoints {
+        v_set: 12.0,
+        i_set: 10.0,
+    });
+    let a = s.tick(
+        PollResult {
+            setpoints: bad,
+            battery: b(13.5, -0.1),
+        },
+        TICK,
+    );
     assert!(matches_disable(&a, FaultReason::SettingsDrift));
 }
 
 #[test]
-fn force_fault_does_not_overwrite_existing_latch() {
-    // First latch wins — matches the internal-path behavior where the
-    // supervisor checks faults in priority order and returns on the first hit.
+fn setpoint_drift_i_set_latches_immediately() {
+    // Float target is 13.5 V (matches), but I_SET disagrees with the 10 A regulation.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let bad = Some(Setpoints {
+        v_set: 13.5,
+        i_set: 5.0,
+    });
+    let a = s.tick(
+        PollResult {
+            setpoints: bad,
+            battery: b(13.5, -0.1),
+        },
+        TICK,
+    );
+    assert!(matches_disable(&a, FaultReason::SettingsDrift));
+}
+
+#[test]
+fn setpoint_within_tolerance_no_drift_fault() {
+    // 0.01 V off — one register quantum, under the 0.02 tolerance.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let close = Some(Setpoints {
+        v_set: 13.51,
+        i_set: 10.0,
+    });
+    let a = s.tick(
+        PollResult {
+            setpoints: close,
+            battery: b(13.5, -0.1),
+        },
+        TICK,
+    );
+    assert!(matches!(a, Action::None));
+    assert!(s.fault().is_none());
+}
+
+#[test]
+fn setpoint_drift_does_not_overwrite_existing_latch() {
+    // First latch wins — modbus-unhealthy debounce trips before the next
+    // good readback can latch SettingsDrift.
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
-        s.tick(false, b(13.5, -0.1), TICK);
+        fail_tick(&mut s, b(13.5, -0.1), TICK);
     }
     assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
-    s.force_fault(FaultReason::SettingsDrift);
-    assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
+    let bad = Some(Setpoints {
+        v_set: 12.0,
+        i_set: 10.0,
+    });
+    let a = s.tick(
+        PollResult {
+            setpoints: bad,
+            battery: b(13.5, -0.1),
+        },
+        TICK,
+    );
+    assert!(matches_disable(&a, FaultReason::ModbusUnhealthy));
 }

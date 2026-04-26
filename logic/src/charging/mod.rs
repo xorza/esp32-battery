@@ -107,6 +107,30 @@ pub struct SafetyLimits {
     pub lvp_v: f32,
 }
 
+/// Setpoints read back from the buck (V_SET / I_SET register pair). Fed
+/// to the supervisor each tick so it can detect drift between what we
+/// commanded and what the buck claims to be regulating to.
+#[derive(Copy, Clone)]
+pub struct Setpoints {
+    pub v_set: f32,
+    pub i_set: f32,
+}
+
+/// One poll cycle's view of the world for the supervisor: the buck's
+/// readback (`None` if the Modbus read failed) and the latest fresh
+/// battery sample (`None` if stale or absent). `setpoints.is_some()`
+/// doubles as the modbus-healthy signal.
+#[derive(Copy, Clone, Default)]
+pub struct PollResult {
+    pub setpoints: Option<Setpoints>,
+    pub battery: Option<BatterySample>,
+}
+
+/// Allowed drift between commanded and observed setpoint. One register
+/// quantum is 0.01; two-quantum slack absorbs IEEE-float round-trip
+/// quirks on values like 14.4 V whose binary repr isn't exact.
+const SETPOINT_DRIFT_TOL: f32 = 0.02;
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Phase {
     Float,
@@ -295,15 +319,13 @@ impl ChargeSupervisor {
         }
     }
 
-    /// Caller-driven latch for faults the supervisor can't observe itself
-    /// (e.g. setpoint readback drift detected by the Modbus thread). No-op
-    /// if already latched — first reason wins, matching the internal paths.
-    pub fn force_fault(&mut self, reason: FaultReason) {
-        if matches!(self.latch, LatchState::Active) {
-            self.latch = LatchState::Tripped {
-                reason,
-                acked: false,
-            };
+    /// What setpoints the supervisor currently expects the buck to be
+    /// regulating to. Used by the caller to construct `Setpoints` for tests
+    /// and as documentation for what `tick` will compare readbacks against.
+    pub fn expected_setpoints(&self) -> Setpoints {
+        Setpoints {
+            v_set: self.target_voltage(),
+            i_set: self.profile.regulation_a,
         }
     }
 
@@ -317,19 +339,18 @@ impl ChargeSupervisor {
         }
     }
 
-    /// Drive one poll cycle. `modbus_ok` reflects the most recent read attempt
-    /// against the XY7025. `battery` is the latest fresh reading (`None` if
-    /// stale or absent). `elapsed` is wall time since the previous tick.
+    /// Drive one poll cycle. `p` carries the buck readback and latest fresh
+    /// battery sample; `elapsed` is wall time since the previous tick.
     /// Returns the action the caller should take.
+    ///
+    /// `p.setpoints.is_some()` doubles as the modbus-healthy signal — a
+    /// successful read means the link is up. Drift (commanded vs.
+    /// reported V_SET / I_SET) latches `SettingsDrift` immediately; no
+    /// debounce, the read itself succeeded so this isn't transport noise.
     ///
     /// Non-finite battery inputs are charitable: voltage NaN doesn't count
     /// toward OV; current NaN holds the current phase.
-    pub fn tick(
-        &mut self,
-        modbus_ok: bool,
-        battery: Option<BatterySample>,
-        elapsed: Duration,
-    ) -> Action {
+    pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
         match self.latch {
             LatchState::Tripped { acked: true, .. } => return Action::None,
             LatchState::Tripped {
@@ -339,20 +360,29 @@ impl ChargeSupervisor {
             LatchState::Active => {}
         }
 
+        if let Some(sp) = p.setpoints {
+            let want = self.expected_setpoints();
+            if (sp.v_set - want.v_set).abs() >= SETPOINT_DRIFT_TOL
+                || (sp.i_set - want.i_set).abs() >= SETPOINT_DRIFT_TOL
+            {
+                return self.latch(FaultReason::SettingsDrift);
+            }
+        }
+
         if self
             .modbus_err
-            .step(!modbus_ok, elapsed, MODBUS_UNHEALTHY_TIMEOUT)
+            .step(p.setpoints.is_none(), elapsed, MODBUS_UNHEALTHY_TIMEOUT)
         {
             return self.latch(FaultReason::ModbusUnhealthy);
         }
 
         if self
             .battery_missing
-            .step(battery.is_none(), elapsed, BATTERY_MISSING_TIMEOUT)
+            .step(p.battery.is_none(), elapsed, BATTERY_MISSING_TIMEOUT)
         {
             return self.latch(FaultReason::BatterySensorStale);
         }
-        let Some(b) = battery else {
+        let Some(b) = p.battery else {
             return Action::None;
         };
 
