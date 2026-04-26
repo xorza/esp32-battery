@@ -394,21 +394,64 @@ fn transition_only_emits_setpoint_once() {
 }
 
 #[test]
-fn nan_and_inf_current_are_ignored() {
+fn nan_or_inf_in_sample_treated_as_missing() {
+    // Within the missing-battery debounce, a non-finite sample is
+    // ignored just like None — no fault yet, no phase change, but no
+    // charitable bypass either.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    assert!(matches!(
-        ok_tick(&mut s, b(OK_V, f32::NAN), TICK),
-        Action::None
-    ));
-    assert!(matches!(
-        ok_tick(&mut s, b(OK_V, f32::INFINITY), TICK),
-        Action::None
-    ));
-    assert!(matches!(
-        ok_tick(&mut s, b(OK_V, f32::NEG_INFINITY), TICK),
-        Action::None
-    ));
+    for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(matches!(ok_tick(&mut s, b(OK_V, v), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(v, -1.0), TICK), Action::None));
+    }
     assert!(matches!(s.phase(), Phase::Float));
+    assert!(s.fault().is_none());
+}
+
+#[test]
+fn nan_voltage_eventually_latches_battery_stale() {
+    // Sustained NaN voltage = sensor stuck. Must NOT silently bypass OV
+    // or the phase machine — must drive through the same sensor-stale
+    // path as truly missing samples.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
+        assert!(matches!(
+            ok_tick(&mut s, b(f32::NAN, -0.1), TICK),
+            Action::None
+        ));
+    }
+    assert!(s.fault().is_none());
+    let a = ok_tick(&mut s, b(f32::NAN, -0.1), TICK);
+    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+}
+
+#[test]
+fn nan_current_eventually_latches_battery_stale() {
+    // Same as above but for current. A stuck-NaN current sensor would
+    // otherwise silently hold whatever phase we were in.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, f32::NAN), TICK);
+    }
+    assert!(s.fault().is_none());
+    let a = ok_tick(&mut s, b(OK_V, f32::NAN), TICK);
+    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+}
+
+#[test]
+fn nan_then_recovery_clears_stale_debounce() {
+    // A brief NaN burst followed by recovery must NOT latch — the
+    // debounce should reset on the first finite sample.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
+        ok_tick(&mut s, b(f32::NAN, f32::NAN), TICK);
+    }
+    // One finite tick clears the debounce.
+    ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    // Now we can NaN-burst again without latching.
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
+        ok_tick(&mut s, b(f32::NAN, -0.1), TICK);
+    }
+    assert!(s.fault().is_none());
 }
 
 #[test]
@@ -712,15 +755,6 @@ fn ov_below_threshold_does_not_trip() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..(OV_DURATION.as_secs() + 5) {
         ok_tick(&mut s, b(14.55, -0.1), TICK);
-    }
-    assert!(s.fault().is_none());
-}
-
-#[test]
-fn nan_voltage_does_not_count_toward_ov() {
-    let mut s = ChargeSupervisor::new(lfp_4s());
-    for _ in 0..(OV_DURATION.as_secs() + 5) {
-        ok_tick(&mut s, b(f32::NAN, -0.1), TICK);
     }
     assert!(s.fault().is_none());
 }

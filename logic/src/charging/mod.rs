@@ -348,8 +348,11 @@ impl ChargeSupervisor {
     /// reported V_SET / I_SET) latches `SettingsDrift` immediately; no
     /// debounce, the read itself succeeded so this isn't transport noise.
     ///
-    /// Non-finite battery inputs are charitable: voltage NaN doesn't count
-    /// toward OV; current NaN holds the current phase.
+    /// Battery samples with NaN/Inf in either field are treated as
+    /// **missing** — a sensor reporting non-finite values can't be used
+    /// to supervise charging, and silently ignoring NaN would let a
+    /// stuck sensor mask overvoltage. Routes through the same
+    /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
         match self.latch {
             LatchState::Tripped { acked: true, .. } => return Action::None,
@@ -376,24 +379,27 @@ impl ChargeSupervisor {
             return self.latch(FaultReason::ModbusUnhealthy);
         }
 
+        // NaN-poisoned samples are treated as missing — they can't safely
+        // drive OV or the phase machine, and the sensor-stale debounce is
+        // the right place to fail closed.
+        let battery = p
+            .battery
+            .filter(|b| b.voltage.is_finite() && b.current.is_finite());
         if self
             .battery_missing
-            .step(p.battery.is_none(), elapsed, BATTERY_MISSING_TIMEOUT)
+            .step(battery.is_none(), elapsed, BATTERY_MISSING_TIMEOUT)
         {
             return self.latch(FaultReason::BatterySensorStale);
         }
-        let Some(b) = p.battery else {
+        let Some(b) = battery else {
             return Action::None;
         };
 
-        let ov = b.voltage.is_finite() && b.voltage > self.profile.absorb_v + OV_MARGIN_V;
+        let ov = b.voltage > self.profile.absorb_v + OV_MARGIN_V;
         if self.ov.step(ov, elapsed, OV_DURATION) {
             return self.latch(FaultReason::Overvoltage);
         }
 
-        if !b.current.is_finite() {
-            return Action::None;
-        }
         // Charging current as a positive number.
         let charging_a = -b.current;
         let below_exit = self.phase == Phase::Absorb && charging_a < self.profile.exit_absorb_a;
