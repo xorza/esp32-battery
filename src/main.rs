@@ -29,10 +29,9 @@ use log::warn;
 
 use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::EventLog;
-use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler};
 
 use crate::clock::{EventRecorder, uptime};
-use crate::history_store::{HistoryStore, Persister};
+use crate::history_store::HistoryStore;
 use crate::net::{LinkState, NetState, NetStatusHandle, ResetSignal, SubmissionStatus};
 use crate::nvs_creds::WifiCredentials;
 
@@ -53,6 +52,9 @@ const CAPTIVE_TRYING_TIMEOUT: Duration = Duration::from_secs(20);
 /// Supervisor loop period.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
 
+/// Interval between flash writes of the serialized history blob.
+const SAVE_INTERVAL_S: u32 = 600;
+
 struct StaCtx {
     sensor_data: Arc<Mutex<SensorData>>,
     event_log: Arc<Mutex<EventLog>>,
@@ -68,6 +70,36 @@ impl StaCtx {
             self.nvs.clone(),
             self.reset.clone(),
         )
+    }
+}
+
+/// Tick the data store and, on the save-interval boundary, write a snapshot
+/// to NVS. The serialize call runs under the same lock as `tick`; the actual
+/// flash I/O happens after the lock is dropped.
+fn tick_and_persist(
+    sensor_data: &Mutex<SensorData>,
+    store: &HistoryStore,
+    last_save_s: &mut Option<u32>,
+    epoch: Option<u32>,
+) {
+    let payload = {
+        let mut sd = sensor_data.lock().unwrap();
+        sd.tick(epoch);
+        match (epoch, *last_save_s) {
+            (Some(t), Some(last)) if t.saturating_sub(last) >= SAVE_INTERVAL_S => {
+                *last_save_s = Some(t);
+                Some(sd.serialize())
+            }
+            (Some(t), None) => {
+                *last_save_s = Some(t);
+                None
+            }
+            _ => None,
+        }
+    };
+    if let Some(bytes) = payload {
+        log::info!("Emitting save payload: {} bytes", bytes.len());
+        store.save(&bytes);
     }
 }
 
@@ -112,11 +144,7 @@ fn main() {
     let event_log: Arc<Mutex<EventLog>> =
         Arc::new(Mutex::new(esp32_battery_logic::error_log::EventLog::new()));
     let net_status = NetStatusHandle::new();
-    let mut persister = Persister::new(
-        sensor_data.clone(),
-        history_store,
-        SaveScheduler::new(DEFAULT_SAVE_INTERVAL_S),
-    );
+    let mut last_save_s: Option<u32> = None;
 
     let _sntp = clock::start_sntp(clock.clone());
 
@@ -135,7 +163,7 @@ fn main() {
 
     let reset = ResetSignal::new();
     let sta_ctx = StaCtx {
-        sensor_data,
+        sensor_data: sensor_data.clone(),
         event_log,
         nvs: nvs.clone(),
         reset,
@@ -167,7 +195,12 @@ fn main() {
     loop {
         thread::sleep(TICK_PERIOD);
         let now = uptime();
-        persister.tick(clock.epoch_s());
+        tick_and_persist(
+            &sensor_data,
+            &history_store,
+            &mut last_save_s,
+            clock.epoch_s(),
+        );
 
         if sta_ctx.reset.take() {
             state = force_captive_idle(state);

@@ -3,7 +3,7 @@
 //! `SensorData` is a thin orchestrator over two concerns: per-producer
 //! staleness tracking (`LiveReadings`) and the adaptive-resolution history
 //! ring + on-flash codec (`history`). Persistence (NVS I/O, save scheduling)
-//! lives in the firmware crate's `Persister` — `data` is pure model.
+//! lives in the firmware crate's main loop — `data` is pure model.
 
 mod history;
 

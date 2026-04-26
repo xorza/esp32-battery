@@ -2,12 +2,9 @@
 //! Owned externally to `SensorData` so flash I/O happens outside the data
 //! mutex — producer threads never stall on the 50–100 ms erase/write.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
-
-use esp32_battery_logic::data::SensorData;
-use esp32_battery_logic::save_scheduler::SaveScheduler;
 
 const NAMESPACE: &str = "data";
 const NVS_KEY: &str = "hist";
@@ -42,46 +39,6 @@ impl HistoryStore {
                 log::warn!("HistoryStore load failed: {e}");
                 None
             }
-        }
-    }
-}
-
-/// One-tick coordinator for the data store + persistence: locks `SensorData`,
-/// ticks it, and (when the save scheduler fires) serializes-and-saves under
-/// the same lock so flash I/O is the only thing held outside the critical
-/// section. Bundles the three pieces that always move together.
-pub struct Persister {
-    sensor_data: Arc<Mutex<SensorData>>,
-    store: HistoryStore,
-    scheduler: SaveScheduler,
-}
-
-impl Persister {
-    pub fn new(
-        sensor_data: Arc<Mutex<SensorData>>,
-        store: HistoryStore,
-        scheduler: SaveScheduler,
-    ) -> Self {
-        Self {
-            sensor_data,
-            store,
-            scheduler,
-        }
-    }
-
-    pub fn tick(&mut self, now: Option<u32>) {
-        let payload = {
-            let mut sd = self.sensor_data.lock().unwrap();
-            sd.tick(now);
-            if self.scheduler.tick(now) {
-                Some(sd.serialize())
-            } else {
-                None
-            }
-        };
-        if let Some(bytes) = payload {
-            log::info!("Emitting save payload: {} bytes", bytes.len());
-            self.store.save(&bytes);
         }
     }
 }
