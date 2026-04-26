@@ -67,21 +67,14 @@ pub(crate) fn serve_static(
     gzipped: bool,
 ) {
     mount_get(server, path, move |req| {
-        let headers: &[(&str, &str)] = if gzipped {
-            &[
-                ("Content-Type", content_type),
-                ("Content-Encoding", "gzip"),
-                ("Cache-Control", cache),
-                ("Connection", "close"),
-            ]
-        } else {
-            &[
-                ("Content-Type", content_type),
-                ("Cache-Control", cache),
-                ("Connection", "close"),
-            ]
-        };
-        let mut resp = req.into_response(200, None, headers).map_err(|e| e.0)?;
+        let mut headers: heapless::Vec<(&str, &str), 4> = heapless::Vec::new();
+        headers.push(("Content-Type", content_type)).unwrap();
+        if gzipped {
+            headers.push(("Content-Encoding", "gzip")).unwrap();
+        }
+        headers.push(("Cache-Control", cache)).unwrap();
+        headers.push(("Connection", "close")).unwrap();
+        let mut resp = req.into_response(200, None, &headers).map_err(|e| e.0)?;
         resp.write_all(body).map_err(|e| e.0)?;
         Ok::<(), EspError>(())
     });
@@ -148,24 +141,6 @@ pub(crate) fn read_to_buf(
     Ok(filled)
 }
 
-/// Send a `Connection: close` response with the given status, content-type,
-/// and body.
-fn body_response(
-    req: Request<&mut EspHttpConnection>,
-    status: u16,
-    content_type: Option<&'static str>,
-    body: &[u8],
-) -> Result<(), EspError> {
-    let mut headers: heapless::Vec<(&'static str, &'static str), 2> = heapless::Vec::new();
-    if let Some(ct) = content_type {
-        headers.push(("Content-Type", ct)).unwrap();
-    }
-    headers.push(("Connection", "close")).unwrap();
-    let mut resp = req.into_response(status, None, &headers).map_err(|e| e.0)?;
-    resp.write_all(body).map_err(|e| e.0)?;
-    Ok(())
-}
-
 /// JSON response with a caller-chosen status and pre-serialized body.
 /// For the common 200 path with streaming serialization use
 /// `json_response`; for the canonical `{"ok":true}` / `{"error":...}`
@@ -175,7 +150,18 @@ pub(crate) fn json_reply(
     status: u16,
     body: &[u8],
 ) -> Result<(), EspError> {
-    body_response(req, status, Some("application/json"), body)
+    let mut resp = req
+        .into_response(
+            status,
+            None,
+            &[
+                ("Content-Type", "application/json"),
+                ("Connection", "close"),
+            ],
+        )
+        .map_err(|e| e.0)?;
+    resp.write_all(body).map_err(|e| e.0)?;
+    Ok(())
 }
 
 /// Canonical 200 success envelope: `{"ok":true}`. All action endpoints
@@ -185,39 +171,30 @@ pub(crate) fn json_ok(req: Request<&mut EspHttpConnection>) -> Result<(), EspErr
     json_reply(req, 200, br#"{"ok":true}"#)
 }
 
-/// Canonical error envelope: `{"error":"<msg>"}`. `msg` must be a
-/// short, JSON-safe ASCII status string (no quotes, no backslashes,
-/// no control chars). Asserts on misuse.
+/// Canonical error envelope: `{"error":"<msg>"}`. `msg` is JSON-escaped
+/// by the serializer; sized at 192 B so any reasonable status string
+/// fits — overrun panics, which is correct since these are
+/// developer-controlled static strings.
 pub(crate) fn json_err(
     req: Request<&mut EspHttpConnection>,
     status: u16,
     msg: &str,
 ) -> Result<(), EspError> {
-    assert!(
-        !msg.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20),
-        "json_err: msg contains characters that need escaping: {msg:?}"
-    );
+    #[derive(serde::Serialize)]
+    struct E<'a> {
+        error: &'a str,
+    }
     let mut buf = [0u8; 192];
-    let prefix = br#"{"error":""#;
-    let suffix = br#""}"#;
-    let total = prefix.len() + msg.len() + suffix.len();
-    assert!(
-        total <= buf.len(),
-        "json_err: msg too long ({} bytes)",
-        msg.len()
-    );
-    buf[..prefix.len()].copy_from_slice(prefix);
-    buf[prefix.len()..prefix.len() + msg.len()].copy_from_slice(msg.as_bytes());
-    buf[prefix.len() + msg.len()..total].copy_from_slice(suffix);
-    json_reply(req, status, &buf[..total])
+    let len = serde_json_core::to_slice(&E { error: msg }, &mut buf)
+        .expect("json_err: msg too long for 192-byte buffer");
+    json_reply(req, status, &buf[..len])
 }
 
 /// Serialize a value into `buf` and write it as `application/json`. The
-/// serialize step runs inside `build`, so the caller can hold a data lock
+/// serialize step runs inside `build` so the caller can hold a data lock
 /// across only the serialization (the lock drops when `build` returns) and
 /// not across the network write. On serialization failure (typically buffer
-/// too small) we return 500 with a plain-text body — matches what
-/// hand-rolled handlers were doing.
+/// too small) the canonical error envelope goes back with status 500.
 pub(crate) fn json_response<F, E>(
     req: Request<&mut EspHttpConnection>,
     buf: &mut [u8],
@@ -227,25 +204,13 @@ where
     F: FnOnce(&mut [u8]) -> Result<usize, E>,
     E: core::fmt::Debug,
 {
-    let len = match build(buf) {
-        Ok(n) => n,
+    match build(buf) {
+        Ok(len) => json_reply(req, 200, &buf[..len]),
         Err(e) => {
             warn!("JSON serialization failed: {:?}", e);
-            return json_reply(req, 500, br#"{"error":"serialization error"}"#);
+            json_err(req, 500, "serialization error")
         }
-    };
-    let mut resp = req
-        .into_response(
-            200,
-            None,
-            &[
-                ("Content-Type", "application/json"),
-                ("Connection", "close"),
-            ],
-        )
-        .map_err(|e| e.0)?;
-    resp.write_all(&buf[..len]).map_err(|e| e.0)?;
-    Ok(())
+    }
 }
 
 /// Heap-allocated, mutex-guarded scratch buffer for JSON handlers. Sized at
@@ -262,8 +227,7 @@ impl<const N: usize> JsonBuf<N> {
 
     pub fn with<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
         let mut guard = self.0.lock().unwrap();
-        let buf: &mut [u8] = &mut **guard;
-        f(buf)
+        f(guard.as_mut_slice())
     }
 }
 
