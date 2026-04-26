@@ -2,5 +2,6 @@
 **/.embuild
 **/.env
 /certs
+/.zed/settings.json
 
 monitoring/volumes/
