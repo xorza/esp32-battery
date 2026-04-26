@@ -27,12 +27,12 @@ use super::Sample;
 pub const SERIALIZED_MAX_BYTES: usize = 4096;
 const HEADER_SIZE: usize = 4 + 4 + 4; // version + interval + count
 const SAMPLE_SIZE: usize = 4 + 4 * 4; // u32 + 4×f32 = 20 bytes
-/// Max samples that fit in `SERIALIZED_MAX_BYTES`. 204 × 1024 s ≈ 58 hours
+/// Max samples that fit in `SERIALIZED_MAX_BYTES`. 204 × 4 s ≈ 13.6 min
 /// of history.
 pub const HISTORY_CAPACITY: usize = (SERIALIZED_MAX_BYTES - HEADER_SIZE) / SAMPLE_SIZE / 2 * 2;
 /// Once interval reaches this, drop old samples instead of compacting
-/// further. 204 samples × 1024 s ≈ 58 h (covers 24 h with margin).
-const MAX_INTERVAL: u32 = 1024;
+/// further. 204 samples × 4 s ≈ 13.6 min.
+const MAX_INTERVAL: u32 = 4;
 
 const FORMAT_VERSION: u32 = 6;
 
@@ -134,7 +134,7 @@ impl History {
             return;
         }
         if self.interval >= MAX_INTERVAL {
-            // At max interval (~41 h of history) — drop oldest sample to
+            // At max interval (~13.6 min of history) — drop oldest sample to
             // make room for the next push.
             self.samples.remove(0);
             return;
@@ -363,7 +363,7 @@ mod tests {
         let mut h = History::new();
         assert_eq!(h.interval, 1);
         fill(&mut h, 820, 0);
-        assert_eq!(h.interval, 8);
+        assert_eq!(h.interval, MAX_INTERVAL);
     }
 
     #[test]
