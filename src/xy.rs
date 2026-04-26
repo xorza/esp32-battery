@@ -21,7 +21,7 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    Action, BatterySample, ChargeSupervisor, Chemistry, PollResult, Profile, SafetyLimits,
+    self, Action, BatterySample, ChargeSupervisor, Chemistry, PollResult, Profile, SafetyLimits,
     Setpoints,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
@@ -388,67 +388,100 @@ const BOOT_RETRY_COUNT: u32 = 10;
 const WDT_TIMEOUT: Duration = Duration::from_secs(10);
 const _: () = assert!(WDT_TIMEOUT.as_secs() > POLL_INTERVAL.as_secs() * 2);
 
-fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
-    let mut boot_err = None;
+/// Try `boot_sequence` up to `BOOT_RETRY_COUNT` times. On total failure,
+/// log + record an event + eagerly disable output. Returns either way —
+/// the supervisor will fail closed via ModbusUnhealthy if Modbus is
+/// genuinely dead. Called both at cold boot and on every recovery
+/// restart, so protection + setpoints get re-verified each time.
+fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
     for attempt in 0..BOOT_RETRY_COUNT {
         if attempt > 0 {
             thread::sleep(BOOT_RETRY_DELAY);
         }
-        match boot_sequence(&xy) {
-            Ok(()) => {
-                boot_err = None;
-                break;
-            }
-            Err(e) => boot_err = Some(e),
+        if boot_sequence(xy).is_ok() {
+            return;
         }
     }
-    if let Some(e) = boot_err {
-        error!(
-            "XY boot failed after {BOOT_RETRY_COUNT} attempts: {e} — falling through to supervisor for fail-closed retries"
-        );
-        recorder.record(Event::Xy(XyError::BootSequence));
-        // Eager disable. The supervisor will keep retrying via the
-        // ModbusUnhealthy latch path anyway, but doing it now cuts
-        // time-to-OFF by ~5 s (the modbus-debounce window).
-        match xy.set_output(false) {
-            Ok(()) => error!("XY post-boot-fail set_output(false) succeeded"),
-            Err(e) => error!("XY post-boot-fail set_output(false) FAILED: {e}"),
-        }
+    error!(
+        "XY boot failed after {BOOT_RETRY_COUNT} attempts — falling through to supervisor for fail-closed retries"
+    );
+    recorder.record(Event::Xy(XyError::BootSequence));
+    // Eager disable: cuts time-to-OFF by ~5 s vs. waiting for the
+    // ModbusUnhealthy debounce.
+    match xy.set_output(false) {
+        Ok(()) => warn!("XY post-boot-fail set_output(false) succeeded"),
+        Err(e) => error!("XY post-boot-fail set_output(false) FAILED: {e}"),
     }
+}
 
-    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
+fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
+    // Subscribe once for the lifetime of this thread. Restarts of the
+    // supervise loop (below) keep feeding the same WDT subscription.
     task_wdt::init_and_subscribe(WDT_TIMEOUT);
 
-    // Wrap the supervisor loop so a panic anywhere inside (poisoned mutex,
-    // unexpected None, etc.) doesn't leave the buck sourcing unsupervised.
-    // On panic we force output OFF and let the thread die — no respawn,
-    // since whatever invariant just broke would likely break again. If
-    // the loop *hangs* instead of panicking, the task WDT reboots us
-    // after WDT_TIMEOUT and S_INI=OFF brings the buck up disabled.
-    // The loop body diverges, so catch_unwind only ever returns on panic.
-    let Err(panic) = catch_unwind(AssertUnwindSafe(|| -> ! {
-        loop {
-            task_wdt::reset();
-            let p = poll(&xy, &sensor_data, &recorder);
-            let action = supervisor.tick(p, POLL_INTERVAL);
-            apply_action(&xy, &mut supervisor, action, &recorder);
-            thread::sleep(POLL_INTERVAL);
+    // Outer loop = recovery restarts. Each iteration re-runs boot_sequence
+    // (which reprograms + verifies OVP/OCP/LVP/V_SET/I_SET) and constructs
+    // a fresh ChargeSupervisor. Bounded by OUTPUT_RECOVERY_MAX_ATTEMPTS;
+    // exhaustion → leave the buck off and exit the thread.
+    for restart in 0..=charging::OUTPUT_RECOVERY_MAX_ATTEMPTS {
+        if restart > 0 {
+            info!(
+                "XY supervisor restart {restart}/{} (recovering from buck self-disable)",
+                charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
+            );
         }
-    }));
+        boot_with_retries(&xy, &recorder);
+        let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
-    let msg = panic
-        .downcast_ref::<&'static str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("<non-string panic>");
-    error!("XY supervisor thread PANICKED: {msg} — forcing output OFF, thread will exit");
-    recorder.record(Event::Xy(XyError::SupervisorPanic));
-    match xy.set_output(false) {
-        Ok(()) => error!("XY post-panic set_output(false) succeeded — buck is OFF"),
-        Err(e) => error!(
-            "XY post-panic set_output(false) FAILED: {e} — buck may still be sourcing, hardware OVP/OCP is the only remaining backstop"
-        ),
+        // Inner loop = supervise. Returns Ok(()) when the supervisor
+        // signals should_restart (caller's cue to tear down + redo
+        // boot_sequence); panics propagate out as Err.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            loop {
+                task_wdt::reset();
+                let p = poll(&xy, &sensor_data, &recorder);
+                let action = supervisor.tick(p, POLL_INTERVAL);
+                apply_action(&xy, &mut supervisor, action, &recorder);
+                if supervisor.should_restart(&p, POLL_INTERVAL) {
+                    return;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+        }));
+
+        match result {
+            Ok(()) => continue, // outer loop re-runs boot_sequence
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic>");
+                error!(
+                    "XY supervisor thread PANICKED: {msg} — forcing output OFF, thread will exit"
+                );
+                recorder.record(Event::Xy(XyError::SupervisorPanic));
+                match xy.set_output(false) {
+                    Ok(()) => error!("XY post-panic set_output(false) succeeded — buck is OFF"),
+                    Err(e) => error!(
+                        "XY post-panic set_output(false) FAILED: {e} — buck may still be sourcing, hardware OVP/OCP is the only remaining backstop"
+                    ),
+                }
+                task_wdt::unsubscribe();
+                return;
+            }
+        }
     }
+
+    error!(
+        "XY recovery budget exhausted ({} attempts) — forcing output OFF, thread will exit",
+        charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
+    );
+    match xy.set_output(false) {
+        Ok(()) => error!("XY recovery-exhausted set_output(false) succeeded — buck is OFF"),
+        Err(e) => error!("XY recovery-exhausted set_output(false) FAILED: {e}"),
+    }
+    task_wdt::unsubscribe();
 }
 
 /// One read cycle: poll the buck, push readings into shared sensor data,

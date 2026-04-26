@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use esp_idf_svc::sys::{
-    ESP_OK, esp, esp_task_wdt_add, esp_task_wdt_config_t, esp_task_wdt_init,
+    ESP_OK, esp, esp_task_wdt_add, esp_task_wdt_config_t, esp_task_wdt_delete, esp_task_wdt_init,
     esp_task_wdt_reconfigure, esp_task_wdt_reset,
 };
 
@@ -42,4 +42,10 @@ pub fn reset() {
     unsafe {
         esp_task_wdt_reset();
     }
+}
+
+/// Unsubscribe the current task. Call this before a deliberate thread
+/// exit so the WDT doesn't reboot the MCU once feeds stop arriving.
+pub fn unsubscribe() {
+    esp!(unsafe { esp_task_wdt_delete(std::ptr::null_mut()) }).expect("WDT unsubscribe");
 }
