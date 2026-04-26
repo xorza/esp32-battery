@@ -54,18 +54,82 @@ struct XyStatus {
     v_in: f32,
 }
 
+/// Latched protection cause read from XY register 0x0010 (PROTECT). Per
+/// the XY6020L Modbus interface doc (Note 3 — same module family as the
+/// XY7025), 0 means normal operation; non-zero values name which
+/// hardware protection most recently tripped. The register stays latched
+/// until cleared via `clear_protection_status` (write 0 to 0x0010).
+#[allow(dead_code)] // variants surfaced once the supervisor consumes them
+#[derive(Copy, Clone, PartialEq, Eq, strum::Display)]
+#[strum(serialize_all = "lowercase")]
+enum XyProtectionStatus {
+    Normal,
+    /// Output overvoltage. Also fires transiently when V_SET is raised
+    /// above current V_OUT.
+    Ovp,
+    /// Output overcurrent.
+    Ocp,
+    /// Output overpower.
+    Opp,
+    /// Input undervoltage (LVP setpoint, not pack-side).
+    Lvp,
+    /// Over amp-hour.
+    Oah,
+    /// Output high-power time exceeded.
+    Ohp,
+    /// Over temperature.
+    Otp,
+    /// Over energy.
+    Oep,
+    /// Over watt-hour.
+    Owh,
+    /// Input overcurrent.
+    Icp,
+    /// Register read back a value not in the documented 0–10 range. We
+    /// don't trust the device in this state — recovery treats Unknown as
+    /// not-Normal so it stays gated.
+    #[strum(to_string = "unknown({0})")]
+    Unknown(u16),
+}
+
+impl XyProtectionStatus {
+    #[allow(dead_code)] // wired in once the supervisor gates recovery on it
+    fn from_register(raw: u16) -> Self {
+        match raw {
+            0 => Self::Normal,
+            1 => Self::Ovp,
+            2 => Self::Ocp,
+            3 => Self::Opp,
+            4 => Self::Lvp,
+            5 => Self::Oah,
+            6 => Self::Ohp,
+            7 => Self::Otp,
+            8 => Self::Oep,
+            9 => Self::Owh,
+            10 => Self::Icp,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
 /// The set of operations the charging loop needs from the buck. Real
 /// builds get the UART-backed implementation; `xy-fake` builds get an
 /// in-memory canned device. The thread loop is identical for both.
 /// `RtuError` is the trait error type because every failure mode the
 /// supervisor cares about today is a Modbus-RTU transport failure.
+#[allow(dead_code)] // protection-status methods wired in once the supervisor gates recovery on them
 trait XyDevice {
     fn read_status(&self) -> Result<XyStatus, RtuError>;
     fn read_protection(&self) -> Result<SafetyLimits, RtuError>;
+    fn read_protection_status(&self) -> Result<XyProtectionStatus, RtuError>;
     fn read_output_on(&self) -> Result<bool, RtuError>;
     fn set_voltage(&self, volts: f32) -> Result<(), RtuError>;
     fn set_current_limit(&self, amps: f32) -> Result<(), RtuError>;
     fn set_protection(&self, limits: SafetyLimits) -> Result<(), RtuError>;
+    /// Write 0 to register 0x0010 (PROTECT) to clear a latched
+    /// protection cause. Per the XY6020L doc, this is how the device
+    /// stops blinking the front-panel backlight after a trip.
+    fn clear_protection_status(&self) -> Result<(), RtuError>;
     fn set_output(&self, on: bool) -> Result<(), RtuError>;
     fn set_power_on_default_off(&self) -> Result<(), RtuError>;
 }
@@ -119,13 +183,17 @@ mod real {
     use esp32_battery_logic::charging::SafetyLimits;
     use esp32_battery_logic::modbus::RtuError;
 
-    use super::{XyDevice, XyStatus};
+    use super::{XyDevice, XyProtectionStatus, XyStatus};
     use crate::board::XyPins;
     use crate::modbus_rtu::{ModbusRtu, RtuConfig};
 
     const SLAVE: u8 = 0x01;
     const REG_V_SET: u16 = 0x0000;
     const REG_I_SET: u16 = 0x0001;
+    /// PROTECT register: latched protection cause, 0 = normal, 1–10 =
+    /// specific trip (see `XyProtectionStatus`). Write 0 to clear.
+    #[allow(dead_code)] // wired in once the supervisor gates recovery on it
+    const REG_PROTECT: u16 = 0x0010;
     const REG_OUTPUT_EN: u16 = 0x0012;
     const REG_S_LVP: u16 = 0x0052;
     const REG_S_OVP: u16 = 0x0053;
@@ -196,6 +264,11 @@ mod real {
             })
         }
 
+        fn read_protection_status(&self) -> Result<XyProtectionStatus, RtuError> {
+            let r = self.modbus.read_holding(SLAVE, REG_PROTECT, 1)?;
+            Ok(XyProtectionStatus::from_register(r[0]))
+        }
+
         fn read_output_on(&self) -> Result<bool, RtuError> {
             let r = self.modbus.read_holding(SLAVE, REG_OUTPUT_EN, 1)?;
             Ok(r[0] != 0)
@@ -217,6 +290,10 @@ mod real {
             self.modbus
                 .write_holding(SLAVE, REG_S_LVP, to_reg(limits.lvp_v))?;
             Ok(())
+        }
+
+        fn clear_protection_status(&self) -> Result<(), RtuError> {
+            self.modbus.write_holding(SLAVE, REG_PROTECT, 0)
         }
 
         fn set_output(&self, on: bool) -> Result<(), RtuError> {
@@ -242,7 +319,7 @@ mod fake {
     use esp32_battery_logic::charging::SafetyLimits;
     use esp32_battery_logic::modbus::RtuError;
 
-    use super::{XyDevice, XyStatus};
+    use super::{XyDevice, XyProtectionStatus, XyStatus};
     use crate::board::XyPins;
 
     const BAUD: u32 = 115200;
@@ -254,6 +331,7 @@ mod fake {
         v_set: Cell<f32>,
         i_set: Cell<f32>,
         protection: Cell<SafetyLimits>,
+        protection_status: Cell<XyProtectionStatus>,
         output_on: Cell<bool>,
         // Real UART driver, constructed but never written to. Held so the
         // peripheral and its GPIOs are genuinely configured and claimed
@@ -282,6 +360,7 @@ mod fake {
                     ocp_a: 0.0,
                     lvp_v: 0.0,
                 }),
+                protection_status: Cell::new(XyProtectionStatus::Normal),
                 output_on: Cell::new(false),
                 _uart: uart,
             }
@@ -307,6 +386,9 @@ mod fake {
         fn read_protection(&self) -> Result<SafetyLimits, RtuError> {
             Ok(self.protection.get())
         }
+        fn read_protection_status(&self) -> Result<XyProtectionStatus, RtuError> {
+            Ok(self.protection_status.get())
+        }
         fn read_output_on(&self) -> Result<bool, RtuError> {
             Ok(self.output_on.get())
         }
@@ -320,6 +402,10 @@ mod fake {
         }
         fn set_protection(&self, limits: SafetyLimits) -> Result<(), RtuError> {
             self.protection.set(limits);
+            Ok(())
+        }
+        fn clear_protection_status(&self) -> Result<(), RtuError> {
+            self.protection_status.set(XyProtectionStatus::Normal);
             Ok(())
         }
         fn set_output(&self, on: bool) -> Result<(), RtuError> {
