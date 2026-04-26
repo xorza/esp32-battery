@@ -146,21 +146,12 @@ mod real {
             Self { uart }
         }
 
-        fn read_holding(&self, addr: u16, count: u16) -> Result<Vec<u16>, XyIoError> {
-            assert!(count > 0 && count <= 125);
-            let req = build_read_request(SLAVE, addr, count);
-            let mut resp = [0u8; 256];
-            let n = self.transact(&req, &mut resp)?;
-            Ok(parse_read_response(&resp[..n], SLAVE, count)?)
-        }
-
         fn write_holding(&self, addr: u16, value: u16) -> Result<(), XyIoError> {
             let req = build_write_request(SLAVE, addr, value);
             let mut resp = [0u8; 8];
-            let result = match self.transact(&req, &mut resp) {
-                Ok(n) => parse_write_response(&resp[..n], &req).map_err(XyIoError::from),
-                Err(e) => Err(e),
-            };
+            let result = self
+                .transact(&req, &mut resp)
+                .and_then(|n| Ok(parse_write_response(&resp[..n], &req)?));
             thread::sleep(POST_WRITE_GAP);
             result
         }
@@ -190,7 +181,10 @@ mod real {
 
     impl XyDevice for Xy<'_> {
         fn read_status(&self) -> Result<XyStatus, XyIoError> {
-            let r = self.read_holding(0x0000, 6)?;
+            let req = build_read_request(SLAVE, 0x0000, 6);
+            let mut resp = [0u8; 256];
+            let n = self.transact(&req, &mut resp)?;
+            let r = parse_read_response(&resp[..n], SLAVE, 6)?;
             Ok(XyStatus {
                 v_set: r[0] as f32 / 100.0,
                 i_set: r[1] as f32 / 100.0,
@@ -310,26 +304,25 @@ fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), XyIoErro
 /// power where there's no CDC-enumeration delay to mask the gap. ~5 s
 /// of retries swallows the race without delaying the supervisor loop
 /// noticeably when the XY is actually unreachable.
-const BOOT_RETRY_DELAY: Duration = Duration::from_millis(200);
-const BOOT_RETRY_COUNT: u32 = 5;
+const BOOT_RETRY_DELAY: Duration = Duration::from_millis(100);
+const BOOT_RETRY_COUNT: u32 = 10;
 
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
     let mut last_err = None;
-    let mut booted = false;
-    for attempt in 0..BOOT_RETRY_COUNT {
+    let booted = (0..BOOT_RETRY_COUNT).any(|attempt| {
         if attempt > 0 {
             thread::sleep(BOOT_RETRY_DELAY);
         }
         match boot_sequence(&xy, supervisor.target_voltage()) {
-            Ok(()) => {
-                booted = true;
-                break;
+            Ok(()) => true,
+            Err(e) => {
+                last_err = Some(e);
+                false
             }
-            Err(e) => last_err = Some(e),
         }
-    }
+    });
     if !booted {
         let e = last_err.expect("retry loop ran at least once");
         error!(
@@ -404,24 +397,18 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
 
 // --- Public entry point -----------------------------------------------------
 
-#[cfg(not(feature = "xy-fake"))]
-fn make_device(pins: XyPins) -> real::Xy<'static> {
-    real::Xy::new(pins)
-}
-
-#[cfg(feature = "xy-fake")]
-fn make_device(pins: XyPins) -> fake::FakeXy {
-    // Burn the peripherals through black_box so XyPins fields aren't
-    // flagged dead — we still claim them at boot and just don't drive
-    // the bus.
-    let XyPins { uart, tx, rx } = pins;
-    std::hint::black_box((uart, tx, rx));
-    log::info!("XY: fake mode — no UART, in-memory device");
-    fake::FakeXy::new()
-}
-
 pub fn start(pins: XyPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
-    let device = make_device(pins);
+    #[cfg(not(feature = "xy-fake"))]
+    let device = real::Xy::new(pins);
+    #[cfg(feature = "xy-fake")]
+    let device = {
+        // Destructure so XyPins fields count as used; we claim the
+        // peripherals at boot but don't drive the bus.
+        let XyPins { uart, tx, rx } = pins;
+        let _ = (uart, tx, rx);
+        log::info!("XY: fake mode — no UART, in-memory device");
+        fake::FakeXy::new()
+    };
     thread::Builder::new()
         .name("xy".into())
         .stack_size(4096)
