@@ -388,6 +388,10 @@ fn promote_to_serving(
     ctx: &StaCtx,
 ) -> NetState {
     nvs_creds::save(&ctx.nvs, &creds);
+    // Publish "connected" and linger so the captive page's 1 Hz /status
+    // poll can read it before the AP disappears with the bundle.
+    bundle.set_status(SubmissionStatus::Connected);
+    thread::sleep(Duration::from_millis(1500));
     drop(bundle);
     let sta_wifi = wifi.into_sta(&creds);
     let server = ctx.start_dashboard();

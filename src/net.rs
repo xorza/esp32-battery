@@ -56,6 +56,7 @@ pub enum SubmissionStatus {
     Pending = 1,
     Trying = 2,
     Failed = 3,
+    Connected = 4,
 }
 
 #[derive(Clone)]

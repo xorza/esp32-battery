@@ -5,9 +5,7 @@
 //! status atomic to `Pending`. The supervisor drains the mailbox on its
 //! next captive-arm tick, applies creds via `set_sta_creds`, and (on
 //! association) persists to NVS — bad creds therefore never overwrite a
-//! known-good pair on flash. On success the supervisor drops the captive
-//! bundle; the page's `/status` poll then errors, which it treats as
-//! success.
+//! known-good pair on flash.
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::sys::EspError;
