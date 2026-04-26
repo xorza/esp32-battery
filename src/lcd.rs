@@ -283,9 +283,7 @@ fn draw_captive_portal(gb: &mut GraphBuf, trying: bool) {
         .unwrap();
     let [a, b, c, d] = crate::wifi::AP_GATEWAY;
     let url = format!("http://{a}.{b}.{c}.{d}/");
-    Text::new(&url, Point::new(20, 98), value)
-        .draw(gb)
-        .unwrap();
+    Text::new(&url, Point::new(20, 98), value).draw(gb).unwrap();
 
     if trying {
         // Top-right indicator so the AP creds remain readable while STA
