@@ -145,8 +145,14 @@
                         m.textContent = "Connecting...";
                         pollStatus(b, m);
                     } else {
+                        var msg;
+                        try {
+                            msg = JSON.parse(x.responseText).error;
+                        } catch (e) {
+                            msg = x.responseText;
+                        }
                         m.className = "msg err";
-                        m.textContent = "Error: " + x.responseText;
+                        m.textContent = "Error: " + msg;
                         b.disabled = false;
                     }
                 };

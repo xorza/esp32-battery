@@ -15,7 +15,7 @@ use log::info;
 
 use esp32_battery_logic::form;
 
-use crate::http::{JsonBuf, mount_get, mount_json_get, mount_post, read_to_buf, text_response};
+use crate::http::{JsonBuf, json_err, json_ok, mount_get, mount_json_get, mount_post, read_to_buf};
 use crate::net::{CredsMailbox, SubmissionStatus, SubmissionStatusHandle};
 use crate::nvs_creds::WifiCredentials;
 use crate::wifi::ScanCache;
@@ -49,31 +49,31 @@ pub fn mount(
         let mut body_buf = [0u8; 256];
         let filled = read_to_buf(&mut req, &mut body_buf)?;
         let Ok(body) = std::str::from_utf8(&body_buf[..filled]) else {
-            return text_response(req, 400, b"Body is not valid UTF-8");
+            return json_err(req, 400, "Body is not valid UTF-8");
         };
 
         let Some((ssid_raw, pass_raw)) = form::parse_form(body) else {
-            return text_response(req, 400, b"Missing SSID");
+            return json_err(req, 400, "Missing SSID");
         };
 
         let mut ssid_buf = [0u8; 33];
         let ssid_len = form::url_decode(ssid_raw, &mut ssid_buf);
         let Ok(ssid) = std::str::from_utf8(&ssid_buf[..ssid_len]) else {
-            return text_response(req, 400, b"SSID is not valid UTF-8");
+            return json_err(req, 400, "SSID is not valid UTF-8");
         };
 
         let mut pass_buf = [0u8; 65];
         let pass_len = form::url_decode(pass_raw, &mut pass_buf);
         let Ok(password) = std::str::from_utf8(&pass_buf[..pass_len]) else {
-            return text_response(req, 400, b"Password is not valid UTF-8");
+            return json_err(req, 400, "Password is not valid UTF-8");
         };
 
         if ssid.is_empty() || ssid.len() > 32 {
-            return text_response(req, 400, b"Invalid SSID");
+            return json_err(req, 400, "Invalid SSID");
         }
         // WPA/WPA2: 8-63 chars, or empty for open networks.
         if !password.is_empty() && !(8..=63).contains(&password.len()) {
-            return text_response(req, 400, b"Password must be 8-63 characters");
+            return json_err(req, 400, "Password must be 8-63 characters");
         }
 
         let creds = WifiCredentials::new(ssid.to_string(), password.to_string());
@@ -84,7 +84,7 @@ pub fn mount(
         save_status.store(SubmissionStatus::Pending);
 
         info!("Captive: queued new credentials for live STA reconnect");
-        text_response(req, 200, b"OK")?;
+        json_ok(req)?;
         Ok::<(), EspError>(())
     });
 

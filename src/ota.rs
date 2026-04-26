@@ -5,26 +5,15 @@ use esp_idf_svc::http::server::{EspHttpConnection, EspHttpServer};
 use esp_idf_svc::ota::EspOta;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use log::{info, warn};
-use serde::Serialize;
 use sha2::Sha256;
 
 use crate::clock::uptime;
-use crate::http::{json_reply, mount_post};
+use crate::http::{json_err, json_ok, mount_post};
 
 /// Wall-clock timeout for the entire OTA upload. A legitimate 1.5 MB firmware
 /// over the local network takes a few seconds; anything approaching this is
 /// either a dead link or a slowloris-style DoS.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Serialize)]
-struct OkResponse {
-    ok: bool,
-}
-
-#[derive(Serialize)]
-struct ErrorResponse<'a> {
-    error: &'a str,
-}
 
 const OTA_KEY_HEX: &str = env!("OTA_KEY");
 
@@ -114,19 +103,15 @@ fn handle_upload(
 
 pub fn mount(server: &mut EspHttpServer<'static>) {
     mount_post(server, "/ota/upload", |mut req| {
-        let mut buf = [0u8; 128];
         match handle_upload(&mut req) {
             Ok(total) => {
                 info!("OTA: received {} bytes, signature valid", total);
-                let len = serde_json_core::to_slice(&OkResponse { ok: true }, &mut buf).unwrap();
-                let _ = json_reply(req, 200, &buf[..len]);
+                let _ = json_ok(req);
                 crate::reboot::reboot_after("OTA: rebooting now");
             }
             Err(msg) => {
                 warn!("OTA: {}", msg);
-                let len =
-                    serde_json_core::to_slice(&ErrorResponse { error: msg }, &mut buf).unwrap();
-                let _ = json_reply(req, 403, &buf[..len]);
+                let _ = json_err(req, 403, msg);
             }
         }
         Ok::<(), esp_idf_svc::sys::EspError>(())

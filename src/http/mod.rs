@@ -166,25 +166,50 @@ fn body_response(
     Ok(())
 }
 
-/// Plain-text response (no explicit Content-Type — httpd defaults to text/html
-/// which browsers render fine for short status messages).
-pub(crate) fn text_response(
-    req: Request<&mut EspHttpConnection>,
-    status: u16,
-    body: &[u8],
-) -> Result<(), EspError> {
-    body_response(req, status, None, body)
-}
-
-/// JSON response with a caller-chosen status — used by handlers that need
-/// non-200 outcomes (OTA error replies, etc). For the common 200 path with
-/// streaming serialization, use `json_response`.
+/// JSON response with a caller-chosen status and pre-serialized body.
+/// For the common 200 path with streaming serialization use
+/// `json_response`; for the canonical `{"ok":true}` / `{"error":...}`
+/// envelopes use `json_ok` / `json_err`.
 pub(crate) fn json_reply(
     req: Request<&mut EspHttpConnection>,
     status: u16,
     body: &[u8],
 ) -> Result<(), EspError> {
     body_response(req, status, Some("application/json"), body)
+}
+
+/// Canonical 200 success envelope: `{"ok":true}`. All action endpoints
+/// (POSTs that do something rather than return data) use this so the
+/// frontend can read a single shape.
+pub(crate) fn json_ok(req: Request<&mut EspHttpConnection>) -> Result<(), EspError> {
+    json_reply(req, 200, br#"{"ok":true}"#)
+}
+
+/// Canonical error envelope: `{"error":"<msg>"}`. `msg` must be a
+/// short, JSON-safe ASCII status string (no quotes, no backslashes,
+/// no control chars). Asserts on misuse.
+pub(crate) fn json_err(
+    req: Request<&mut EspHttpConnection>,
+    status: u16,
+    msg: &str,
+) -> Result<(), EspError> {
+    assert!(
+        !msg.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20),
+        "json_err: msg contains characters that need escaping: {msg:?}"
+    );
+    let mut buf = [0u8; 192];
+    let prefix = br#"{"error":""#;
+    let suffix = br#""}"#;
+    let total = prefix.len() + msg.len() + suffix.len();
+    assert!(
+        total <= buf.len(),
+        "json_err: msg too long ({} bytes)",
+        msg.len()
+    );
+    buf[..prefix.len()].copy_from_slice(prefix);
+    buf[prefix.len()..prefix.len() + msg.len()].copy_from_slice(msg.as_bytes());
+    buf[prefix.len() + msg.len()..total].copy_from_slice(suffix);
+    json_reply(req, status, &buf[..total])
 }
 
 /// Serialize a value into `buf` and write it as `application/json`. The
