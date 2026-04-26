@@ -27,15 +27,15 @@ Telegraf + InfluxDB + Grafana (TIG) stack that polls the ESP32 battery monitor A
 
 | Field | Unit | Description |
 |-------|------|-------------|
-| voltage | V | Battery voltage (avg of both sensors) |
-| soc | % | State of charge |
-| battery_current | A | Battery current (sensor 1) |
-| battery_power | W | Battery power (sensor 1) |
-| supply_current | A | Power supply current (sensor 2) |
-| supply_power | W | Power supply power (sensor 2) |
-| charge | Ah | Accumulated charge |
-| max_charge | Ah | Max charge seen |
+| voltage | V | Battery voltage |
+| soc | % | State of charge (computed from OCV) |
+| battery_current | A | Battery current (negative when charging) |
+| battery_power | W | Battery power |
+| supply_voltage | V | Power-supply (XY7025) output voltage |
+| supply_current | A | Power-supply output current |
+| supply_power | W | Power-supply output power |
+| power_online | 0/1 | Supply-online indicator (averaged over the window for uptime %) |
+| heap_free | bytes | Free heap right now |
+| heap_min_free | bytes | Low-water mark of free heap since boot |
 | rssi | dBm | WiFi signal strength |
 | uptime | s | ESP32 uptime |
-| read_failures | count | I2C read failures |
-| read_total | count | Total I2C reads |
