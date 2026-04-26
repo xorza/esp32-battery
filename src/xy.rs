@@ -13,6 +13,7 @@
 //! conflicts surface on the bench) but never transacts — setpoints are
 //! tracked in-memory.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -407,11 +408,32 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
 
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
-    loop {
-        let p = poll(&xy, &sensor_data, &recorder);
-        let action = supervisor.tick(p, POLL_INTERVAL);
-        apply_action(&xy, &mut supervisor, action, &recorder);
-        thread::sleep(POLL_INTERVAL);
+    // Wrap the supervisor loop so a panic anywhere inside (poisoned mutex,
+    // unexpected None, etc.) doesn't leave the buck sourcing unsupervised.
+    // On panic we force output OFF and let the thread die — no respawn,
+    // since whatever invariant just broke would likely break again.
+    // The loop body diverges, so catch_unwind only ever returns on panic.
+    let Err(panic) = catch_unwind(AssertUnwindSafe(|| -> ! {
+        loop {
+            let p = poll(&xy, &sensor_data, &recorder);
+            let action = supervisor.tick(p, POLL_INTERVAL);
+            apply_action(&xy, &mut supervisor, action, &recorder);
+            thread::sleep(POLL_INTERVAL);
+        }
+    }));
+
+    let msg = panic
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic>");
+    error!("XY supervisor thread PANICKED: {msg} — forcing output OFF, thread will exit");
+    recorder.record(Event::Xy(XyError::SupervisorPanic));
+    match xy.set_output(false) {
+        Ok(()) => error!("XY post-panic set_output(false) succeeded — buck is OFF"),
+        Err(e) => error!(
+            "XY post-panic set_output(false) FAILED: {e} — buck may still be sourcing, hardware OVP/OCP is the only remaining backstop"
+        ),
     }
 }
 

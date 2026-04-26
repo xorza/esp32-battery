@@ -41,6 +41,7 @@ pub enum XyError {
     SetOutput,
     SetProtection,
     BootSequence,
+    SupervisorPanic,
 }
 
 impl XyError {
