@@ -57,12 +57,7 @@ Both `flash.sh` and `deploy.sh` honor the same env vars:
 | `INA_FAKE`   | `1`                     | Adds the `ina-fake` Cargo feature — substitutes a canned in-memory device for the INA228 I2C driver |
 | `XY_FAKE`    | `1`                     | Adds the `xy-fake` Cargo feature — substitutes a canned in-memory device for the XY7025 Modbus client |
 
-Exactly one MCU feature must be enabled (`board.rs` enforces this with a `compile_error!`).
-
-### Partition Tables
-
-- `partitions-8mb.csv` — 8 MB flash (default)
-- `partitions-4mb.csv` — 4 MB flash
+Exactly one MCU feature must be enabled (`board.rs` enforces this with a `compile_error!`). `flash.sh` picks the right partition table per `MCU`.
 
 ## OTA Deployment
 
