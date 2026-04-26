@@ -139,10 +139,11 @@ const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
 /// How long the pack must hold above `absorb_v + OV_MARGIN_V` before tripping.
 /// Time-based so the debounce isn't sensitive to poll cadence.
 const OV_DURATION: Duration = Duration::from_secs(3);
-/// Cap on how long absorb can run continuously. Long enough to finish a real
-/// charge taper, short enough that a stuck-current scenario can't keep the
-/// pack at CV indefinitely.
-const MAX_ABSORB: Duration = Duration::from_secs(4 * 60 * 60);
+/// Cap on how long absorb can run continuously. With the manufacturer-spec
+/// 0.05C tail (`EXIT_ABSORB_C`), a healthy pack tapers under 30 min — 2 h
+/// is generous headroom while keeping a stuck-current scenario from sitting
+/// at CV indefinitely.
+const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long battery readings can stay absent before we fail closed.
 const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long Modbus reads to the XY can keep failing before we fail closed.
