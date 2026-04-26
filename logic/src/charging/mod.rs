@@ -63,28 +63,38 @@ pub struct SafetyLimits {
     pub lvp_v: f32,
 }
 
+/// CC charge rate as a fraction of pack capacity. 0.2C is the
+/// longevity-tuned value; manufacturer max is 0.5C. Stay conservative.
+pub const REGULATION_C: f32 = 0.2;
+/// Tail-current threshold for ending Absorb, as a fraction of capacity.
+/// 0.05C (= C/20) is the cell-manufacturer-standard termination current
+/// for LFP — consensus across Battle Born, Victron, and Nordkyn Design
+/// references.
+pub const EXIT_ABSORB_C: f32 = 0.05;
+/// Threshold for entering Absorb. Sits just above `EXIT_ABSORB_C` so the
+/// hysteresis band straddles the manufacturer tail current — no flap once
+/// the pack tapers near 0.05C.
+pub const ENTER_ABSORB_C: f32 = 0.06;
+const _: () = assert!(REGULATION_C > ENTER_ABSORB_C);
+const _: () = assert!(ENTER_ABSORB_C > EXIT_ABSORB_C);
+
 impl Profile {
-    /// Build a pack-level profile from chemistry + series cell count. Voltages
-    /// scale with `cells`; currents are pack-level (not per-cell) and so stay
-    /// as configured by the caller.
-    pub const fn for_pack(
-        chemistry: Chemistry,
-        cells: u8,
-        regulation_a: f32,
-        enter_absorb_a: f32,
-        exit_absorb_a: f32,
-    ) -> Self {
+    /// Build a pack-level profile from chemistry, series cell count, and
+    /// pack capacity. Voltages scale with `cells`; charge/taper currents
+    /// scale with `capacity_ah` via the `*_C` constants above. Same C-rates
+    /// across chemistries — the LFP literature is the basis, but the
+    /// fractions are conservative enough that NMC/LCO are also safe.
+    pub const fn for_pack(chemistry: Chemistry, cells: u8, capacity_ah: f32) -> Self {
         assert!(cells > 0);
-        assert!(enter_absorb_a > exit_absorb_a);
-        assert!(regulation_a > enter_absorb_a);
+        assert!(capacity_ah > 0.0);
         let (av, fv) = chemistry.per_cell();
         let s = cells as f32;
         Self {
             absorb_v: av * s,
             float_v: fv * s,
-            regulation_a,
-            enter_absorb_a,
-            exit_absorb_a,
+            regulation_a: capacity_ah * REGULATION_C,
+            enter_absorb_a: capacity_ah * ENTER_ABSORB_C,
+            exit_absorb_a: capacity_ah * EXIT_ABSORB_C,
         }
     }
 

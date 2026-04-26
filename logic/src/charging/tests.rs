@@ -1,12 +1,10 @@
 use super::*;
 
+/// 4S 50 Ah LFP — the board's actual pack. With the module's C-rate
+/// constants this gives reg = 10 A, enter = 3 A, exit = 2.5 A. Tests that
+/// exercise threshold edges expect those numbers.
 fn lfp_4s() -> Profile {
-    // Pack-level defaults: 1 A enter, 0.5 A exit. Real CC-CV chargers
-    // terminate absorb at 0.05C (5 A on 100 Ah), but they enter absorb on
-    // VOLTAGE — we enter on current, which forces enter > exit so we don't
-    // flap. 0.5 A keeps a usable hysteresis band without sitting at CV
-    // forever. Absorb voltage (14.4 V) is the bigger longevity win.
-    Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.5)
+    Profile::for_pack(Chemistry::LiFePo4, 4, 50.0)
 }
 
 fn approx(a: f32, b: f32) -> bool {
@@ -30,6 +28,43 @@ fn matches_disable(a: &Action, expected: FaultReason) -> bool {
 // --- Profile construction ---
 
 #[test]
+fn lfp_4s_50ah_matches_hand_calculation() {
+    // Exhaustive check of the production profile's derived fields against
+    // hand math. If any C-rate constant or per-cell voltage is changed
+    // accidentally, exactly this test fires.
+    //
+    // Inputs: chemistry = LiFePo4 (3.60 V/cell absorb, 3.375 V/cell float),
+    //         cells = 4, capacity = 50 Ah.
+    // C-rates: REGULATION_C = 0.20, ENTER_ABSORB_C = 0.06, EXIT_ABSORB_C = 0.05.
+    // Hardware-OVP margin = OV_MARGIN_V × 3 = 0.2 × 3 = 0.6 V.
+    // Input UVLO = INPUT_NOMINAL_V − INPUT_LVP_MARGIN_V = 24 − 2 = 22 V.
+    //
+    //   absorb_v       = 3.60   × 4   = 14.40 V
+    //   float_v        = 3.375  × 4   = 13.50 V
+    //   regulation_a   = 0.20   × 50  = 10.00 A
+    //   enter_absorb_a = 0.06   × 50  =  3.00 A
+    //   exit_absorb_a  = 0.05   × 50  =  2.50 A
+    //   ovp_v          = 14.40  + 0.6 = 15.00 V
+    //   ocp_a          = 10.00  × 1.5 = 15.00 A
+    //   lvp_v          = 24     − 2   = 22.00 V
+    let p = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
+    assert!(approx(p.absorb_v, 14.40));
+    assert!(approx(p.float_v, 13.50));
+    assert!(approx(p.regulation_a, 10.00));
+    assert!(approx(p.enter_absorb_a, 3.00));
+    assert!(approx(p.exit_absorb_a, 2.50));
+    let s = p.safety_limits();
+    assert!(approx(s.ovp_v, 15.00));
+    assert!(approx(s.ocp_a, 15.00));
+    assert!(approx(s.lvp_v, 22.00));
+    // Derived ordering invariants the supervisor relies on.
+    assert!(p.absorb_v > p.float_v);
+    assert!(p.regulation_a > p.enter_absorb_a);
+    assert!(p.enter_absorb_a > p.exit_absorb_a);
+    assert!(s.ovp_v > p.absorb_v + OV_MARGIN_V);
+}
+
+#[test]
 fn lfp_4s_voltages_match_known_setpoints() {
     let p = lfp_4s();
     // 3.60 V × 4 = 14.4 V CV (daily-cycle); 3.375 V × 4 = 13.5 V float.
@@ -38,16 +73,25 @@ fn lfp_4s_voltages_match_known_setpoints() {
 }
 
 #[test]
+fn lfp_4s_currents_derive_from_capacity() {
+    // 50 Ah × {0.2C, 0.06C, 0.05C} = {10 A, 3 A, 2.5 A}.
+    let p = lfp_4s();
+    assert!(approx(p.regulation_a, 10.0));
+    assert!(approx(p.enter_absorb_a, 3.0));
+    assert!(approx(p.exit_absorb_a, 2.5));
+}
+
+#[test]
 fn lfp_top_balance_uses_manufacturer_max() {
     // 3.65 V/cell — used only when BMS needs the headroom to balance.
-    let p = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 10.0, 2.0, 0.5);
+    let p = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 50.0);
     assert!(approx(p.absorb_v, 14.6));
     assert!(approx(p.float_v, 13.5));
 }
 
 #[test]
 fn liion_3s_voltages_match_known_setpoints() {
-    let p = Profile::for_pack(Chemistry::LiIon, 3, 10.0, 1.0, 0.1);
+    let p = Profile::for_pack(Chemistry::LiIon, 3, 50.0);
     // Longevity-tuned: 4.10 × 3 = 12.3, 4.00 × 3 = 12.0.
     assert!(approx(p.absorb_v, 12.3));
     assert!(approx(p.float_v, 12.0));
@@ -55,9 +99,9 @@ fn liion_3s_voltages_match_known_setpoints() {
 
 #[test]
 fn voltages_scale_with_cell_count() {
-    let p1 = Profile::for_pack(Chemistry::LiFePo4, 1, 10.0, 1.0, 0.1);
-    let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.1);
-    let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 10.0, 1.0, 0.1);
+    let p1 = Profile::for_pack(Chemistry::LiFePo4, 1, 50.0);
+    let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
+    let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 50.0);
     assert!(approx(p1.absorb_v, 3.60));
     assert!(approx(p4.absorb_v, 3.60 * 4.0));
     assert!(approx(p16.absorb_v, 3.60 * 16.0));
@@ -67,39 +111,35 @@ fn voltages_scale_with_cell_count() {
 }
 
 #[test]
-fn currents_do_not_scale_with_cell_count() {
-    // Pack-level current — independent of S.
-    let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 2.5, 0.25);
-    let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 10.0, 2.5, 0.25);
-    assert_eq!(p4.enter_absorb_a, 2.5);
-    assert_eq!(p16.enter_absorb_a, 2.5);
-    assert_eq!(p4.exit_absorb_a, 0.25);
-    assert_eq!(p16.exit_absorb_a, 0.25);
+fn currents_scale_with_capacity_not_cells() {
+    // Same capacity, different S → identical currents.
+    let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
+    let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 50.0);
+    assert!(approx(p4.regulation_a, p16.regulation_a));
+    assert!(approx(p4.enter_absorb_a, p16.enter_absorb_a));
+    assert!(approx(p4.exit_absorb_a, p16.exit_absorb_a));
+    // Same S, different capacity → currents scale linearly.
+    let p100 = Profile::for_pack(Chemistry::LiFePo4, 4, 100.0);
+    assert!(approx(p100.regulation_a, 2.0 * p4.regulation_a));
+    assert!(approx(p100.enter_absorb_a, 2.0 * p4.enter_absorb_a));
+    assert!(approx(p100.exit_absorb_a, 2.0 * p4.exit_absorb_a));
 }
 
 #[test]
 #[should_panic]
 fn zero_cells_panics() {
-    let _ = Profile::for_pack(Chemistry::LiFePo4, 0, 10.0, 1.0, 0.1);
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 0, 50.0);
 }
 
 #[test]
 #[should_panic]
-fn enter_must_exceed_exit() {
-    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 0.5, 1.0);
-}
-
-#[test]
-#[should_panic]
-fn regulation_must_exceed_enter() {
-    // regulation_a == enter_absorb_a would mean we'd enter Absorb at the
-    // same current we're regulating to — unstable. Strict inequality.
-    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 1.0, 1.0, 0.5);
+fn zero_capacity_panics() {
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 0.0);
 }
 
 #[test]
 fn safety_limits_match_lfp_4s_known_values() {
-    // 4S LFP daily: absorb 14.4 V, float 13.5 V, CC 10 A.
+    // 4S LFP daily, 50 Ah: absorb 14.4 V, float 13.5 V, CC 10 A.
     // OVP = 14.4 + 0.6 = 15.0; OCP = 10 * 1.5 = 15.0.
     // LVP is input UVLO on the XY7025: 24 V nominal − 2 V margin = 22 V.
     let s = lfp_4s().safety_limits();
@@ -112,17 +152,18 @@ fn safety_limits_match_lfp_4s_known_values() {
 fn safety_limits_track_chemistry_change() {
     // Top-balance pushes absorb to 14.6 V — OVP must move up too, not stay
     // at the 4S-daily 15.0 V. Without derived limits this is the footgun.
-    let s = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 10.0, 2.0, 0.5).safety_limits();
+    let s = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 50.0).safety_limits();
     assert!(approx(s.ovp_v, 15.2));
     assert!(s.ovp_v > 14.6, "OVP must clear absorb_v");
 }
 
 #[test]
 fn safety_limits_track_cell_count_change() {
-    let s4 = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.1).safety_limits();
-    let s8 = Profile::for_pack(Chemistry::LiFePo4, 8, 10.0, 1.0, 0.1).safety_limits();
+    let s4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).safety_limits();
+    let s8 = Profile::for_pack(Chemistry::LiFePo4, 8, 50.0).safety_limits();
     assert!(s8.ovp_v > s4.ovp_v, "OVP scales with cell count");
-    // OCP is current-only and LVP is input-side — both independent of S.
+    // OCP is current-only (and capacity-derived) and LVP is input-side —
+    // both independent of S.
     assert!(approx(s4.ocp_a, s8.ocp_a));
     assert!(approx(s4.lvp_v, s8.lvp_v));
 }
@@ -132,12 +173,12 @@ fn safety_limits_ovp_clears_supervisor_threshold() {
     // The supervisor's OV detection trips at absorb_v + OV_MARGIN_V.
     // The hardware OVP must sit strictly above that — supervisor first,
     // hardware backstop second.
-    for (chem, cells, reg) in [
-        (Chemistry::LiFePo4, 4, 10.0),
-        (Chemistry::LiFePo4TopBalance, 4, 10.0),
-        (Chemistry::LiIon, 3, 5.0),
+    for (chem, cells) in [
+        (Chemistry::LiFePo4, 4),
+        (Chemistry::LiFePo4TopBalance, 4),
+        (Chemistry::LiIon, 3),
     ] {
-        let p = Profile::for_pack(chem, cells, reg, 1.0, 0.1);
+        let p = Profile::for_pack(chem, cells, 50.0);
         let s = p.safety_limits();
         let supervisor_trip = p.absorb_v + OV_MARGIN_V;
         assert!(
@@ -150,6 +191,8 @@ fn safety_limits_ovp_clears_supervisor_threshold() {
 }
 
 // --- Phase machine ---
+//
+// All currents below are tuned to the 50 Ah pack: enter > 3 A, exit < 2.5 A.
 
 #[test]
 fn starts_in_float_at_float_voltage() {
@@ -161,9 +204,9 @@ fn starts_in_float_at_float_voltage() {
 #[test]
 fn enters_absorb_when_charging_current_exceeds_threshold() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    // charging at 1.5 A → -1.5 A on the bus; threshold is 1.0 A.
+    // Charging at 4 A → -4 A on the bus; threshold is 3 A.
     assert!(matches!(
-        s.tick(true, b(OK_V, -1.5), TICK),
+        s.tick(true, b(OK_V, -4.0), TICK),
         Action::SetVoltage(v) if approx(v, 14.4)
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
@@ -171,19 +214,19 @@ fn enters_absorb_when_charging_current_exceeds_threshold() {
 
 #[test]
 fn does_not_enter_absorb_at_exact_threshold() {
-    // Strictly greater: 1.0 A must NOT trigger; 1.001 A must.
+    // Strictly greater: 3.0 A must NOT trigger; 3.001 A must.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    assert!(matches!(s.tick(true, b(OK_V, -1.0), TICK), Action::None));
+    assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Float));
     assert!(matches!(
-        s.tick(true, b(OK_V, -1.001), TICK),
+        s.tick(true, b(OK_V, -3.001), TICK),
         Action::SetVoltage(_)
     ));
 }
 
 #[test]
 fn discharge_current_does_not_enter_absorb() {
-    // 5 A discharge (positive). |I| > 1 A but it's NOT charging.
+    // 5 A discharge (positive). |I| > 3 A but it's NOT charging.
     let mut s = ChargeSupervisor::new(lfp_4s());
     assert!(matches!(s.tick(true, b(OK_V, 5.0), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Float));
@@ -192,22 +235,22 @@ fn discharge_current_does_not_enter_absorb() {
 #[test]
 fn stays_in_absorb_above_exit_threshold() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.tick(true, b(OK_V, -2.0), TICK); // → Absorb
-    // Exit threshold is 0.5 A — anything above keeps us in absorb.
-    assert!(matches!(s.tick(true, b(OK_V, -1.0), TICK), Action::None));
-    assert!(matches!(s.tick(true, b(OK_V, -0.6), TICK), Action::None));
-    // Strictly less-than, so 0.5 stays.
-    assert!(matches!(s.tick(true, b(OK_V, -0.5), TICK), Action::None));
+    s.tick(true, b(OK_V, -4.0), TICK); // → Absorb
+    // Exit threshold is 2.5 A — anything above keeps us in absorb.
+    assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
+    assert!(matches!(s.tick(true, b(OK_V, -2.7), TICK), Action::None));
+    // Strictly less-than, so 2.5 stays.
+    assert!(matches!(s.tick(true, b(OK_V, -2.5), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Absorb));
 }
 
 #[test]
 fn exits_absorb_when_taper_drops_below_threshold() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.tick(true, b(OK_V, -2.0), TICK); // → Absorb
-    // 0.4 A charging — below 0.5 A exit.
+    s.tick(true, b(OK_V, -4.0), TICK); // → Absorb
+    // 2.4 A charging — below 2.5 A exit.
     assert!(matches!(
-        s.tick(true, b(OK_V, -0.4), TICK),
+        s.tick(true, b(OK_V, -2.4), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
     ));
     assert!(matches!(s.phase(), Phase::Float));
@@ -216,9 +259,9 @@ fn exits_absorb_when_taper_drops_below_threshold() {
 #[test]
 fn exits_absorb_when_load_pulls_current() {
     // Battery starts discharging mid-absorb (charger off / heavy load).
-    // charging_a is negative → certainly < 0.5 A → drop to float.
+    // charging_a is negative → certainly < 2.5 A → drop to float.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    s.tick(true, b(OK_V, -2.0), TICK);
+    s.tick(true, b(OK_V, -4.0), TICK);
     assert!(matches!(
         s.tick(true, b(OK_V, 3.0), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
@@ -228,13 +271,14 @@ fn exits_absorb_when_load_pulls_current() {
 #[test]
 fn hysteresis_no_flap_between_thresholds() {
     let mut s = ChargeSupervisor::new(lfp_4s());
+    // 2.7 A sits in the hysteresis band: > exit (2.5) but < enter (3.0).
     for _ in 0..10 {
-        assert!(matches!(s.tick(true, b(OK_V, -0.5), TICK), Action::None));
+        assert!(matches!(s.tick(true, b(OK_V, -2.7), TICK), Action::None));
     }
     assert!(matches!(s.phase(), Phase::Float));
-    s.tick(true, b(OK_V, -2.0), TICK);
+    s.tick(true, b(OK_V, -4.0), TICK);
     for _ in 0..10 {
-        assert!(matches!(s.tick(true, b(OK_V, -0.5), TICK), Action::None));
+        assert!(matches!(s.tick(true, b(OK_V, -2.7), TICK), Action::None));
     }
     assert!(matches!(s.phase(), Phase::Absorb));
 }
@@ -252,12 +296,12 @@ fn transition_only_emits_setpoint_once() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // First crossing → write.
     assert!(matches!(
-        s.tick(true, b(OK_V, -2.0), TICK),
+        s.tick(true, b(OK_V, -4.0), TICK),
         Action::SetVoltage(_)
     ));
     // Already absorb → silent.
-    assert!(matches!(s.tick(true, b(OK_V, -2.0), TICK), Action::None));
-    assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
+    assert!(matches!(s.tick(true, b(OK_V, -4.0), TICK), Action::None));
+    assert!(matches!(s.tick(true, b(OK_V, -5.0), TICK), Action::None));
 }
 
 #[test]
@@ -280,12 +324,12 @@ fn nan_and_inf_current_are_ignored() {
 
 #[test]
 fn different_chemistries_yield_different_setpoints() {
-    let mut lfp = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.1));
-    let mut liion = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiIon, 3, 10.0, 1.0, 0.1));
-    let Action::SetVoltage(v_lfp) = lfp.tick(true, b(OK_V, -2.0), TICK) else {
+    let mut lfp = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiFePo4, 4, 50.0));
+    let mut liion = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiIon, 3, 50.0));
+    let Action::SetVoltage(v_lfp) = lfp.tick(true, b(OK_V, -4.0), TICK) else {
         panic!("expected SetVoltage")
     };
-    let Action::SetVoltage(v_liion) = liion.tick(true, b(12.0, -2.0), TICK) else {
+    let Action::SetVoltage(v_liion) = liion.tick(true, b(12.0, -4.0), TICK) else {
         panic!("expected SetVoltage")
     };
     assert!(approx(v_lfp, 14.4));
@@ -294,11 +338,12 @@ fn different_chemistries_yield_different_setpoints() {
 
 #[test]
 fn single_cell_lfp_works() {
-    // 1S LFP charger — float 3.375 V, absorb 3.60 V (daily).
-    let mut s = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiFePo4, 1, 10.0, 1.0, 0.1));
+    // 1S 50 Ah LFP — float 3.375 V, absorb 3.60 V (daily). Same currents
+    // as the 4S pack since they derive from capacity, not cell count.
+    let mut s = ChargeSupervisor::new(Profile::for_pack(Chemistry::LiFePo4, 1, 50.0));
     assert!(approx(s.target_voltage(), 3.375));
     assert!(matches!(
-        s.tick(true, b(3.4, -1.5), TICK),
+        s.tick(true, b(3.4, -4.0), TICK),
         Action::SetVoltage(v) if approx(v, 3.60)
     ));
 }
@@ -306,19 +351,22 @@ fn single_cell_lfp_works() {
 #[test]
 fn full_charge_cycle() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    // Exit threshold is 0.5 A — design taper around that.
+    // Bulk → absorb on heavy current.
     assert!(matches!(
         s.tick(true, b(OK_V, -8.0), TICK),
         Action::SetVoltage(v) if approx(v, 14.4)
     ));
-    for &i in &[-7.0, -5.0, -3.0, -1.0, -0.6] {
+    // Hold absorb across a realistic taper — all values stay above 2.5 A.
+    for &i in &[-7.0, -5.0, -3.5, -3.0, -2.7] {
         assert!(matches!(s.tick(true, b(OK_V, i), TICK), Action::None));
     }
+    // Crosses below 2.5 A → drop to float.
     assert!(matches!(
-        s.tick(true, b(OK_V, -0.4), TICK),
+        s.tick(true, b(OK_V, -2.4), TICK),
         Action::SetVoltage(v) if approx(v, 13.5)
     ));
-    for &i in &[-0.05, -0.02, 0.0, -0.4] {
+    // Sit at float without retriggering absorb (all below 3 A enter).
+    for &i in &[-0.05, -0.02, 0.0, -2.0] {
         assert!(matches!(s.tick(true, b(OK_V, i), TICK), Action::None));
     }
 }
@@ -377,7 +425,7 @@ fn absorb_timeout_in_a_single_large_elapsed_tick() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     enter_absorb(&mut s);
     assert!(matches_disable(
-        &s.tick(true, b(OK_V, -1.0), MAX_ABSORB),
+        &s.tick(true, b(OK_V, -3.0), MAX_ABSORB),
         FaultReason::AbsorbTimeout,
     ));
 }
@@ -404,7 +452,7 @@ fn modbus_unhealthy_honors_elapsed() {
 /// has elapsed (the transition itself).
 fn enter_absorb(s: &mut ChargeSupervisor) {
     assert!(matches!(
-        s.tick(true, b(OK_V, -2.0), TICK),
+        s.tick(true, b(OK_V, -4.0), TICK),
         Action::SetVoltage(_)
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
@@ -415,9 +463,9 @@ fn absorb_does_not_time_out_below_budget() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     enter_absorb(&mut s);
     // Hold absorb just shy of the cap. Current pinned above exit threshold
-    // (0.5 A) so we never drop to Float on our own.
+    // (2.5 A) so we never drop to Float on our own.
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
-        assert!(matches!(s.tick(true, b(OK_V, -1.0), TICK), Action::None));
+        assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
     }
     assert!(s.fault().is_none());
 }
@@ -438,7 +486,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     enter_absorb(&mut s);
     // Spend most of the budget in absorb…
     for _ in 0..(MAX_ABSORB.as_secs() - 10) {
-        s.tick(true, b(OK_V, -1.0), TICK);
+        s.tick(true, b(OK_V, -3.0), TICK);
     }
     // …then taper to Float. Counter must reset.
     assert!(matches!(
@@ -451,7 +499,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     // No fault yet — counter started over.
     enter_absorb(&mut s);
     for _ in 0..20 {
-        assert!(matches!(s.tick(true, b(OK_V, -1.0), TICK), Action::None));
+        assert!(matches!(s.tick(true, b(OK_V, -3.0), TICK), Action::None));
     }
     assert!(s.fault().is_none());
 }
@@ -461,7 +509,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
 #[test]
 fn supervisor_passes_setpoint_through_on_phase_transition() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let a = s.tick(true, b(13.5, -2.0), TICK);
+    let a = s.tick(true, b(13.5, -4.0), TICK);
     match a {
         Action::SetVoltage(v) => assert!(approx(v, 14.4)),
         _ => panic!("expected SetVoltage"),
@@ -592,7 +640,7 @@ fn latch_keeps_emitting_disable_until_acked() {
     s.ack_disable();
     // Now the supervisor goes quiet — no further commands to the buck.
     for _ in 0..10 {
-        assert!(matches!(s.tick(true, b(13.5, -2.0), TICK), Action::None));
+        assert!(matches!(s.tick(true, b(13.5, -4.0), TICK), Action::None));
     }
 }
 
@@ -629,14 +677,14 @@ fn first_fault_wins_over_simultaneous_conditions() {
 fn supervisor_latches_on_absorb_timeout() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     // Drive into Absorb.
-    let _ = s.tick(true, b(13.5, -2.0), TICK);
+    let _ = s.tick(true, b(13.5, -4.0), TICK);
     // Hold Absorb until just before the cap. Current pinned above exit
     // threshold so the controller can't taper out on its own.
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
-        s.tick(true, b(13.5, -1.0), TICK);
+        s.tick(true, b(13.5, -3.0), TICK);
     }
     assert!(s.fault().is_none());
 
-    let a = s.tick(true, b(13.5, -1.0), TICK);
+    let a = s.tick(true, b(13.5, -3.0), TICK);
     assert!(matches_disable(&a, FaultReason::AbsorbTimeout));
 }

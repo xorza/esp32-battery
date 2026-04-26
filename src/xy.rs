@@ -30,9 +30,10 @@ use crate::clock::EventRecorder;
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
-/// absorb / 13.5 V float. CC at 10 A; enter absorb at 1 A (C/50), drop
-/// back to float at 0.5 A (C/100). enter > exit so we don't flap.
-const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 10.0, 1.0, 0.5);
+/// absorb / 13.5 V float. Currents derive from capacity via the `*_C`
+/// constants in `charging`: 0.2C = 10 A CC, 0.06C = 3 A enter, 0.05C = 2.5 A
+/// exit (manufacturer-standard tail).
+const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
 /// Hard trip thresholds programmed into the XY's protection registers.
 /// Derived from the profile so a chemistry/cell-count change moves them
 /// in lockstep — no chance the OVP ceiling drifts below the absorb target.
