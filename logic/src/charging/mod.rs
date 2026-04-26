@@ -1,17 +1,21 @@
-//! Two-phase CV charging strategy with hysteresis.
+//! Two-phase CV charging strategy with hysteresis + supervisor latch.
 //!
 //! Sits in Float (low CV) by default. When the battery draws more than
 //! `enter_absorb_a` of charging current, switches to Absorb (high CV) to
 //! finish the pack. Once current tapers below `exit_absorb_a`, drops back to
 //! Float. Profiles are per-chemistry constants.
 //!
+//! Wraps the phase logic with a latch that disables the buck on
+//! overvoltage, stuck-absorb, missing-battery, or unhealthy-Modbus
+//! conditions. Once latched, only a reboot clears it.
+//!
 //! Sign convention: battery current is **negative when charging** (matches
-//! the INA228 wiring on this board). The controller takes signed amps and
+//! the INA228 wiring on this board). The supervisor takes signed amps and
 //! negates internally, so profile thresholds stay positive and read
 //! naturally.
 //!
-//! Pure logic: no I/O. The firmware calls `update()` each poll and writes
-//! the returned setpoint to the buck converter on transitions.
+//! Pure logic: no I/O. The firmware calls `tick()` each poll and writes
+//! the returned action to the buck converter.
 
 use std::time::Duration;
 
@@ -106,17 +110,6 @@ pub enum Phase {
     Absorb,
 }
 
-/// Outcome of one controller `update`. Setpoint changes only on phase
-/// transitions; faults are emitted once the relevant counter reaches
-/// budget. Only the controller-emittable variants of `FaultReason`
-/// (`Overvoltage`, `AbsorbTimeout`) ever appear here — the supervisor's
-/// transport/sensor variants are produced one layer up.
-pub enum Decision {
-    NoChange,
-    Setpoint(f32),
-    Fault(FaultReason),
-}
-
 /// How far above `absorb_v` the pack must sit before the firmware's
 /// debounced OV trip starts counting. Pub so callers (and the hardware-OVP
 /// derivation below) reference one number, not a literal.
@@ -140,88 +133,14 @@ const OV_DURATION: Duration = Duration::from_secs(3);
 /// charge taper, short enough that a stuck-current scenario can't keep the
 /// pack at CV indefinitely.
 const MAX_ABSORB: Duration = Duration::from_secs(4 * 60 * 60);
-
-pub struct ChargeController {
-    profile: Profile,
-    phase: Phase,
-    ov_elapsed: Duration,
-    absorb_elapsed: Duration,
-}
-
-impl ChargeController {
-    pub fn new(profile: Profile) -> Self {
-        assert!(profile.absorb_v > profile.float_v);
-        // Always boot in Float — never resume Absorb across a reset, even if
-        // we crashed mid-absorb. Conservative by design: re-derive phase from
-        // observed current. Don't add NVS-backed phase persistence.
-        Self {
-            profile,
-            phase: Phase::Float,
-            ov_elapsed: Duration::ZERO,
-            absorb_elapsed: Duration::ZERO,
-        }
-    }
-
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-
-    pub fn target_voltage(&self) -> f32 {
-        match self.phase {
-            Phase::Float => self.profile.float_v,
-            Phase::Absorb => self.profile.absorb_v,
-        }
-    }
-
-    /// Feed the latest pack voltage, signed battery current, and the time
-    /// elapsed since the previous call. Returns a `Decision`: a setpoint on
-    /// phase transitions, a fault when overvoltage or absorb-time-cap has
-    /// triggered, otherwise `NoChange`. Non-finite inputs are charitable —
-    /// voltage NaN doesn't count toward OV, current NaN holds the current
-    /// phase.
-    pub fn update(&mut self, v_batt: f32, i_batt_a: f32, elapsed: Duration) -> Decision {
-        if v_batt.is_finite() && v_batt > self.profile.absorb_v + OV_MARGIN_V {
-            self.ov_elapsed = self.ov_elapsed.saturating_add(elapsed);
-            if self.ov_elapsed >= OV_DURATION {
-                return Decision::Fault(FaultReason::Overvoltage);
-            }
-        } else {
-            self.ov_elapsed = Duration::ZERO;
-        }
-
-        if !i_batt_a.is_finite() {
-            return Decision::NoChange;
-        }
-        // Charging current as a positive number.
-        let charging_a = -i_batt_a;
-        let next = match self.phase {
-            Phase::Float if charging_a > self.profile.enter_absorb_a => Phase::Absorb,
-            Phase::Absorb if charging_a < self.profile.exit_absorb_a => Phase::Float,
-            p => p,
-        };
-        if next != self.phase {
-            self.phase = next;
-            self.absorb_elapsed = Duration::ZERO;
-            return Decision::Setpoint(self.target_voltage());
-        }
-
-        if self.phase == Phase::Absorb {
-            self.absorb_elapsed = self.absorb_elapsed.saturating_add(elapsed);
-            if self.absorb_elapsed >= MAX_ABSORB {
-                return Decision::Fault(FaultReason::AbsorbTimeout);
-            }
-        }
-        Decision::NoChange
-    }
-}
+/// How long battery readings can stay absent before we fail closed.
+const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long Modbus reads to the XY can keep failing before we fail closed.
+const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why the supervisor latched the buck off. Once latched, only a reboot
 /// clears it — auto-recovery on a battery charger means trying again
 /// under the same conditions.
-///
-/// Variant origin is a runtime invariant, not a type-system split:
-/// `BatterySensorStale` and `ModbusUnhealthy` are emitted only by the
-/// supervisor; `Overvoltage` and `AbsorbTimeout` only by the controller.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum FaultReason {
     /// No fresh battery reading for `BATTERY_MISSING_TIMEOUT.as_secs()` consecutive ticks.
@@ -250,17 +169,12 @@ pub enum Action {
 }
 
 /// Latest fresh battery reading fed to the supervisor. Voltage is used for
-/// OV detection, current drives the charge controller. Power isn't needed.
+/// OV detection, current drives the phase machine. Power isn't needed.
 #[derive(Copy, Clone)]
 pub struct BatterySample {
     pub voltage: f32,
     pub current: f32,
 }
-
-/// How long battery readings can stay absent before we fail closed.
-const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long Modbus reads to the XY can keep failing before we fail closed.
-const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Latch state. `Tripped { acked: false }` is the only state that emits
 /// `DisableOutput`; the unreachable `(None, true)` of the old two-field
@@ -271,7 +185,10 @@ enum LatchState {
 }
 
 pub struct ChargeSupervisor {
-    controller: ChargeController,
+    profile: Profile,
+    phase: Phase,
+    ov_elapsed: Duration,
+    absorb_elapsed: Duration,
     battery_missing_elapsed: Duration,
     modbus_err_elapsed: Duration,
     latch: LatchState,
@@ -279,20 +196,30 @@ pub struct ChargeSupervisor {
 
 impl ChargeSupervisor {
     pub fn new(profile: Profile) -> Self {
+        assert!(profile.absorb_v > profile.float_v);
+        // Always boot in Float — never resume Absorb across a reset, even if
+        // we crashed mid-absorb. Conservative by design: re-derive phase from
+        // observed current. Don't add NVS-backed phase persistence.
         Self {
-            controller: ChargeController::new(profile),
+            profile,
+            phase: Phase::Float,
+            ov_elapsed: Duration::ZERO,
+            absorb_elapsed: Duration::ZERO,
             battery_missing_elapsed: Duration::ZERO,
             modbus_err_elapsed: Duration::ZERO,
             latch: LatchState::Active,
         }
     }
 
-    pub fn target_voltage(&self) -> f32 {
-        self.controller.target_voltage()
+    pub fn phase(&self) -> Phase {
+        self.phase
     }
 
-    pub fn phase(&self) -> Phase {
-        self.controller.phase()
+    pub fn target_voltage(&self) -> f32 {
+        match self.phase {
+            Phase::Float => self.profile.float_v,
+            Phase::Absorb => self.profile.absorb_v,
+        }
     }
 
     pub fn fault(&self) -> Option<FaultReason> {
@@ -314,9 +241,11 @@ impl ChargeSupervisor {
 
     /// Drive one poll cycle. `modbus_ok` reflects the most recent read attempt
     /// against the XY7025. `battery` is the latest fresh reading (`None` if
-    /// stale or absent). `elapsed` is wall time since the previous tick — the
-    /// controller uses it for the absorb time cap. Returns the action the
-    /// caller should take.
+    /// stale or absent). `elapsed` is wall time since the previous tick.
+    /// Returns the action the caller should take.
+    ///
+    /// Non-finite battery inputs are charitable: voltage NaN doesn't count
+    /// toward OV; current NaN holds the current phase.
     pub fn tick(
         &mut self,
         modbus_ok: bool,
@@ -350,11 +279,38 @@ impl ChargeSupervisor {
         };
         self.battery_missing_elapsed = Duration::ZERO;
 
-        match self.controller.update(b.voltage, b.current, elapsed) {
-            Decision::NoChange => Action::None,
-            Decision::Setpoint(v) => Action::SetVoltage(v),
-            Decision::Fault(reason) => self.latch(reason),
+        if b.voltage.is_finite() && b.voltage > self.profile.absorb_v + OV_MARGIN_V {
+            self.ov_elapsed = self.ov_elapsed.saturating_add(elapsed);
+            if self.ov_elapsed >= OV_DURATION {
+                return self.latch(FaultReason::Overvoltage);
+            }
+        } else {
+            self.ov_elapsed = Duration::ZERO;
         }
+
+        if !b.current.is_finite() {
+            return Action::None;
+        }
+        // Charging current as a positive number.
+        let charging_a = -b.current;
+        let next = match self.phase {
+            Phase::Float if charging_a > self.profile.enter_absorb_a => Phase::Absorb,
+            Phase::Absorb if charging_a < self.profile.exit_absorb_a => Phase::Float,
+            p => p,
+        };
+        if next != self.phase {
+            self.phase = next;
+            self.absorb_elapsed = Duration::ZERO;
+            return Action::SetVoltage(self.target_voltage());
+        }
+
+        if self.phase == Phase::Absorb {
+            self.absorb_elapsed = self.absorb_elapsed.saturating_add(elapsed);
+            if self.absorb_elapsed >= MAX_ABSORB {
+                return self.latch(FaultReason::AbsorbTimeout);
+            }
+        }
+        Action::None
     }
 
     fn latch(&mut self, reason: FaultReason) -> Action {
