@@ -19,7 +19,7 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const HOSTNAME: &str = "battery-esp32";
+pub const HOSTNAME: &str = "battery-esp32";
 const HTTP_PORT: u16 = 80;
 pub const AP_SSID: &str = "Battery-Setup";
 pub const AP_PASS: &str = "01010101";

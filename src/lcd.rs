@@ -217,7 +217,14 @@ fn draw_host(
             let _ = write!(buf, "--");
         }
     }
-    Text::new(buf, Point::new(20, 56), value).draw(gb).unwrap();
+    Text::new(buf, Point::new(20, 44), value).draw(gb).unwrap();
+
+    Text::new("URL", Point::new(20, 60), label)
+        .draw(gb)
+        .unwrap();
+    buf.clear();
+    let _ = write!(buf, "https://{}.local", crate::wifi::HOSTNAME);
+    Text::new(buf, Point::new(20, 80), value).draw(gb).unwrap();
 
     if has_errors {
         draw_warning_triangle(gb);
