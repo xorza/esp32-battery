@@ -1,9 +1,9 @@
 //! INA228 battery sensor — I²C @ 400 kHz on the board's I2C0 bus.
 //!
 //! The device is abstracted behind `InaDevice` so the thread loop runs
-//! unchanged under the `ina-fake` feature (which substitutes a canned
-//! in-memory device for the I²C INA228 — useful when developing without
-//! the sensor wired up).
+//! unchanged under the `ina-fake` feature. The fake still constructs
+//! the I²C bus driver (so pin/mux/clock conflicts surface on the bench)
+//! but never reads the chip — `read()` returns zeros.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -69,11 +69,11 @@ mod real {
 
     type I2cDev = I2cDriver<'static, &'static I2cBusDriver<'static>>;
 
-    pub struct RealIna {
+    pub struct Ina {
         ina: ina228::Ina228<I2cDev>,
     }
 
-    impl RealIna {
+    impl Ina {
         /// Claims the I²C peripheral and pins, probes + calibrates the
         /// INA228. Panics on any init failure — the INA is soldered on,
         /// so a failure here is a hardware fault, not a runtime condition.
@@ -95,7 +95,7 @@ mod real {
         }
     }
 
-    impl InaDevice for RealIna {
+    impl InaDevice for Ina {
         fn read(&mut self) -> Result<Ina228Reading, InaError> {
             let voltage = self
                 .ina
@@ -124,7 +124,7 @@ mod fake {
     use super::InaDevice;
     use crate::board::I2cPins;
 
-    pub struct FakeIna {
+    pub struct Ina {
         // Real I²C bus driver, constructed but never read. Held so the
         // peripheral and its GPIOs are genuinely configured and claimed
         // for the program lifetime — pin/mux/clock conflicts surface on
@@ -132,7 +132,7 @@ mod fake {
         _bus: I2cBusDriver<'static>,
     }
 
-    impl FakeIna {
+    impl Ina {
         pub fn new(pins: I2cPins) -> Self {
             let bus = I2cBusDriver::new(pins.i2c, pins.sda, pins.scl, &BusConfig::new())
                 .expect("I2C bus init");
@@ -140,7 +140,7 @@ mod fake {
         }
     }
 
-    impl InaDevice for FakeIna {
+    impl InaDevice for Ina {
         fn read(&mut self) -> Result<Ina228Reading, InaError> {
             Ok(Ina228Reading {
                 voltage: 0.0,
@@ -185,14 +185,14 @@ fn run<D: InaDevice>(mut device: D, sensor_data: Arc<Mutex<SensorData>>, recorde
 // --- Public entry point -----------------------------------------------------
 
 #[cfg(not(feature = "ina-fake"))]
-fn make_device(pins: I2cPins) -> real::RealIna {
-    real::RealIna::new(pins)
+fn make_device(pins: I2cPins) -> real::Ina {
+    real::Ina::new(pins)
 }
 
 #[cfg(feature = "ina-fake")]
-fn make_device(pins: I2cPins) -> fake::FakeIna {
+fn make_device(pins: I2cPins) -> fake::Ina {
     log::info!("INA: fake mode — claiming I²C but not driving it");
-    fake::FakeIna::new(pins)
+    fake::Ina::new(pins)
 }
 
 pub fn start(pins: I2cPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {

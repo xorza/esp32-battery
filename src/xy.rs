@@ -8,8 +8,10 @@
 //! needed — both sides are 3.3 V TTL.
 //!
 //! The device is abstracted behind `XyDevice` so the thread loop +
-//! charge-supervisor integration runs unchanged under the `xy-fake` feature
-//! (which substitutes a canned in-memory device for the UART).
+//! charge-supervisor integration runs unchanged under the `xy-fake`
+//! feature. The fake still constructs the UART driver (so pin/mux/baud
+//! conflicts surface on the bench) but never transacts — setpoints are
+//! tracked in-memory.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -242,7 +244,7 @@ mod fake {
     /// In-memory stand-in for the buck. Tracks the last voltage/output
     /// state set by the supervisor so reads reflect what the supervisor
     /// last commanded — exercises the same control flow as the real path.
-    pub struct FakeXy<'d> {
+    pub struct Xy<'d> {
         v_set: Cell<f32>,
         output_on: Cell<bool>,
         // Real UART driver, constructed but never written to. Held so the
@@ -252,7 +254,7 @@ mod fake {
         _uart: UartDriver<'d>,
     }
 
-    impl<'d> FakeXy<'d> {
+    impl<'d> Xy<'d> {
         pub fn new(pins: XyPins) -> Self {
             let config = Config::new().baudrate(Hertz(BAUD));
             let uart = UartDriver::new(
@@ -272,7 +274,7 @@ mod fake {
         }
     }
 
-    impl XyDevice for FakeXy<'_> {
+    impl XyDevice for Xy<'_> {
         fn read_status(&self) -> Result<XyStatus, XyIoError> {
             let v = if self.output_on.get() {
                 self.v_set.get()
@@ -420,17 +422,21 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
 
 // --- Public entry point -----------------------------------------------------
 
+#[cfg(not(feature = "xy-fake"))]
+fn make_device(pins: XyPins) -> real::Xy<'static> {
+    real::Xy::new(pins)
+}
+
+#[cfg(feature = "xy-fake")]
+fn make_device(pins: XyPins) -> fake::Xy<'static> {
+    log::info!("XY: fake mode — claiming UART but not driving it");
+    fake::Xy::new(pins)
+}
+
 pub fn start(pins: XyPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
-    #[cfg(not(feature = "xy-fake"))]
-    let device = real::Xy::new(pins);
-    #[cfg(feature = "xy-fake")]
-    let device = {
-        log::info!("XY: fake mode — claiming UART but not driving it");
-        fake::FakeXy::new(pins)
-    };
     thread::Builder::new()
         .name("xy".into())
         .stack_size(4096)
-        .spawn(move || run(device, sensor_data, recorder))
+        .spawn(move || run(make_device(pins), sensor_data, recorder))
         .unwrap();
 }
