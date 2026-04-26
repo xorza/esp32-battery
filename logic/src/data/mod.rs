@@ -1,21 +1,120 @@
 //! Sensor data store: live readings + history pipeline.
 //!
-//! `SensorData` is a thin orchestrator over three concerns kept in
-//! sibling modules: per-producer staleness (`live`), the adaptive-
-//! resolution history ring (`history`), and the on-flash codec
-//! (`codec`). Persistence (NVS I/O, save scheduling) lives in the
-//! firmware crate's `Persister` — `data` is pure model.
+//! `SensorData` is a thin orchestrator over two concerns: per-producer
+//! staleness tracking (`LiveReadings`) and the adaptive-resolution history
+//! ring + on-flash codec (`history`). Persistence (NVS I/O, save scheduling)
+//! lives in the firmware crate's `Persister` — `data` is pure model.
 
-mod codec;
 mod history;
-mod live;
-mod sample;
 
 pub use history::{HISTORY_CAPACITY, SERIALIZED_MAX_BYTES};
-pub use sample::{Ina228Reading, PsReading, Sample};
 
 use history::History;
-use live::LiveReadings;
+
+// --- Sample shapes ----------------------------------------------------------
+
+#[derive(Clone, Copy, Default)]
+pub struct Ina228Reading {
+    pub voltage: f32,
+    pub current: f32,
+    pub power: f32,
+}
+
+/// Power-supply reading sourced from the XY7025 Modbus client (no charge register).
+#[derive(Clone, Copy, Default)]
+pub struct PsReading {
+    pub voltage: f32,
+    pub current: f32,
+    pub power: f32,
+}
+
+/// A single timestamped data point for charting (both sensors).
+#[derive(Clone, Copy, Default)]
+pub struct Sample {
+    pub time_s: u32,
+    pub voltage: f32,
+    pub battery_current: f32,
+    pub ps_current: f32,
+    /// 1.0 when power supply is online, 0.0 when offline. Averaged during compaction.
+    pub power_online: f32,
+}
+
+// --- Live readings ----------------------------------------------------------
+
+/// Ticks a sensor's reading can go unrefreshed before `tick` treats it as
+/// absent. At 1 Hz ticks this is ~5 s — enough to ride out a single missed
+/// poll, short enough that a stuck producer flips the dashboard / history
+/// to its zero fallback before the user notices.
+const STALE_TICKS: u32 = 5;
+
+/// Minimum XY output voltage (V) to consider the PS "online". Uses voltage,
+/// not current, so an enabled PSU with no load (fully-charged battery) still
+/// registers as online. ~2 V covers noise/leakage while staying well below
+/// any real rail.
+const POWER_ONLINE_VOLTAGE_THRESHOLD: f32 = 2.0;
+
+struct LiveReadings {
+    latest_battery: Option<Ina228Reading>,
+    latest_ps: Option<PsReading>,
+    /// Ticks since the last `update_*`. Initialised to `u32::MAX` so a
+    /// fresh `LiveReadings` treats both sensors as absent until the first
+    /// live reading lands.
+    battery_ticks_stale: u32,
+    ps_ticks_stale: u32,
+}
+
+impl LiveReadings {
+    fn new() -> Self {
+        Self {
+            latest_battery: None,
+            latest_ps: None,
+            battery_ticks_stale: u32::MAX,
+            ps_ticks_stale: u32::MAX,
+        }
+    }
+
+    fn update_battery(&mut self, bat: Ina228Reading) {
+        self.latest_battery = Some(bat);
+        self.battery_ticks_stale = 0;
+    }
+
+    fn update_ps(&mut self, ps: PsReading) {
+        self.latest_ps = Some(ps);
+        self.ps_ticks_stale = 0;
+    }
+
+    /// Age both staleness counters by one tick. Called once per supervisor
+    /// tick before any reads.
+    fn age(&mut self) {
+        self.battery_ticks_stale = self.battery_ticks_stale.saturating_add(1);
+        self.ps_ticks_stale = self.ps_ticks_stale.saturating_add(1);
+    }
+
+    fn battery(&self) -> Option<Ina228Reading> {
+        if self.battery_ticks_stale > STALE_TICKS {
+            return None;
+        }
+        self.latest_battery
+    }
+
+    fn ps(&self) -> Option<PsReading> {
+        if self.ps_ticks_stale > STALE_TICKS {
+            return None;
+        }
+        self.latest_ps
+    }
+
+    /// `1.0` when a fresh PS reading shows measurable voltage, `0.0` otherwise
+    /// (including before the first reading and after PS goes stale).
+    fn power_online(&self) -> f32 {
+        match self.ps() {
+            Some(ps) if ps.voltage > POWER_ONLINE_VOLTAGE_THRESHOLD => 1.0,
+            _ => 0.0,
+        }
+    }
+}
+
+// --- SensorData orchestrator ------------------------------------------------
 
 /// Central data store with adaptive-resolution history. Producer threads
 /// publish via `update_*`; the supervisor's 1 Hz `tick` drives commits.
@@ -78,7 +177,7 @@ impl SensorData {
     /// Restore history from a previously-saved blob. Call at startup
     /// before the first `tick`. Returns `false` if the blob is malformed.
     pub fn load_from_bytes(&mut self, bytes: &[u8]) -> bool {
-        if codec::deserialize(bytes, &mut self.history) {
+        if history::deserialize(bytes, &mut self.history) {
             log::info!("Loaded {} samples from blob", self.history.samples().len());
             true
         } else {
@@ -89,7 +188,7 @@ impl SensorData {
 
     /// Serialize history + metadata into a fresh `Vec` for NVS storage.
     pub fn serialize(&self) -> Vec<u8> {
-        codec::serialize(&self.history)
+        history::serialize(&self.history)
     }
 
     /// Drive the history pipeline forward by one tick. `now_epoch` is the
@@ -166,7 +265,12 @@ mod tests {
     /// Push n uniform samples (v=13, c1=1, c2=2). Returns the next time_s value.
     fn fill(sd: &mut SensorData, n: u32, start_t: u32) -> u32 {
         for i in 0..n {
-            update(sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), start_t + i);
+            update(
+                sd,
+                bat_reading(13.0, 1.0),
+                ps_reading(13.0, 2.0),
+                start_t + i,
+            );
         }
         start_t + n
     }
@@ -233,7 +337,12 @@ mod tests {
     fn history_returns_all_entries() {
         let mut sd = SensorData::new();
         for i in 0..10u32 {
-            update(&mut sd, bat_reading(13.0, i as f32), ps_reading(13.0, 0.0), i);
+            update(
+                &mut sd,
+                bat_reading(13.0, i as f32),
+                ps_reading(13.0, 0.0),
+                i,
+            );
         }
         let h = sd.history();
         assert_eq!(h.len(), 10);
@@ -343,11 +452,21 @@ mod tests {
     fn loads_from_platform_on_first_update() {
         let mut sd = SensorData::new();
         for i in 0..10u32 {
-            update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 1000 + i);
+            update(
+                &mut sd,
+                bat_reading(13.0, 1.0),
+                ps_reading(13.0, 2.0),
+                1000 + i,
+            );
         }
 
         let mut sd2 = sd_with_blob(&sd);
-        update(&mut sd2, bat_reading(14.0, 3.0), ps_reading(14.0, 4.0), 1010);
+        update(
+            &mut sd2,
+            bat_reading(14.0, 3.0),
+            ps_reading(14.0, 4.0),
+            1010,
+        );
 
         assert_eq!(sd2.history().len(), 11);
         assert_eq!(sd2.interval(), 1);
@@ -364,7 +483,12 @@ mod tests {
         fill(&mut sd, 100, 1000);
 
         let mut sd2 = sd_with_blob(&sd);
-        update(&mut sd2, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 5000);
+        update(
+            &mut sd2,
+            bat_reading(13.0, 1.0),
+            ps_reading(13.0, 2.0),
+            5000,
+        );
 
         assert_eq!(sd2.history().len(), 101);
         assert_eq!(sd2.history()[0].time_s, 1000);
