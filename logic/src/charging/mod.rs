@@ -140,6 +140,18 @@ pub enum FaultReason {
     SettingsDrift,
 }
 
+impl FaultReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BatterySensorStale => "battery sensor stale",
+            Self::ModbusUnhealthy => "modbus link unhealthy",
+            Self::Overvoltage => "pack overvoltage",
+            Self::AbsorbTimeout => "absorb time cap reached",
+            Self::SettingsDrift => "setpoint readback drift",
+        }
+    }
+}
+
 /// What the poll loop should do this tick. The supervisor never enables the
 /// output — `boot_sequence` does that once at startup. After a latch, only
 /// `DisableOutput` is ever emitted until the disable is ACKed.
