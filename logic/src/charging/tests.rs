@@ -25,19 +25,21 @@ fn matches_disable(a: &Action, expected: FaultReason) -> bool {
     matches!(a, Action::DisableOutput(r) if *r == expected)
 }
 
-/// Tick with a successful, drift-free Modbus readback — the common case.
-/// Builds Setpoints from the supervisor's current expectation so phase
-/// transitions don't fire spurious `SettingsDrift`.
+/// Tick with a successful, drift-free Modbus readback where the buck
+/// reports the output state the supervisor currently expects — the
+/// common case. Phase transitions don't fire spurious `SettingsDrift`,
+/// and Active ticks don't fire spurious `OutputUnexpectedlyOff`.
 fn ok_tick(s: &mut ChargeSupervisor, battery: Option<BatterySample>, elapsed: Duration) -> Action {
     let p = PollResult {
         setpoints: Some(s.expected_setpoints()),
+        output_on: Some(s.expected_output_on()),
         battery,
     };
     s.tick(p, elapsed)
 }
 
-/// Tick where the Modbus read failed — `setpoints = None` exercises the
-/// modbus-unhealthy debounce path.
+/// Tick where the Modbus read failed — both `setpoints` and
+/// `output_on` are None, exercising the modbus-unhealthy debounce path.
 fn fail_tick(
     s: &mut ChargeSupervisor,
     battery: Option<BatterySample>,
@@ -46,6 +48,7 @@ fn fail_tick(
     s.tick(
         PollResult {
             setpoints: None,
+            output_on: None,
             battery,
         },
         elapsed,
@@ -861,6 +864,7 @@ fn setpoint_drift_v_set_latches_immediately() {
     let a = s.tick(
         PollResult {
             setpoints: bad,
+            output_on: Some(true),
             battery: b(13.5, -0.1),
         },
         TICK,
@@ -879,6 +883,7 @@ fn setpoint_drift_i_set_latches_immediately() {
     let a = s.tick(
         PollResult {
             setpoints: bad,
+            output_on: Some(true),
             battery: b(13.5, -0.1),
         },
         TICK,
@@ -897,6 +902,7 @@ fn setpoint_within_tolerance_no_drift_fault() {
     let a = s.tick(
         PollResult {
             setpoints: close,
+            output_on: Some(true),
             battery: b(13.5, -0.1),
         },
         TICK,
@@ -921,6 +927,7 @@ fn setpoint_drift_does_not_overwrite_existing_latch() {
     let a = s.tick(
         PollResult {
             setpoints: bad,
+            output_on: Some(true),
             battery: b(13.5, -0.1),
         },
         TICK,
@@ -969,6 +976,7 @@ fn pending_drift_latches_without_enabling() {
     let a = s.tick(
         PollResult {
             setpoints: bad,
+            output_on: Some(false),
             battery: b(OK_V, -0.1),
         },
         TICK,
@@ -994,6 +1002,35 @@ fn pending_no_battery_waits_then_latches() {
 fn ack_enable_from_active_panics() {
     let mut s = active(lfp_4s());
     s.ack_enable();
+}
+
+#[test]
+fn buck_self_disable_in_active_latches() {
+    // Active supervisor + buck reports output OFF (own OVP/OCP/LVP/over-temp
+    // tripped, or panel toggled) → latch OutputUnexpectedlyOff.
+    let mut s = active(lfp_4s());
+    let p = PollResult {
+        setpoints: Some(s.expected_setpoints()),
+        output_on: Some(false),
+        battery: b(OK_V, -0.1),
+    };
+    let a = s.tick(p, TICK);
+    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff));
+}
+
+#[test]
+fn buck_output_off_in_pending_does_not_fault() {
+    // In Pending the buck IS supposed to be off — output_on=Some(false)
+    // is normal, must not latch.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p = PollResult {
+        setpoints: Some(s.expected_setpoints()),
+        output_on: Some(false),
+        battery: b(OK_V, -0.1),
+    };
+    let a = s.tick(p, TICK);
+    assert!(matches!(a, Action::EnableOutput));
+    assert!(s.fault().is_none());
 }
 
 #[test]

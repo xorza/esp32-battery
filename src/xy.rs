@@ -60,6 +60,7 @@ struct XyStatus {
 trait XyDevice {
     fn read_status(&self) -> Result<XyStatus, RtuError>;
     fn read_protection(&self) -> Result<SafetyLimits, RtuError>;
+    fn read_output_on(&self) -> Result<bool, RtuError>;
     fn set_voltage(&self, volts: f32) -> Result<(), RtuError>;
     fn set_current_limit(&self, amps: f32) -> Result<(), RtuError>;
     fn set_protection(&self, limits: SafetyLimits) -> Result<(), RtuError>;
@@ -193,6 +194,11 @@ mod real {
             })
         }
 
+        fn read_output_on(&self) -> Result<bool, RtuError> {
+            let r = self.modbus.read_holding(SLAVE, REG_OUTPUT_EN, 1)?;
+            Ok(r[0] != 0)
+        }
+
         fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
             self.modbus.write_holding(SLAVE, REG_V_SET, to_reg(volts))
         }
@@ -298,6 +304,9 @@ mod fake {
         }
         fn read_protection(&self) -> Result<SafetyLimits, RtuError> {
             Ok(self.protection.get())
+        }
+        fn read_output_on(&self) -> Result<bool, RtuError> {
+            Ok(self.output_on.get())
         }
         fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
             self.v_set.set(volts);
@@ -433,11 +442,26 @@ fn poll<D: XyDevice>(
             None
         }
     };
+    // Read OUTPUT_EN separately — it's at 0x0012, not contiguous with the
+    // main readback block. Lets the supervisor catch buck self-disable
+    // (hardware OVP/OCP/LVP, panel toggle) within one tick.
+    let output_on = match xy.read_output_on() {
+        Ok(on) => Some(on),
+        Err(e) => {
+            warn!("XY read_output_on: {e}");
+            recorder.record(Event::Xy(XyError::ReadStatus));
+            None
+        }
+    };
     let battery = sd.battery_reading().map(|b| BatterySample {
         voltage: b.voltage,
         current: b.current,
     });
-    PollResult { setpoints, battery }
+    PollResult {
+        setpoints,
+        output_on,
+        battery,
+    }
 }
 
 fn apply_action<D: XyDevice>(

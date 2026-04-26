@@ -123,13 +123,17 @@ pub struct Setpoints {
     pub i_set: f32,
 }
 
-/// One poll cycle's view of the world for the supervisor: the buck's
-/// readback (`None` if the Modbus read failed) and the latest fresh
-/// battery sample (`None` if stale or absent). `setpoints.is_some()`
-/// doubles as the modbus-healthy signal.
+/// One poll cycle's view of the world for the supervisor.
+/// `setpoints` and `output_on` come from the same Modbus read and fail
+/// together; `setpoints.is_some()` doubles as the modbus-healthy signal.
+/// `battery` is independent — it's the latest fresh INA228 reading.
 #[derive(Copy, Clone, Default)]
 pub struct PollResult {
     pub setpoints: Option<Setpoints>,
+    /// Whether the buck's OUTPUT_EN register currently reads 1. `None`
+    /// only when the Modbus read failed (same condition as
+    /// `setpoints.is_none()`).
+    pub output_on: Option<bool>,
     pub battery: Option<BatterySample>,
 }
 
@@ -176,6 +180,13 @@ pub enum FaultReason {
     /// a transport glitch.
     #[strum(serialize = "setpoint readback drift")]
     SettingsDrift,
+    /// Buck's OUTPUT_EN register read 0 while the supervisor was Active.
+    /// The buck self-disabled — its own hardware OVP / OCP / LVP /
+    /// over-temp tripped, or someone toggled the front panel. Latch and
+    /// require a reboot rather than re-enabling under unknown
+    /// conditions.
+    #[strum(serialize = "buck self-disabled")]
+    OutputUnexpectedlyOff,
 }
 
 impl FaultReason {
@@ -356,6 +367,14 @@ impl ChargeSupervisor {
         }
     }
 
+    /// Whether the supervisor expects the buck's output to be on right
+    /// now. False in Pending (haven't enabled yet) and Tripped; true in
+    /// Active. Used to detect when the buck self-disabled (hardware
+    /// OVP/OCP/LVP, panel toggle, etc.).
+    pub fn expected_output_on(&self) -> bool {
+        matches!(self.latch, LatchState::Active)
+    }
+
     /// Caller invokes this after a successful `set_output(false)` Modbus write.
     /// Until then, the supervisor will keep emitting `DisableOutput` so a
     /// failed disable write gets retried on every tick.
@@ -411,6 +430,13 @@ impl ChargeSupervisor {
             {
                 return self.latch(FaultReason::SettingsDrift);
             }
+        }
+
+        // Active and the buck reports output OFF — it self-disabled
+        // (hardware OVP/OCP/LVP, over-temp, panel toggle). Latch.
+        // Pending doesn't check: output is supposed to be off there.
+        if !pending && matches!(p.output_on, Some(false)) {
+            return self.latch(FaultReason::OutputUnexpectedlyOff);
         }
 
         if self
