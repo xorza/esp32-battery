@@ -116,12 +116,29 @@ mod real {
 
 #[cfg(feature = "ina-fake")]
 mod fake {
+    use esp_idf_hal::i2c::{I2cBusDriver, config::BusConfig};
+
     use esp32_battery_logic::data::Ina228Reading;
     use esp32_battery_logic::error_log::InaError;
 
     use super::InaDevice;
+    use crate::board::I2cPins;
 
-    pub struct FakeIna;
+    pub struct FakeIna {
+        // Real I²C bus driver, constructed but never read. Held so the
+        // peripheral and its GPIOs are genuinely configured and claimed
+        // for the program lifetime — pin/mux/clock conflicts surface on
+        // the bench just as they would in a real build.
+        _bus: I2cBusDriver<'static>,
+    }
+
+    impl FakeIna {
+        pub fn new(pins: I2cPins) -> Self {
+            let bus = I2cBusDriver::new(pins.i2c, pins.sda, pins.scl, &BusConfig::new())
+                .expect("I2C bus init");
+            Self { _bus: bus }
+        }
+    }
 
     impl InaDevice for FakeIna {
         fn read(&mut self) -> Result<Ina228Reading, InaError> {
@@ -174,13 +191,8 @@ fn make_device(pins: I2cPins) -> real::RealIna {
 
 #[cfg(feature = "ina-fake")]
 fn make_device(pins: I2cPins) -> fake::FakeIna {
-    // Burn the peripherals through black_box so I2cPins fields aren't
-    // flagged dead — we still claim them at boot and just don't drive
-    // the bus.
-    let I2cPins { i2c, sda, scl } = pins;
-    std::hint::black_box((i2c, sda, scl));
-    log::info!("INA: fake mode — no I²C, in-memory device");
-    fake::FakeIna
+    log::info!("INA: fake mode — claiming I²C but not driving it");
+    fake::FakeIna::new(pins)
 }
 
 pub fn start(pins: I2cPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {

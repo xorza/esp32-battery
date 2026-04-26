@@ -229,28 +229,50 @@ mod real {
 mod fake {
     use std::cell::Cell;
 
+    use esp_idf_hal::uart::{UartDriver, config::Config};
+    use esp_idf_hal::units::Hertz;
+
     use esp32_battery_logic::charging::SafetyLimits;
 
     use super::{XyDevice, XyIoError, XyStatus};
+    use crate::board::XyPins;
+
+    const BAUD: u32 = 115200;
 
     /// In-memory stand-in for the buck. Tracks the last voltage/output
     /// state set by the supervisor so reads reflect what the supervisor
     /// last commanded — exercises the same control flow as the real path.
-    pub struct FakeXy {
+    pub struct FakeXy<'d> {
         v_set: Cell<f32>,
         output_on: Cell<bool>,
+        // Real UART driver, constructed but never written to. Held so the
+        // peripheral and its GPIOs are genuinely configured and claimed
+        // for the program lifetime — pin/mux/baud conflicts surface on
+        // the bench just as they would in a real build.
+        _uart: UartDriver<'d>,
     }
 
-    impl FakeXy {
-        pub fn new() -> Self {
+    impl<'d> FakeXy<'d> {
+        pub fn new(pins: XyPins) -> Self {
+            let config = Config::new().baudrate(Hertz(BAUD));
+            let uart = UartDriver::new(
+                pins.uart,
+                pins.tx,
+                pins.rx,
+                None::<esp_idf_hal::gpio::AnyIOPin>,
+                None::<esp_idf_hal::gpio::AnyIOPin>,
+                &config,
+            )
+            .expect("UART1 init");
             Self {
                 v_set: Cell::new(13.5),
                 output_on: Cell::new(false),
+                _uart: uart,
             }
         }
     }
 
-    impl XyDevice for FakeXy {
+    impl XyDevice for FakeXy<'_> {
         fn read_status(&self) -> Result<XyStatus, XyIoError> {
             let v = if self.output_on.get() {
                 self.v_set.get()
@@ -403,12 +425,8 @@ pub fn start(pins: XyPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
     let device = real::Xy::new(pins);
     #[cfg(feature = "xy-fake")]
     let device = {
-        // Destructure so XyPins fields count as used; we claim the
-        // peripherals at boot but don't drive the bus.
-        let XyPins { uart, tx, rx } = pins;
-        let _ = (uart, tx, rx);
-        log::info!("XY: fake mode — no UART, in-memory device");
-        fake::FakeXy::new()
+        log::info!("XY: fake mode — claiming UART but not driving it");
+        fake::FakeXy::new(pins)
     };
     thread::Builder::new()
         .name("xy".into())
