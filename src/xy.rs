@@ -455,7 +455,8 @@ fn apply_action<D: XyDevice>(
                 }
             }
         }
-        Action::SetVoltage(v) => {
+        Action::UpdateVoltage => {
+            let v = supervisor.target_voltage();
             info!(
                 "charge phase → {}: setting V_set = {v:.2} V",
                 supervisor.phase().label()

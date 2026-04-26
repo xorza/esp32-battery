@@ -199,7 +199,9 @@ pub enum Action {
     /// `boot_sequence` already programmed it to `float_v`, which is
     /// always the supervisor's target voltage in Pending.
     EnableOutput,
-    SetVoltage(f32),
+    /// Caller should write V_SET to `supervisor.target_voltage()`.
+    /// Emitted after the phase machine transitions Float ↔ Absorb.
+    UpdateVoltage,
     DisableOutput(FaultReason),
 }
 
@@ -474,7 +476,7 @@ impl ChargeSupervisor {
             // dwell to clear stale counts.
             self.absorb.elapsed = Duration::ZERO;
             self.exit.elapsed = Duration::ZERO;
-            return Action::SetVoltage(self.target_voltage());
+            return Action::UpdateVoltage;
         }
 
         if self.phase == Phase::Absorb && self.absorb.step(true, elapsed, MAX_ABSORB) {

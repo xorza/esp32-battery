@@ -247,10 +247,11 @@ fn enters_absorb_when_charging_current_exceeds_threshold() {
     let mut s = active(lfp_4s());
     // Charging at 4 A → -4 A on the bus; threshold is 3 A.
     assert!(matches!(
-        ok_tick(&mut s,b(OK_V, -4.0), TICK),
-        Action::SetVoltage(v) if approx(v, 14.4)
+        ok_tick(&mut s, b(OK_V, -4.0), TICK),
+        Action::UpdateVoltage
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
+    assert!(approx(s.target_voltage(), 14.4));
 }
 
 #[test]
@@ -261,7 +262,7 @@ fn does_not_enter_absorb_at_exact_threshold() {
     assert!(matches!(s.phase(), Phase::Float));
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -3.001), TICK),
-        Action::SetVoltage(_)
+        Action::UpdateVoltage
     ));
 }
 
@@ -295,10 +296,11 @@ fn exits_absorb_when_taper_drops_below_threshold() {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     }
     assert!(matches!(
-        ok_tick(&mut s,b(OK_V, -2.4), TICK),
-        Action::SetVoltage(v) if approx(v, 13.5)
+        ok_tick(&mut s, b(OK_V, -2.4), TICK),
+        Action::UpdateVoltage
     ));
     assert!(matches!(s.phase(), Phase::Float));
+    assert!(approx(s.target_voltage(), 13.5));
 }
 
 #[test]
@@ -312,9 +314,10 @@ fn exits_absorb_when_load_pulls_current() {
         assert!(matches!(ok_tick(&mut s, b(OK_V, 3.0), TICK), Action::None));
     }
     assert!(matches!(
-        ok_tick(&mut s,b(OK_V, 3.0), TICK),
-        Action::SetVoltage(v) if approx(v, 13.5)
+        ok_tick(&mut s, b(OK_V, 3.0), TICK),
+        Action::UpdateVoltage
     ));
+    assert!(approx(s.target_voltage(), 13.5));
 }
 
 #[test]
@@ -349,7 +352,7 @@ fn exit_debounce_does_not_accumulate_in_float() {
     // tick is not enough to transition out.
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -4.0), TICK),
-        Action::SetVoltage(_)
+        Action::UpdateVoltage
     ));
     assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Absorb));
@@ -362,10 +365,11 @@ fn exit_debounce_honors_elapsed() {
     let mut s = active(lfp_4s());
     ok_tick(&mut s, b(OK_V, -4.0), TICK);
     assert!(matches!(
-        ok_tick(&mut s,b(OK_V, -2.4), EXIT_DEBOUNCE),
-        Action::SetVoltage(v) if approx(v, 13.5)
+        ok_tick(&mut s, b(OK_V, -2.4), EXIT_DEBOUNCE),
+        Action::UpdateVoltage
     ));
     assert!(matches!(s.phase(), Phase::Float));
+    assert!(approx(s.target_voltage(), 13.5));
 }
 
 #[test]
@@ -400,7 +404,7 @@ fn transition_only_emits_setpoint_once() {
     // First crossing → write.
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -4.0), TICK),
-        Action::SetVoltage(_)
+        Action::UpdateVoltage
     ));
     // Already absorb → silent.
     assert!(matches!(ok_tick(&mut s, b(OK_V, -4.0), TICK), Action::None));
@@ -472,14 +476,16 @@ fn nan_then_recovery_clears_stale_debounce() {
 fn different_chemistries_yield_different_setpoints() {
     let mut lfp = active(Profile::for_pack(Chemistry::LiFePo4, 4, 50.0));
     let mut liion = active(Profile::for_pack(Chemistry::LiIon, 3, 50.0));
-    let Action::SetVoltage(v_lfp) = ok_tick(&mut lfp, b(OK_V, -4.0), TICK) else {
-        panic!("expected SetVoltage")
-    };
-    let Action::SetVoltage(v_liion) = ok_tick(&mut liion, b(12.0, -4.0), TICK) else {
-        panic!("expected SetVoltage")
-    };
-    assert!(approx(v_lfp, 14.4));
-    assert!(approx(v_liion, 12.3));
+    assert!(matches!(
+        ok_tick(&mut lfp, b(OK_V, -4.0), TICK),
+        Action::UpdateVoltage
+    ));
+    assert!(matches!(
+        ok_tick(&mut liion, b(12.0, -4.0), TICK),
+        Action::UpdateVoltage
+    ));
+    assert!(approx(lfp.target_voltage(), 14.4));
+    assert!(approx(liion.target_voltage(), 12.3));
 }
 
 #[test]
@@ -489,9 +495,10 @@ fn single_cell_lfp_works() {
     let mut s = active(Profile::for_pack(Chemistry::LiFePo4, 1, 50.0));
     assert!(approx(s.target_voltage(), 3.375));
     assert!(matches!(
-        ok_tick(&mut s,b(3.4, -4.0), TICK),
-        Action::SetVoltage(v) if approx(v, 3.60)
+        ok_tick(&mut s, b(3.4, -4.0), TICK),
+        Action::UpdateVoltage
     ));
+    assert!(approx(s.target_voltage(), 3.60));
 }
 
 #[test]
@@ -499,9 +506,10 @@ fn full_charge_cycle() {
     let mut s = active(lfp_4s());
     // Bulk → absorb on heavy current.
     assert!(matches!(
-        ok_tick(&mut s,b(OK_V, -8.0), TICK),
-        Action::SetVoltage(v) if approx(v, 14.4)
+        ok_tick(&mut s, b(OK_V, -8.0), TICK),
+        Action::UpdateVoltage
     ));
+    assert!(approx(s.target_voltage(), 14.4));
     // Hold absorb across a realistic taper — all values stay above 2.5 A.
     for &i in &[-7.0, -5.0, -3.5, -3.0, -2.7] {
         assert!(matches!(ok_tick(&mut s, b(OK_V, i), TICK), Action::None));
@@ -511,9 +519,10 @@ fn full_charge_cycle() {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     }
     assert!(matches!(
-        ok_tick(&mut s,b(OK_V, -2.4), TICK),
-        Action::SetVoltage(v) if approx(v, 13.5)
+        ok_tick(&mut s, b(OK_V, -2.4), TICK),
+        Action::UpdateVoltage
     ));
+    assert!(approx(s.target_voltage(), 13.5));
     // Sit at float without retriggering absorb (all below 3 A enter).
     for &i in &[-0.05, -0.02, 0.0, -2.0] {
         assert!(matches!(ok_tick(&mut s, b(OK_V, i), TICK), Action::None));
@@ -602,7 +611,7 @@ fn modbus_unhealthy_honors_elapsed() {
 fn enter_absorb(s: &mut ChargeSupervisor) {
     assert!(matches!(
         ok_tick(s, b(OK_V, -4.0), TICK),
-        Action::SetVoltage(_)
+        Action::UpdateVoltage
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
 }
@@ -645,7 +654,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     }
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -0.1), TICK),
-        Action::SetVoltage(_)
+        Action::UpdateVoltage
     ));
     assert!(matches!(s.phase(), Phase::Float));
 
@@ -663,12 +672,12 @@ fn absorb_counter_resets_on_taper_back_to_float() {
 #[test]
 fn supervisor_passes_setpoint_through_on_phase_transition() {
     let mut s = active(lfp_4s());
-    let a = ok_tick(&mut s, b(13.5, -4.0), TICK);
-    match a {
-        Action::SetVoltage(v) => assert!(approx(v, 14.4)),
-        _ => panic!("expected SetVoltage"),
-    }
+    assert!(matches!(
+        ok_tick(&mut s, b(13.5, -4.0), TICK),
+        Action::UpdateVoltage
+    ));
     assert!(matches!(s.phase(), Phase::Absorb));
+    assert!(approx(s.target_voltage(), 14.4));
     assert!(s.fault().is_none());
 }
 
