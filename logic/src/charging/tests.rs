@@ -1019,6 +1019,258 @@ fn buck_self_disable_in_active_latches() {
 }
 
 #[test]
+fn output_unexpectedly_off_recovers_after_healthy_window() {
+    // Active → buck self-disables → latch → ack via DisableOutput. Then
+    // healthy state for OUTPUT_RECOVERY_HEALTHY → supervisor transitions
+    // back to Pending and re-emits EnableOutput.
+    let mut s = active(lfp_4s());
+    let p = PollResult {
+        setpoints: Some(s.expected_setpoints()),
+        output_on: Some(false),
+        battery: b(OK_V, -0.1),
+    };
+    let a = s.tick(p, TICK);
+    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff));
+    // Drive ack via the apply_action analogue.
+    s.ack_disable();
+    // Tick through the healthy window with output staying OFF (as it
+    // should after a self-disable).
+    for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
+        let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+        assert!(matches!(a, Action::None));
+        assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff)));
+    }
+    // One more healthy tick crosses the threshold → Tripped → Pending.
+    // This tick itself returns None (recovery is silent); the next tick
+    // is the first Pending tick and emits EnableOutput.
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(a, Action::None));
+    assert!(s.fault().is_none()); // back to Pending
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(a, Action::EnableOutput));
+}
+
+#[test]
+fn output_unexpectedly_off_recovery_resets_on_unhealthy_tick() {
+    let mut s = active(lfp_4s());
+    s.tick(
+        PollResult {
+            setpoints: Some(s.expected_setpoints()),
+            output_on: Some(false),
+            battery: b(OK_V, -0.1),
+        },
+        TICK,
+    );
+    s.ack_disable();
+    // Almost there...
+    for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    }
+    // A bad tick: pack went over the OV threshold. Must reset the clock.
+    let absorb = lfp_4s().absorb_v;
+    ok_tick(&mut s, b(absorb + OV_MARGIN_V + 0.5, -0.1), TICK);
+    // One more healthy tick should NOT recover yet (clock is back at 1).
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(a, Action::None));
+    assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff)));
+}
+
+#[test]
+fn output_unexpectedly_off_recovery_exhausts_after_max_attempts() {
+    // Three flap cycles: each latches, recovers, then re-latches. After
+    // the third recovery the budget is exhausted — next latch is permanent.
+    let mut s = active(lfp_4s());
+    for _ in 0..OUTPUT_RECOVERY_MAX_ATTEMPTS {
+        // Latch.
+        s.tick(
+            PollResult {
+                setpoints: Some(s.expected_setpoints()),
+                output_on: Some(false),
+                battery: b(OK_V, -0.1),
+            },
+            TICK,
+        );
+        s.ack_disable();
+        // Recover.
+        for _ in 0..OUTPUT_RECOVERY_HEALTHY.as_secs() {
+            ok_tick(&mut s, b(OK_V, -0.1), TICK);
+        }
+        // Now back in Pending → emits EnableOutput → ack.
+        assert!(matches!(
+            ok_tick(&mut s, b(OK_V, -0.1), TICK),
+            Action::EnableOutput
+        ));
+        s.ack_enable();
+    }
+    // 4th latch — recovery exhausted, must stay permanent.
+    s.tick(
+        PollResult {
+            setpoints: Some(s.expected_setpoints()),
+            output_on: Some(false),
+            battery: b(OK_V, -0.1),
+        },
+        TICK,
+    );
+    s.ack_disable();
+    for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() * 2) {
+        let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+        assert!(matches!(a, Action::None));
+    }
+    assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff)));
+}
+
+#[test]
+fn recovery_resets_on_modbus_down() {
+    // Same shape as the OV reset test, but the unhealthy condition is
+    // setpoints=None (Modbus failed) instead of overvoltage.
+    let mut s = active(lfp_4s());
+    s.tick(
+        PollResult {
+            setpoints: Some(s.expected_setpoints()),
+            output_on: Some(false),
+            battery: b(OK_V, -0.1),
+        },
+        TICK,
+    );
+    s.ack_disable();
+    for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    }
+    fail_tick(&mut s, b(OK_V, -0.1), TICK); // modbus down — resets clock
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(a, Action::None));
+    assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff)));
+}
+
+#[test]
+fn recovery_resets_on_missing_battery() {
+    let mut s = active(lfp_4s());
+    s.tick(
+        PollResult {
+            setpoints: Some(s.expected_setpoints()),
+            output_on: Some(false),
+            battery: b(OK_V, -0.1),
+        },
+        TICK,
+    );
+    s.ack_disable();
+    for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    }
+    ok_tick(&mut s, None, TICK); // battery missing — resets clock
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(a, Action::None));
+    assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff)));
+}
+
+#[test]
+fn recovery_resets_on_unexpected_output_on() {
+    // Buck spontaneously came back on (panel toggle, EMC, whatever) —
+    // we want a stable OFF state before recovering. Reset the clock.
+    let mut s = active(lfp_4s());
+    s.tick(
+        PollResult {
+            setpoints: Some(s.expected_setpoints()),
+            output_on: Some(false),
+            battery: b(OK_V, -0.1),
+        },
+        TICK,
+    );
+    s.ack_disable();
+    for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    }
+    // ok_tick uses expected_output_on() = false (still latched). Override
+    // by ticking with output_on=true to simulate the spontaneous re-enable.
+    s.tick(
+        PollResult {
+            setpoints: Some(s.expected_setpoints()),
+            output_on: Some(true),
+            battery: b(OK_V, -0.1),
+        },
+        TICK,
+    );
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(a, Action::None));
+    assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff)));
+}
+
+#[test]
+fn recovery_full_bring_up_chain() {
+    // Full happy-path: latch → recover → Pending → EnableOutput → ack
+    // → Active → phase machine works. Verifies recovery hands off
+    // cleanly to the normal control flow.
+    let mut s = active(lfp_4s());
+    s.tick(
+        PollResult {
+            setpoints: Some(s.expected_setpoints()),
+            output_on: Some(false),
+            battery: b(OK_V, -0.1),
+        },
+        TICK,
+    );
+    s.ack_disable();
+    for _ in 0..OUTPUT_RECOVERY_HEALTHY.as_secs() {
+        ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    }
+    // Pending now. EnableOutput.
+    assert!(matches!(
+        ok_tick(&mut s, b(OK_V, -0.1), TICK),
+        Action::EnableOutput
+    ));
+    s.ack_enable();
+    // Active. Phase machine engages — heavy charging current → Absorb.
+    assert!(matches!(
+        ok_tick(&mut s, b(OK_V, -4.0), TICK),
+        Action::UpdateVoltage
+    ));
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn pending_after_recovery_can_re_latch_on_ov() {
+    // Recovery → Pending. If the first Pending tick sees an OV pack,
+    // it must latch Overvoltage (undebounced in Pending), not enable.
+    let mut s = active(lfp_4s());
+    s.tick(
+        PollResult {
+            setpoints: Some(s.expected_setpoints()),
+            output_on: Some(false),
+            battery: b(OK_V, -0.1),
+        },
+        TICK,
+    );
+    s.ack_disable();
+    // Recover.
+    for _ in 0..OUTPUT_RECOVERY_HEALTHY.as_secs() {
+        ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    }
+    // First Pending tick: pack is now over the OV threshold.
+    let absorb = lfp_4s().absorb_v;
+    let a = ok_tick(&mut s, b(absorb + OV_MARGIN_V + 0.5, -0.1), TICK);
+    assert!(matches_disable(&a, FaultReason::Overvoltage));
+}
+
+#[test]
+fn non_recoverable_fault_stays_latched_forever() {
+    // Confirm only OutputUnexpectedlyOff is recoverable. OV trip in
+    // active state should never auto-clear.
+    let mut s = active(lfp_4s());
+    let absorb = lfp_4s().absorb_v;
+    for _ in 0..(OV_DURATION.as_secs() + 1) {
+        ok_tick(&mut s, b(absorb + OV_MARGIN_V + 0.5, -0.1), TICK);
+    }
+    assert!(matches!(s.fault(), Some(FaultReason::Overvoltage)));
+    s.ack_disable();
+    // Long stretch of healthy state — must NOT recover.
+    for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() * 5) {
+        let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+        assert!(matches!(a, Action::None));
+    }
+    assert!(matches!(s.fault(), Some(FaultReason::Overvoltage)));
+}
+
+#[test]
 fn buck_output_off_in_pending_does_not_fault() {
     // In Pending the buck IS supposed to be off — output_on=Some(false)
     // is normal, must not latch.

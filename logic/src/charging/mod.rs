@@ -79,6 +79,17 @@ const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 /// quirks on values like 14.4 V whose binary repr isn't exact.
 const SETPOINT_DRIFT_TOL: f32 = 0.02;
 
+/// How long the world must look healthy after `OutputUnexpectedlyOff`
+/// before the supervisor attempts to bring the buck back up. Long enough
+/// for transient causes (input LVP from AC sag, over-temp cooldown) to
+/// genuinely clear; short enough that operationally a brief input glitch
+/// doesn't require a manual reboot.
+const OUTPUT_RECOVERY_HEALTHY: Duration = Duration::from_secs(60);
+/// Total recoveries from `OutputUnexpectedlyOff` allowed since boot.
+/// After this many flap cycles, the supervisor latches permanently —
+/// flapping is a real signal that something underlying is wrong.
+const OUTPUT_RECOVERY_MAX_ATTEMPTS: u32 = 3;
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone)]
@@ -193,6 +204,31 @@ impl FaultReason {
     pub fn label(self) -> &'static str {
         self.into()
     }
+
+    /// Auto-recovery policy for this fault, if any. `None` means
+    /// reboot-only recovery; only `OutputUnexpectedlyOff` is currently
+    /// recoverable since its common causes (input LVP, over-temp,
+    /// transient panel toggle) genuinely clear without operator
+    /// intervention. Hard safety faults (OV, drift, absorb timeout)
+    /// stay reboot-only.
+    pub fn recovery(self) -> Option<RecoveryPolicy> {
+        match self {
+            Self::OutputUnexpectedlyOff => Some(RecoveryPolicy {
+                healthy_for: OUTPUT_RECOVERY_HEALTHY,
+                max_attempts: OUTPUT_RECOVERY_MAX_ATTEMPTS,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// How a recoverable fault auto-clears.
+#[derive(Copy, Clone)]
+pub struct RecoveryPolicy {
+    /// Continuous healthy-state duration required to attempt recovery.
+    pub healthy_for: Duration,
+    /// Max recoveries since boot. Cap on flap-cycles before permanent latch.
+    pub max_attempts: u32,
 }
 
 /// What the poll loop should do this tick.
@@ -269,6 +305,13 @@ pub struct ChargeSupervisor {
     battery_missing: Debounce,
     modbus_err: Debounce,
     latch: LatchState,
+    /// Continuous healthy-state time accumulated since the current
+    /// Tripped latch. Reset on each new latch. Only meaningful when
+    /// the latched fault has a recovery policy.
+    recovery_elapsed: Duration,
+    /// Total auto-recoveries performed since boot. Compared to the
+    /// fault's `recovery().max_attempts` at decision time.
+    recovery_attempts_used: u32,
 }
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
@@ -336,6 +379,8 @@ impl ChargeSupervisor {
             battery_missing: Debounce::default(),
             modbus_err: Debounce::default(),
             latch: LatchState::Pending,
+            recovery_elapsed: Duration::ZERO,
+            recovery_attempts_used: 0,
         }
     }
 
@@ -414,7 +459,13 @@ impl ChargeSupervisor {
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
         let pending = match self.latch {
-            LatchState::Tripped { acked: true, .. } => return Action::None,
+            LatchState::Tripped {
+                reason,
+                acked: true,
+            } => {
+                self.try_recover(reason, &p, elapsed);
+                return Action::None;
+            }
             LatchState::Tripped {
                 reason,
                 acked: false,
@@ -511,7 +562,45 @@ impl ChargeSupervisor {
             reason,
             acked: false,
         };
+        // New latch — reset recovery elapsed clock. attempts_used persists
+        // across latches so flapping eventually exhausts the budget.
+        self.recovery_elapsed = Duration::ZERO;
         Action::DisableOutput(reason)
+    }
+
+    /// Recovery tick for an acked Tripped latch. Per-fault `recovery()`
+    /// policy decides whether and when to transition Tripped → Pending.
+    /// "Healthy" for recovery purposes: Modbus up, battery present and
+    /// finite, pack below the OV threshold, and the buck still reporting
+    /// output OFF (any spontaneous re-enable is unmodeled — reset the
+    /// clock until we see a clean stable state).
+    fn try_recover(&mut self, reason: FaultReason, p: &PollResult, elapsed: Duration) {
+        let Some(policy) = reason.recovery() else {
+            return;
+        };
+        if self.recovery_attempts_used >= policy.max_attempts {
+            return;
+        }
+        let battery_ok = p
+            .battery
+            .map(|b| {
+                b.voltage.is_finite()
+                    && b.current.is_finite()
+                    && b.voltage <= self.profile.absorb_v + OV_MARGIN_V
+            })
+            .unwrap_or(false);
+        let healthy =
+            p.setpoints.is_some() && p.output_on == Some(false) && battery_ok;
+        if !healthy {
+            self.recovery_elapsed = Duration::ZERO;
+            return;
+        }
+        self.recovery_elapsed = self.recovery_elapsed.saturating_add(elapsed);
+        if self.recovery_elapsed >= policy.healthy_for {
+            self.recovery_attempts_used += 1;
+            self.recovery_elapsed = Duration::ZERO;
+            self.latch = LatchState::Pending;
+        }
     }
 }
 
