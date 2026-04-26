@@ -19,6 +19,8 @@
 
 use std::time::Duration;
 
+use strum::IntoStaticStr;
+
 // ─── Tunables ────────────────────────────────────────────────────────────────
 
 /// CC charge rate as a fraction of pack capacity. 0.2C is the
@@ -131,56 +133,72 @@ pub struct PollResult {
 /// quirks on values like 14.4 V whose binary repr isn't exact.
 const SETPOINT_DRIFT_TOL: f32 = 0.02;
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum Phase {
     Float,
     Absorb,
 }
 
+impl Phase {
+    pub fn label(self) -> &'static str {
+        self.into()
+    }
+}
+
 /// Why the supervisor latched the buck off. Once latched, only a reboot
 /// clears it — auto-recovery on a battery charger means trying again
 /// under the same conditions.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, IntoStaticStr)]
 pub enum FaultReason {
     /// No fresh battery reading for `BATTERY_MISSING_TIMEOUT.as_secs()` consecutive ticks.
     /// Without current/voltage we cannot supervise charging — fail closed.
+    #[strum(serialize = "battery sensor stale")]
     BatterySensorStale,
     /// Modbus reads to the XY7025 have been failing for `MODBUS_UNHEALTHY_TIMEOUT`
     /// continuously. We've lost closed-loop control over the buck; disable
     /// while we still can.
+    #[strum(serialize = "modbus link unhealthy")]
     ModbusUnhealthy,
     /// Pack voltage exceeded `absorb_v + OV_MARGIN_V` for `OV_DURATION.as_secs()` ticks.
     /// Catches drift below the XY's hardware OVP trip but above the profile target.
+    #[strum(serialize = "pack overvoltage")]
     Overvoltage,
     /// Absorb ran for `MAX_ABSORB.as_secs()` ticks. Under a parasitic load
     /// pinning current above `exit_absorb_a` we'd otherwise sit at CV
     /// forever.
+    #[strum(serialize = "absorb time cap reached")]
     AbsorbTimeout,
     /// XY7025 setpoint readback (V_SET or I_SET) disagreed with what we
     /// commanded. The buck is sourcing under unknown setpoints — disable
     /// before it can do damage. Triggers immediately, no debounce: the
     /// caller already verified the read itself succeeded, so this isn't
     /// a transport glitch.
+    #[strum(serialize = "setpoint readback drift")]
     SettingsDrift,
 }
 
 impl FaultReason {
     pub fn label(self) -> &'static str {
-        match self {
-            Self::BatterySensorStale => "battery sensor stale",
-            Self::ModbusUnhealthy => "modbus link unhealthy",
-            Self::Overvoltage => "pack overvoltage",
-            Self::AbsorbTimeout => "absorb time cap reached",
-            Self::SettingsDrift => "setpoint readback drift",
-        }
+        self.into()
     }
 }
 
-/// What the poll loop should do this tick. The supervisor never enables the
-/// output — `boot_sequence` does that once at startup. After a latch, only
-/// `DisableOutput` is ever emitted until the disable is ACKed.
+/// What the poll loop should do this tick.
+///
+/// The supervisor boots in a `Pending` latch state — output is OFF and we
+/// haven't decided it's safe to enable yet. Each tick re-runs the same
+/// safety checks as the active path; once all clear, the supervisor emits
+/// `EnableOutput` and stays Pending until the caller `ack_enable`s. After
+/// that it transitions to active operation: phase machine + drift +
+/// fault paths. After a fault latches, only `DisableOutput` is ever
+/// emitted until the disable is ACKed.
 pub enum Action {
     None,
+    /// Caller should write `set_output(true)`. V_SET is untouched —
+    /// `boot_sequence` already programmed it to `float_v`, which is
+    /// always the supervisor's target voltage in Pending.
+    EnableOutput,
     SetVoltage(f32),
     DisableOutput(FaultReason),
 }
@@ -193,10 +211,16 @@ pub struct BatterySample {
     pub current: f32,
 }
 
-/// Latch state. `Tripped { acked: false }` is the only state that emits
-/// `DisableOutput`; the unreachable `(None, true)` of the old two-field
-/// encoding can't be expressed.
+/// Latch state.
+/// - `Pending`: output is OFF and we haven't yet emitted EnableOutput, or
+///   we have but `ack_enable` hasn't been called yet (write may have
+///   failed). Same safety checks as `Active`, but tick emits
+///   `EnableOutput` instead of running the phase machine.
+/// - `Active`: output is on, phase machine + drift + fault paths run.
+/// - `Tripped { acked: false }`: a fault latched; emit `DisableOutput`.
+/// - `Tripped { acked: true }`: caller successfully disabled; emit None.
 enum LatchState {
+    Pending,
     Active,
     Tripped { reason: FaultReason, acked: bool },
 }
@@ -289,6 +313,11 @@ impl ChargeSupervisor {
         // Always boot in Float — never resume Absorb across a reset, even if
         // we crashed mid-absorb. Conservative by design: re-derive phase from
         // observed current. Don't add NVS-backed phase persistence.
+        //
+        // Always boot Pending — output stays OFF until the supervisor sees
+        // a healthy first tick (drift-free setpoints, fresh battery sample
+        // below OV). Bringing up the buck is the supervisor's job, not
+        // boot_sequence's, so the cold-boot moment can't bypass safety.
         Self {
             profile,
             phase: Phase::Float,
@@ -297,7 +326,7 @@ impl ChargeSupervisor {
             exit: Debounce::default(),
             battery_missing: Debounce::default(),
             modbus_err: Debounce::default(),
-            latch: LatchState::Active,
+            latch: LatchState::Pending,
         }
     }
 
@@ -314,7 +343,7 @@ impl ChargeSupervisor {
 
     pub fn fault(&self) -> Option<FaultReason> {
         match self.latch {
-            LatchState::Active => None,
+            LatchState::Pending | LatchState::Active => None,
             LatchState::Tripped { reason, .. } => Some(reason),
         }
     }
@@ -335,7 +364,20 @@ impl ChargeSupervisor {
     pub fn ack_disable(&mut self) {
         match &mut self.latch {
             LatchState::Tripped { acked, .. } => *acked = true,
-            LatchState::Active => panic!("ack_disable without latched fault"),
+            LatchState::Pending | LatchState::Active => {
+                panic!("ack_disable without latched fault")
+            }
+        }
+    }
+
+    /// Caller invokes this after a successful `set_output(true)` Modbus write.
+    /// Transitions Pending → Active; the supervisor's phase machine starts
+    /// running on the next tick. Until acked, the supervisor keeps emitting
+    /// `EnableOutput` so a failed enable write gets retried.
+    pub fn ack_enable(&mut self) {
+        match self.latch {
+            LatchState::Pending => self.latch = LatchState::Active,
+            _ => panic!("ack_enable from non-Pending state"),
         }
     }
 
@@ -354,14 +396,15 @@ impl ChargeSupervisor {
     /// stuck sensor mask overvoltage. Routes through the same
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
-        match self.latch {
+        let pending = match self.latch {
             LatchState::Tripped { acked: true, .. } => return Action::None,
             LatchState::Tripped {
                 reason,
                 acked: false,
             } => return Action::DisableOutput(reason),
-            LatchState::Active => {}
-        }
+            LatchState::Pending => true,
+            LatchState::Active => false,
+        };
 
         if let Some(sp) = p.setpoints {
             let want = self.expected_setpoints();
@@ -396,8 +439,22 @@ impl ChargeSupervisor {
         };
 
         let ov = b.voltage > self.profile.absorb_v + OV_MARGIN_V;
+        // OV is undebounced in Pending — a pack already over the threshold
+        // at boot must never see EnableOutput. In Active the existing 3 s
+        // debounce filters transients caused by switching noise / load steps.
+        if pending && ov {
+            return self.latch(FaultReason::Overvoltage);
+        }
         if self.ov.step(ov, elapsed, OV_DURATION) {
             return self.latch(FaultReason::Overvoltage);
+        }
+
+        // All safety checks clear. In Pending we haven't enabled output yet
+        // — emit EnableOutput and stay Pending until the caller acks.
+        // Phase machine doesn't run yet (output is OFF, no current
+        // measurement is meaningful).
+        if pending {
+            return Action::EnableOutput;
         }
 
         // Charging current as a positive number.

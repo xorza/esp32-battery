@@ -20,7 +20,7 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    Action, BatterySample, ChargeSupervisor, Chemistry, Phase, PollResult, Profile, SafetyLimits,
+    Action, BatterySample, ChargeSupervisor, Chemistry, PollResult, Profile, SafetyLimits,
     Setpoints,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
@@ -319,11 +319,11 @@ mod fake {
 
 // --- Shared thread loop -----------------------------------------------------
 
-/// Programs protection + setpoints, reads them back to confirm the device
-/// accepted the writes, then enables output. Any failure short-circuits —
-/// we never enable output with unverified setpoints. Readback catches
-/// dropped Modbus writes, scale-divider mismatches, and wrong-slave wiring
-/// before the buck can source into the pack.
+/// Programs protection + setpoints and reads them back to confirm the
+/// device accepted the writes. Output stays OFF — bringing up the buck
+/// is the supervisor's job, conditional on a fresh, drift-free, in-range
+/// first tick. Readback catches dropped writes, scale-divider mismatches,
+/// and wrong-slave wiring before the supervisor can ask for output enable.
 fn boot_sequence<D: XyDevice>(xy: &D) -> Result<(), BootError> {
     xy.set_output(false)?;
     xy.set_power_on_default_off()?;
@@ -338,8 +338,6 @@ fn boot_sequence<D: XyDevice>(xy: &D) -> Result<(), BootError> {
     verify("OVP", SAFETY.ovp_v, p.ovp_v)?;
     verify("OCP", SAFETY.ocp_a, p.ocp_a)?;
     verify("LVP", SAFETY.lvp_v, p.lvp_v)?;
-
-    xy.set_output(true)?;
     Ok(())
 }
 
@@ -447,12 +445,21 @@ fn apply_action<D: XyDevice>(
 ) {
     match action {
         Action::None => {}
+        Action::EnableOutput => {
+            info!("supervisor enabling output");
+            match xy.set_output(true) {
+                Ok(()) => supervisor.ack_enable(),
+                Err(e) => {
+                    warn!("XY set_output(true): {e} — supervisor stays Pending, will retry");
+                    recorder.record(Event::Xy(XyError::SetOutput));
+                }
+            }
+        }
         Action::SetVoltage(v) => {
-            let phase = match supervisor.phase() {
-                Phase::Float => "float",
-                Phase::Absorb => "absorb",
-            };
-            info!("charge phase → {phase}: setting V_set = {v:.2} V");
+            info!(
+                "charge phase → {}: setting V_set = {v:.2} V",
+                supervisor.phase().label()
+            );
             if let Err(e) = xy.set_voltage(v) {
                 warn!("XY set_voltage({v}): {e}");
                 recorder.record(Event::Xy(XyError::SetVoltage));

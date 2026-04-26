@@ -26,21 +26,18 @@ leave the buck regulating to its last commanded V_SET indefinitely.
 
 ## Medium
 
-### Cold boot enables output without checking pack voltage
+### Cold boot enables output without checking pack voltage — FIXED
 
-`src/xy.rs:342` — `boot_sequence` programs setpoints, verifies via
-readback, then calls `set_output(true)`. The pack voltage is never
-read before energizing.
+**Status: fixed.** Output enable moved from `boot_sequence` into the
+supervisor. `LatchState::Pending` is the new initial state; `tick`
+runs the same safety checks (drift, modbus, battery missing, OV) and
+only emits `Action::EnableOutput(target_voltage)` once everything
+clears. OV is **undebounced** in Pending — a pack already over the
+threshold at boot latches `Overvoltage` on the first tick instead of
+waiting out the 3 s active-state debounce.
 
-**Effect**: if the pack is already above the absorb target at boot (hot
-pack from a prior interrupted charge, sensor offset, after-fault
-restart), we energize and rely entirely on the hardware OVP register
-(15.0 V for 4S LFP). The supervisor's debounced OV trip starts only
-after `boot_sequence` returns and the loop spins.
-
-**Fix**: take one battery sample before `set_output(true)`. Refuse to
-enable if `b.voltage > absorb_v + OV_MARGIN_V` (or `!is_finite()`).
-Costs at most one POLL_INTERVAL of latency.
+`boot_sequence` now ends after the verify, never calling
+`set_output(true)`. Cold-boot moment can no longer bypass safety.
 
 ### Boot-failure path discards the disable write — FIXED
 
