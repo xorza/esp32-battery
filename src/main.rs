@@ -145,6 +145,7 @@ fn main() {
             NetState::StaConnecting {
                 wifi: sta_wifi,
                 server,
+                creds,
                 session_start: uptime(),
             }
         }
@@ -170,39 +171,14 @@ fn main() {
 }
 
 /// One supervisor tick. Consumes `state` and returns the next variant.
-/// Each arm is the full transition logic for that state — there are no
-/// fallthroughs and no shared mutable cross-state plumbing.
 fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
     match state {
         NetState::BootNoCreds { mut wifi, bundle } => {
             if let Some(creds) = take_submitted(&bundle) {
-                return NetState::CaptiveSubmitted {
-                    wifi,
-                    bundle,
-                    creds,
-                    since: now,
-                };
+                return apply_submission(wifi, bundle, creds, now);
             }
             wifi.refresh_scan_if_stale(now);
             NetState::BootNoCreds { wifi, bundle }
-        }
-        NetState::CaptiveSubmitted {
-            mut wifi,
-            bundle,
-            creds,
-            since,
-        } => {
-            // One-tick state: apply parked creds to the radio, flip
-            // status to Trying, fall through to CaptiveTrying. `since`
-            // carries forward — the 20s window starts at /save time.
-            wifi.set_sta_creds(&creds);
-            bundle.status.store(SubmissionStatus::Trying);
-            NetState::CaptiveTrying {
-                wifi,
-                bundle,
-                creds,
-                since,
-            }
         }
         NetState::CaptiveTrying {
             mut wifi,
@@ -210,18 +186,14 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
             creds,
             since,
         } => {
-            // A second /save during the trying window overrides — drop
-            // current attempt, restart with new creds.
-            if let Some(new_creds) = take_submitted(&bundle) {
-                return NetState::CaptiveSubmitted {
-                    wifi,
-                    bundle,
-                    creds: new_creds,
-                    since: now,
-                };
-            }
+            // Order matters: an associate-success on the in-flight creds
+            // wins over a /save that arrived too late — otherwise we'd
+            // disconnect from the network we just successfully joined.
             if wifi.try_connect() {
                 return promote_to_host(wifi, bundle, creds, ctx, now);
+            }
+            if let Some(new_creds) = take_submitted(&bundle) {
+                return apply_submission(wifi, bundle, new_creds, now);
             }
             if now.saturating_sub(since) >= CAPTIVE_TRYING_TIMEOUT {
                 bundle.status.store(SubmissionStatus::Failed);
@@ -237,39 +209,36 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
         }
         NetState::CaptiveFailed { mut wifi, bundle } => {
             if let Some(creds) = take_submitted(&bundle) {
-                return NetState::CaptiveSubmitted {
-                    wifi,
-                    bundle,
-                    creds,
-                    since: now,
-                };
+                return apply_submission(wifi, bundle, creds, now);
             }
             wifi.refresh_scan_if_stale(now);
             NetState::CaptiveFailed { wifi, bundle }
         }
-        NetState::CaptiveFallbackRetrying { mut wifi, bundle } => {
-            // Sta→Captive carry-over: NVS already has known-good (or
-            // last-known) creds and the radio is configured to retry
-            // them. /save still wins if the user re-submits.
-            if let Some(creds) = take_submitted(&bundle) {
-                return NetState::CaptiveSubmitted {
-                    wifi,
-                    bundle,
-                    creds,
-                    since: now,
-                };
-            }
+        NetState::CaptiveFallbackRetrying {
+            mut wifi,
+            bundle,
+            creds,
+        } => {
+            // STA half is configured with the carry-over creds and
+            // retrying in the background. Same ordering as CaptiveTrying:
+            // assoc-success wins over a /save in the same tick.
             if wifi.try_connect() {
-                let creds = nvs_creds::load(&ctx.nvs)
-                    .expect("CaptiveFallbackRetrying without NVS creds");
                 return promote_to_host(wifi, bundle, creds, ctx, now);
             }
+            if let Some(new_creds) = take_submitted(&bundle) {
+                return apply_submission(wifi, bundle, new_creds, now);
+            }
             wifi.refresh_scan_if_stale(now);
-            NetState::CaptiveFallbackRetrying { wifi, bundle }
+            NetState::CaptiveFallbackRetrying {
+                wifi,
+                bundle,
+                creds,
+            }
         }
         NetState::StaConnecting {
             mut wifi,
             server,
+            creds,
             session_start,
         } => {
             if wifi.try_connect() {
@@ -278,15 +247,17 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
                     wifi,
                     server,
                     mdns,
+                    creds,
                     last_assoc: now,
                 };
             }
             if now.saturating_sub(session_start) >= CAPTIVE_AFTER_DISCONNECT {
-                return fallback_to_captive(wifi, server, None, ctx);
+                return fallback_to_captive(wifi, server, None, creds);
             }
             NetState::StaConnecting {
                 wifi,
                 server,
+                creds,
                 session_start,
             }
         }
@@ -294,6 +265,7 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
             mut wifi,
             server,
             mdns,
+            creds,
             last_assoc,
         } => {
             if wifi.try_connect() {
@@ -301,6 +273,7 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
                     wifi,
                     server,
                     mdns,
+                    creds,
                     last_assoc: now,
                 }
             } else {
@@ -308,6 +281,7 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
                     wifi,
                     server,
                     mdns,
+                    creds,
                     last_assoc,
                 }
             }
@@ -316,6 +290,7 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
             mut wifi,
             server,
             mdns,
+            creds,
             last_assoc,
         } => {
             if wifi.try_connect() {
@@ -323,16 +298,18 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
                     wifi,
                     server,
                     mdns,
+                    creds,
                     last_assoc: now,
                 };
             }
             if now.saturating_sub(last_assoc) >= CAPTIVE_AFTER_DISCONNECT {
-                return fallback_to_captive(wifi, server, Some(mdns), ctx);
+                return fallback_to_captive(wifi, server, Some(mdns), creds);
             }
             NetState::StaReassociating {
                 wifi,
                 server,
                 mdns,
+                creds,
                 last_assoc,
             }
         }
@@ -343,6 +320,25 @@ fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
 /// mailbox. Returns `None` if no `/save` has fired since the last drain.
 fn take_submitted(bundle: &net::CaptiveBundle) -> Option<WifiCredentials> {
     bundle.mailbox.lock().unwrap().take()
+}
+
+/// Apply freshly-submitted creds to the live radio and enter the 20 s
+/// trying window. Used by every captive-arm state that might receive a
+/// `/save` (or, in the case of `CaptiveTrying`, a re-`/save`).
+fn apply_submission(
+    mut wifi: wifi::MixedWifi<'static>,
+    bundle: net::CaptiveBundle,
+    creds: WifiCredentials,
+    now: Duration,
+) -> NetState {
+    wifi.set_sta_creds(&creds);
+    bundle.status.store(SubmissionStatus::Trying);
+    NetState::CaptiveTrying {
+        wifi,
+        bundle,
+        creds,
+        since: now,
+    }
 }
 
 /// Captive → STA promotion. Persist creds to NVS, drop the captive
@@ -364,6 +360,7 @@ fn promote_to_host(
         wifi: sta_wifi,
         server,
         mdns,
+        creds,
         last_assoc: now,
     }
 }
@@ -375,16 +372,15 @@ fn fallback_to_captive(
     wifi: wifi::StaWifi<'static>,
     server: EspHttpServer<'static>,
     mdns: Option<esp_idf_svc::mdns::EspMdns>,
-    ctx: &StaCtx,
+    creds: WifiCredentials,
 ) -> NetState {
     drop(server);
     drop(mdns);
-    let creds =
-        nvs_creds::load(&ctx.nvs).expect("STA fallback without NVS creds (boot path bug?)");
     let mixed = wifi.into_mixed(Some(&creds));
     let bundle = http::start_captive(mixed.scan_cache());
     NetState::CaptiveFallbackRetrying {
         wifi: mixed,
         bundle,
+        creds,
     }
 }

@@ -96,19 +96,16 @@ pub struct CaptiveBundle {
 /// radio mode, alive servers, and legal transitions are all bounded by
 /// the type. See `wifi_fsm.md` for the state table and transitions.
 ///
-/// Credentials live in NVS (`nvs_creds`) and on the radio config; only
-/// `CaptiveSubmitted` / `CaptiveTrying` carry an in-memory copy, for the
-/// window between `/save` and the success that persists them.
+/// Every variant that *has* credentials at runtime carries them in the
+/// variant. NVS is the durable store; the FSM doesn't read NVS per
+/// tick. The only state with no creds is `BootNoCreds` (cold boot, NVS
+/// empty) and the user-visible-error states `CaptiveFailed`, where the
+/// last attempt's creds are intentionally dropped so the captive page
+/// is the source of truth on retry.
 pub enum NetState {
     BootNoCreds {
         wifi: MixedWifi<'static>,
         bundle: CaptiveBundle,
-    },
-    CaptiveSubmitted {
-        wifi: MixedWifi<'static>,
-        bundle: CaptiveBundle,
-        creds: WifiCredentials,
-        since: Duration,
     },
     CaptiveTrying {
         wifi: MixedWifi<'static>,
@@ -123,22 +120,26 @@ pub enum NetState {
     CaptiveFallbackRetrying {
         wifi: MixedWifi<'static>,
         bundle: CaptiveBundle,
+        creds: WifiCredentials,
     },
     StaConnecting {
         wifi: StaWifi<'static>,
         server: EspHttpServer<'static>,
+        creds: WifiCredentials,
         session_start: Duration,
     },
     StaHost {
         wifi: StaWifi<'static>,
         server: EspHttpServer<'static>,
         mdns: EspMdns,
+        creds: WifiCredentials,
         last_assoc: Duration,
     },
     StaReassociating {
         wifi: StaWifi<'static>,
         server: EspHttpServer<'static>,
         mdns: EspMdns,
+        creds: WifiCredentials,
         last_assoc: Duration,
     },
 }
@@ -149,9 +150,7 @@ impl NetState {
             NetState::BootNoCreds { .. }
             | NetState::CaptiveFailed { .. }
             | NetState::CaptiveFallbackRetrying { .. } => NetStatus::Captive,
-            NetState::CaptiveSubmitted { .. } | NetState::CaptiveTrying { .. } => {
-                NetStatus::CaptiveTrying
-            }
+            NetState::CaptiveTrying { .. } => NetStatus::CaptiveTrying,
             NetState::StaConnecting { .. } | NetState::StaReassociating { .. } => {
                 NetStatus::Connecting
             }

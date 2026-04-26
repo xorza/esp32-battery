@@ -16,13 +16,12 @@ representable.
 | # | State | Radio | Servers up | Creds on radio | LCD |
 |---|---|---|---|---|---|
 | 1 | `BootNoCreds` | Mixed | captive | none | `Captive` |
-| 2 | `CaptiveSubmitted` | Mixed | captive | freshly submitted, not yet applied | `CaptiveTrying` |
-| 3 | `CaptiveTrying` | Mixed | captive | applied, association in flight (≤ 20 s) | `CaptiveTrying` |
-| 4 | `CaptiveFailed` | Mixed | captive | last attempt failed | `Captive` (with error) |
-| 5 | `CaptiveFallbackRetrying` | Mixed | captive | known-good creds, STA half retrying in background | `Captive` |
-| 6 | `StaConnecting` | STA-only | dashboard | known, never associated this session | `Connecting` |
-| 7 | `StaHost` | STA-only | dashboard + mDNS | known, associated | `Host` |
-| 8 | `StaReassociating` | STA-only | dashboard + mDNS | known, link briefly dropped | `Connecting` |
+| 2 | `CaptiveTrying` | Mixed | captive | applied, association in flight (≤ 20 s) | `CaptiveTrying` |
+| 3 | `CaptiveFailed` | Mixed | captive | last attempt failed | `Captive` (with error) |
+| 4 | `CaptiveFallbackRetrying` | Mixed | captive | known-good creds, STA half retrying in background | `Captive` |
+| 5 | `StaConnecting` | STA-only | dashboard | known, never associated this session | `Connecting` |
+| 6 | `StaHost` | STA-only | dashboard + mDNS | known, associated | `Host` |
+| 7 | `StaReassociating` | STA-only | dashboard + mDNS | known, link briefly dropped | `Connecting` |
 
 ## Transitions
 
@@ -34,15 +33,22 @@ Triggers:
 - **timeout:20s** — `CaptiveTrying` association budget expired
 - **timeout:2h** — STA-side fallback grace expired
 
+Drain semantics: when the supervisor sees a fresh `/save` payload in
+the mailbox during a captive-arm tick, it applies the creds to the
+radio (`set_sta_creds`), flips the submission status to `Trying`, and
+transitions directly to `CaptiveTrying`. Within `CaptiveTrying` and
+`CaptiveFallbackRetrying`, the **assoc-success check runs before the
+mailbox drain** so a /save that arrives in the same tick as a
+late-but-successful association can't disconnect us.
+
 | From | Trigger | To | Action |
 |---|---|---|---|
 | (start) | boot, no NVS creds | `BootNoCreds` | start Mixed, mount captive |
 | (start) | boot, NVS creds present | `StaConnecting` | start STA-only with creds, start dashboard |
-| `BootNoCreds` | /save | `CaptiveSubmitted` | park creds |
-| `CaptiveFailed` | /save | `CaptiveSubmitted` | park creds |
-| `CaptiveFallbackRetrying` | /save | `CaptiveSubmitted` | park creds (overrides carry-over) |
-| `CaptiveTrying` | /save | `CaptiveSubmitted` | park new creds (overrides in-flight attempt) |
-| `CaptiveSubmitted` | tick | `CaptiveTrying` | apply creds to radio, status → Trying, 20 s deadline runs from /save |
+| `BootNoCreds` | /save (drain) | `CaptiveTrying` | apply creds, status → Trying, 20 s deadline starts |
+| `CaptiveFailed` | /save (drain) | `CaptiveTrying` | apply creds, status → Trying, 20 s deadline starts |
+| `CaptiveFallbackRetrying` | /save (drain) | `CaptiveTrying` | apply creds, status → Trying (overrides carry-over) |
+| `CaptiveTrying` | /save (drain) | `CaptiveTrying` | apply new creds, restart 20 s window (overrides in-flight attempt; only fires if assoc didn't already succeed this tick) |
 | `CaptiveTrying` | tick:assoc | `StaHost` | persist creds to NVS, drop captive bundle, switch radio to STA-only, start dashboard + mDNS |
 | `CaptiveTrying` | timeout:20s | `CaptiveFailed` | status → Failed, captive page shows error |
 | `CaptiveFallbackRetrying` | tick:assoc | `StaHost` | drop captive bundle, switch radio to STA-only, start dashboard + mDNS |
@@ -52,26 +58,22 @@ Triggers:
 | `StaReassociating` | tick:assoc | `StaHost` | bump `last_assoc` |
 | `StaReassociating` | timeout:2h since last assoc | `CaptiveFallbackRetrying` | drop dashboard + mDNS, switch radio to Mixed (carry creds), mount captive |
 
-States 1/4/5 and 6/8 with no listed trigger simply stay put.
+States 1/3/4 and 5/7 with no listed trigger simply stay put.
 
 ## Credential ownership
 
-Credentials live in **NVS** (`nvs_creds::{load, save, clear}`) and on
-the **radio config** (set via `MixedWifi::set_sta_creds` /
-`into_sta`). The FSM only carries an in-memory copy during the
-*un-persisted window* — between `/save` and the success that writes
-them to NVS. Outside that window, the FSM reads from NVS or the radio,
-not from a variant field.
+NVS is the durable store. Every variant that has creds at runtime
+carries them in the variant — the supervisor never reads NVS per tick.
+NVS is written exactly once per successful association
+(`CaptiveTrying → StaHost`, `CaptiveFallbackRetrying → StaHost`) so
+bad creds can't overwrite a known-good pair.
 
-| Variant | Creds in variant? | Source of truth |
-|---|---|---|
-| `BootNoCreds`, `CaptiveFailed` | no | — |
-| `CaptiveSubmitted`, `CaptiveTrying` | **yes** | variant (not yet in NVS) |
-| `CaptiveFallbackRetrying` | no | NVS + radio |
-| `StaConnecting`, `StaHost`, `StaReassociating` | no | NVS + radio |
-
-On `CaptiveTrying → StaHost`: take the creds out of the variant,
-`nvs_creds::save(...)`, then construct `StaHost` without them.
+| Variant | Creds in variant? |
+|---|---|
+| `BootNoCreds` | no (NVS is empty by definition) |
+| `CaptiveFailed` | no (last attempt's creds intentionally dropped — captive page is source of truth on retry) |
+| `CaptiveTrying`, `CaptiveFallbackRetrying` | **yes** |
+| `StaConnecting`, `StaHost`, `StaReassociating` | **yes** |
 
 ## Submission status (captive-page UX only)
 
@@ -89,13 +91,12 @@ which it treats as success.
 ```rust
 enum NetState {
     BootNoCreds              { wifi: MixedWifi, bundle: CaptiveBundle },
-    CaptiveSubmitted         { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds, since: Duration },
     CaptiveTrying            { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds, since: Duration },
     CaptiveFailed            { wifi: MixedWifi, bundle: CaptiveBundle },
-    CaptiveFallbackRetrying  { wifi: MixedWifi, bundle: CaptiveBundle },
-    StaConnecting            { wifi: StaWifi,   server: HttpServer, session_start: Duration },
-    StaHost                  { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, last_assoc: Duration },
-    StaReassociating         { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, last_assoc: Duration },
+    CaptiveFallbackRetrying  { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds },
+    StaConnecting            { wifi: StaWifi,   server: HttpServer, creds: Creds, session_start: Duration },
+    StaHost                  { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, creds: Creds, last_assoc: Duration },
+    StaReassociating         { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, creds: Creds, last_assoc: Duration },
 }
 ```
 
@@ -112,4 +113,5 @@ relevant captive-arm ticks; latest submission wins.
 - 2 h — STA-side fallback grace (`StaConnecting` from boot, or
   `StaReassociating` since last associated tick).
 - 10 s — captive scan-cache TTL (refreshed by the supervisor on every
-  captive-arm tick where STA is not mid-association — states 1, 4, 5).
+  captive-arm tick where STA is not mid-association — states
+  `BootNoCreds`, `CaptiveFailed`, `CaptiveFallbackRetrying`).
