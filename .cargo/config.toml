@@ -24,4 +24,3 @@ build-std = ["std", "panic_abort"]
 MCU = { value = "esp32c6", relative = false }
 ESP_IDF_VERSION = "v6.0"
 ESP_IDF_TOOLS_INSTALL_DIR = "global"
-LIBCLANG_PATH = { value = "/usr/lib/llvm19/lib/", force = true }
