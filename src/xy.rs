@@ -89,8 +89,15 @@ impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rtu(e) => std::fmt::Display::fmt(e, f),
-            Self::Verify { what, expected, actual } => {
-                write!(f, "{what} readback mismatch: expected {expected:.2}, got {actual:.2}")
+            Self::Verify {
+                what,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "{what} readback mismatch: expected {expected:.2}, got {actual:.2}"
+                )
             }
         }
     }
@@ -342,7 +349,11 @@ fn verify(what: &'static str, expected: f32, actual: f32) -> Result<(), BootErro
     if (expected - actual).abs() < 0.02 {
         Ok(())
     } else {
-        Err(BootError::Verify { what, expected, actual })
+        Err(BootError::Verify {
+            what,
+            expected,
+            actual,
+        })
     }
 }
 
@@ -411,10 +422,12 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
                     false
                 }
             };
+
             let battery = sd.battery_reading().map(|b| BatterySample {
                 voltage: b.voltage,
                 current: b.current,
             });
+
             (modbus_ok, battery)
         };
 
