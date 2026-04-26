@@ -76,6 +76,29 @@ impl SubmissionStatusHandle {
     }
 }
 
+/// One-shot signal raised by the `/wifi-reset` handler and consumed by
+/// the supervisor on its next tick. The handler clears NVS creds; the
+/// supervisor drops the live association and returns the FSM to
+/// `CaptiveIdle`. An atomic so the HTTP handler thread can signal
+/// without holding any FSM lock.
+#[derive(Clone)]
+pub struct ResetSignal(Arc<std::sync::atomic::AtomicBool>);
+
+impl ResetSignal {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Atomically reads-and-clears the flag.
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Relaxed)
+    }
+}
+
 /// Single-slot creds mailbox. `/save` writes; the supervisor `take`s on
 /// the next captive-arm tick. Latest-submission-wins — a second `/save`
 /// before the supervisor drains overwrites the first. Wrapped in
@@ -178,8 +201,14 @@ impl NetState {
             }
             NetState::CaptiveTrying { .. } => NetStatus::CaptiveTrying,
             NetState::StaConnecting { .. } => NetStatus::Connecting,
-            NetState::StaServing { link: LinkState::Up, .. } => NetStatus::Host,
-            NetState::StaServing { link: LinkState::Down { .. }, .. } => NetStatus::Connecting,
+            NetState::StaServing {
+                link: LinkState::Up,
+                ..
+            } => NetStatus::Host,
+            NetState::StaServing {
+                link: LinkState::Down { .. },
+                ..
+            } => NetStatus::Connecting,
         }
     }
 }

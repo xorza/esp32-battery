@@ -33,7 +33,7 @@ use esp32_battery_logic::save_scheduler::{DEFAULT_SAVE_INTERVAL_S, SaveScheduler
 
 use crate::clock::{EventRecorder, uptime};
 use crate::history_store::{HistoryStore, Persister};
-use crate::net::{LinkState, NetState, NetStatusHandle, SubmissionStatus};
+use crate::net::{LinkState, NetState, NetStatusHandle, ResetSignal, SubmissionStatus};
 use crate::nvs_creds::WifiCredentials;
 
 /// How long `is_connected() == false` may persist before we tear down
@@ -57,6 +57,7 @@ struct StaCtx {
     sensor_data: Arc<Mutex<SensorData>>,
     event_log: Arc<Mutex<EventLog>>,
     nvs: Arc<EspNvs<NvsDefault>>,
+    reset: ResetSignal,
 }
 
 impl StaCtx {
@@ -65,6 +66,7 @@ impl StaCtx {
             self.sensor_data.clone(),
             self.event_log.clone(),
             self.nvs.clone(),
+            self.reset.clone(),
         )
     }
 }
@@ -131,10 +133,12 @@ fn main() {
         net_status.clone(),
     );
 
+    let reset = ResetSignal::new();
     let sta_ctx = StaCtx {
         sensor_data,
         event_log,
         nvs: nvs.clone(),
+        reset,
     };
 
     // Bootstrap per `wifi_fsm.md`: STA if we have creds, captive otherwise.
@@ -165,8 +169,39 @@ fn main() {
         let now = uptime();
         persister.tick(clock.epoch_s());
 
+        if sta_ctx.reset.take() {
+            state = force_captive_idle(state);
+        }
         state = step(state, now, &sta_ctx);
         net_status.store(state.lcd_status());
+    }
+}
+
+/// Drop the live STA association and return the FSM to `CaptiveIdle`.
+/// Only reachable from the dashboard's `/wifi-reset`, which is mounted
+/// only on the host server — captive states cannot raise the signal.
+fn force_captive_idle(state: NetState) -> NetState {
+    match state {
+        NetState::StaConnecting { wifi, server, .. } => sta_to_captive_idle(wifi, server, None),
+        NetState::StaServing {
+            wifi, server, mdns, ..
+        } => sta_to_captive_idle(wifi, server, Some(mdns)),
+        _ => unreachable!("/wifi-reset only reachable from dashboard (Sta* states)"),
+    }
+}
+
+fn sta_to_captive_idle(
+    wifi: wifi::StaWifi<'static>,
+    server: EspHttpServer<'static>,
+    mdns: Option<esp_idf_svc::mdns::EspMdns>,
+) -> NetState {
+    drop(server);
+    drop(mdns);
+    let mixed = wifi.into_mixed(None);
+    let bundle = http::start_captive(mixed.scan_cache());
+    NetState::CaptiveIdle {
+        wifi: mixed,
+        bundle,
     }
 }
 

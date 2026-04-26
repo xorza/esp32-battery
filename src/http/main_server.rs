@@ -10,6 +10,7 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::EventLog;
 
+use crate::net::ResetSignal;
 use crate::{api, errors, log_ring, ota, wifi_reset};
 
 use super::{create_server, serve_common_assets, serve_static};
@@ -18,6 +19,7 @@ pub fn start(
     sensor_data: Arc<Mutex<SensorData>>,
     event_log: Arc<Mutex<EventLog>>,
     nvs: Arc<EspNvs<NvsDefault>>,
+    reset: ResetSignal,
 ) -> EspHttpServer<'static> {
     let mut server = create_server(10240, false, 4, Some(Duration::from_secs(0)), true);
 
@@ -42,7 +44,7 @@ pub fn start(
     api::mount(&mut server, sensor_data);
     errors::mount(&mut server, event_log);
     log_ring::mount(&mut server);
-    wifi_reset::mount(&mut server, nvs);
+    wifi_reset::mount(&mut server, nvs, reset);
     ota::mount(&mut server);
 
     server
