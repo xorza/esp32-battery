@@ -34,7 +34,7 @@ pub const HISTORY_CAPACITY: usize = (SERIALIZED_MAX_BYTES - HEADER_SIZE) / SAMPL
 /// further. 204 samples × 4 s ≈ 13.6 min.
 const MAX_INTERVAL: u32 = 4;
 
-const FORMAT_VERSION: u32 = 6;
+const FORMAT_VERSION: u32 = 7;
 
 const _: () = assert!(
     HISTORY_CAPACITY.is_multiple_of(2),
