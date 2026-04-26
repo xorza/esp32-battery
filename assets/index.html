@@ -9,8 +9,8 @@
     </head>
     <body style="opacity:0;transition:opacity .15s">
         <div class="card hero">
-            <div class="hero-status">
-                <span class="status-dot" id="s1_status_dot"></span>
+            <div class="hero-status" id="s1_status_row">
+                <span class="status-dot"></span>
                 <span id="s1_status">--</span>
             </div>
             <div class="hero-soc" id="s1_soc">--%</div>
@@ -27,11 +27,11 @@
             <div class="card-title">Battery:</div>
             <div class="metrics">
                 <div class="metric">
-                    <div class="metric-value a" id="s1_current">--</div>
+                    <div class="metric-value c-battery" id="s1_current">--</div>
                     <div class="metric-label">Current (A)</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-value a" id="s1_power">--</div>
+                    <div class="metric-value c-battery" id="s1_power">--</div>
                     <div class="metric-label">Power (W)</div>
                 </div>
             </div>
@@ -40,19 +40,15 @@
             <div class="card-title">Power supply:</div>
             <div class="metrics">
                 <div class="metric">
-                    <div class="metric-value a2" id="s2_current">--</div>
+                    <div class="metric-value c-psu" id="s2_current">--</div>
                     <div class="metric-label">Current (A)</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-value a2" id="s2_power">--</div>
+                    <div class="metric-value c-psu" id="s2_power">--</div>
                     <div class="metric-label">Power (W)</div>
                 </div>
                 <div class="metric">
-                    <div
-                        class="metric-value"
-                        style="color: #f87171"
-                        id="s2_offline"
-                    >
+                    <div class="metric-value c-discharging" id="s2_offline">
                         --
                     </div>
                     <div class="metric-label">Offline</div>
@@ -72,11 +68,7 @@
                 </tr>
                 <tr>
                     <td>
-                        <span
-                            class="legend-dot"
-                            style="background: #39ff14"
-                        ></span
-                        >Voltage
+                        <span class="legend-dot v"></span>Voltage
                     </td>
                     <td id="st_v_min">--</td>
                     <td id="st_v_avg">--</td>
@@ -84,11 +76,7 @@
                 </tr>
                 <tr>
                     <td>
-                        <span
-                            class="legend-dot"
-                            style="background: #00e5ff"
-                        ></span
-                        >Battery current
+                        <span class="legend-dot c1"></span>Battery current
                     </td>
                     <td id="st_c1_min">--</td>
                     <td id="st_c1_avg">--</td>
@@ -96,11 +84,7 @@
                 </tr>
                 <tr>
                     <td>
-                        <span
-                            class="legend-dot"
-                            style="background: #ff9800"
-                        ></span
-                        >Power supply current
+                        <span class="legend-dot c2"></span>Power supply current
                     </td>
                     <td id="st_c2_min">--</td>
                     <td id="st_c2_avg">--</td>
@@ -127,6 +111,15 @@
         <script>
             const $ = (id) => document.getElementById(id);
             const IDLE_CURRENT_A = 0.1;
+
+            const css = getComputedStyle(document.documentElement);
+            const C = {
+                accent: css.getPropertyValue("--accent").trim(),
+                battery: css.getPropertyValue("--c-battery").trim(),
+                psu: css.getPropertyValue("--c-psu").trim(),
+                discharging: css.getPropertyValue("--c-discharging").trim(),
+                dim: css.getPropertyValue("--fg-dim").trim(),
+            };
 
             function formatUptime(s) {
                 const d = Math.floor(s / 86400);
@@ -168,20 +161,19 @@
                     .then((r) => r.json())
                     .then((d) => {
                         // Battery hero
-                        let status, color;
+                        let status, cls;
                         if (d.battery.current < -IDLE_CURRENT_A) {
                             status = "Charging";
-                            color = "#4ade80";
+                            cls = "charging";
                         } else if (d.battery.current > IDLE_CURRENT_A) {
                             status = "Discharging";
-                            color = "#f87171";
+                            cls = "discharging";
                         } else {
                             status = "Idle";
-                            color = "#555";
+                            cls = "idle";
                         }
                         $("s1_status").textContent = status;
-                        $("s1_status").style.color = color;
-                        $("s1_status_dot").style.background = color;
+                        $("s1_status_row").className = "hero-status " + cls;
                         $("s1_soc").textContent = d.battery.soc.toFixed(1) + "%";
                         $("s1_bar").style.width = d.battery.soc + "%";
                         $("s1_bar").style.backgroundSize =
@@ -289,11 +281,12 @@
                     zero: true,
                 });
 
-                // Draw red background for power-offline spans (alpha scales with offline fraction)
+                // Draw red background for power-offline spans (alpha scales with offline fraction).
+                // Channels match --c-discharging (#f87171) so the overlay reads as the same red.
                 for (let i = 0; i < powerOnline.length; i++) {
                     if (powerOnline[i] < 0.99) {
                         const alpha = 0.35 * (1 - powerOnline[i]);
-                        ctx.fillStyle = "rgba(200, 30, 30, " + alpha + ")";
+                        ctx.fillStyle = "rgba(248, 113, 113, " + alpha + ")";
                         const x0 =
                             i > 0
                                 ? pad.l +
@@ -312,7 +305,7 @@
                     }
                 }
 
-                ctx.strokeStyle = "#1a1a1a";
+                ctx.strokeStyle = css.getPropertyValue("--bg-inset").trim();
                 ctx.lineWidth = 1;
                 for (let i = 0; i <= 4; i++) {
                     const y = pad.t + (cH * i) / 4;
@@ -345,14 +338,14 @@
                     ctx.fillText(yMin.toFixed(1) + unit, x, pad.t + cH);
                 }
 
-                drawLine(voltages, vMin, vMax, "#39ff14");
-                drawAxisLabels(vMin, vMax, "#39ff14", "left", "V");
+                drawLine(voltages, vMin, vMax, C.accent);
+                drawAxisLabels(vMin, vMax, C.accent, "left", "V");
 
-                drawLine(currents1, cMin, cMax, "#00e5ff");
-                drawLine(currents2, cMin, cMax, "#ff9800");
-                drawAxisLabels(cMin, cMax, "#00e5ff", "right", "A");
+                drawLine(currents1, cMin, cMax, C.battery);
+                drawLine(currents2, cMin, cMax, C.psu);
+                drawAxisLabels(cMin, cMax, C.battery, "right", "A");
 
-                ctx.fillStyle = "#555";
+                ctx.fillStyle = C.dim;
                 ctx.font = "11px sans-serif";
                 ctx.textAlign = "center";
                 let timeLabel;

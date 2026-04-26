@@ -1,8 +1,29 @@
+/* Palette — semantic tokens shared with the LCD (src/lcd.rs).
+   LCD uses Rgb565-quantized variants of these same hues. */
+:root {
+    --bg: #0a0a0a;
+    --bg-card: #111;
+    --bg-inset: #1a1a1a;
+    --border: #222;
+
+    --fg: #eee;
+    --fg-muted: #888;
+    --fg-dim: #555;
+
+    --accent: #39ff14; /* primary neon green: voltage, hero, button, links (LCD: COLOR_VOLTAGE) */
+    --c-battery: #00e5ff; /* battery current cyan (LCD: COLOR_IP) */
+    --c-psu: #ff9800; /* PSU current orange (LCD: COLOR_PSU_CURRENT) */
+    --c-charging: #4ade80; /* charging green (LCD: COLOR_CHARGING) */
+    --c-discharging: #f87171; /* discharging / error red (LCD: COLOR_DISCHARGING is orange — LCD reserves red for warnings) */
+    --c-warning: #ff3d00; /* gradient low-end (LCD: COLOR_WARNING) */
+    --c-warning-mid: #ffdd00; /* gradient mid */
+}
+
 body {
     font-family: sans-serif;
     font-size: 22px;
-    background: #0a0a0a;
-    color: #eee;
+    background: var(--bg);
+    color: var(--fg);
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -13,17 +34,17 @@ body {
 }
 
 a {
-    color: #39ff14;
+    color: var(--accent);
 }
 
 h1 {
     margin: 0 0 0.8em 0;
     font-size: 1.3em;
-    color: #39ff14;
+    color: var(--accent);
 }
 
 .card {
-    background: #111;
+    background: var(--bg-card);
     border-radius: 12px;
     padding: 0.9em 1.2em;
     width: 100%;
@@ -37,7 +58,7 @@ h1 {
 
 .card-title {
     font-size: 0.8em;
-    color: #555;
+    color: var(--fg-dim);
     margin-bottom: 0.5em;
 }
 
@@ -52,7 +73,7 @@ h1 {
     justify-content: center;
     gap: 0.5em;
     font-size: 0.9em;
-    color: #555;
+    color: var(--fg-dim);
     margin-bottom: 0.3em;
 }
 
@@ -60,19 +81,29 @@ h1 {
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: #555;
+    background: currentColor;
+}
+
+.hero-status.charging {
+    color: var(--c-charging);
+}
+.hero-status.discharging {
+    color: var(--c-discharging);
+}
+.hero-status.idle {
+    color: var(--fg-dim);
 }
 
 .hero-soc {
     font-size: 2.7em;
     font-weight: bold;
-    color: #39ff14;
+    color: var(--accent);
     line-height: 1.1;
 }
 
 .hero-voltage {
     font-size: 1.1em;
-    color: #888;
+    color: var(--fg-muted);
     margin-bottom: 0.3em;
 }
 
@@ -94,12 +125,12 @@ h1 {
 
 .metric-label {
     font-size: 0.75em;
-    color: #555;
+    color: var(--fg-dim);
     margin-top: 0.2em;
 }
 
 .bar-bg {
-    background: #1a1a1a;
+    background: var(--bg-inset);
     border-radius: 6px;
     height: 18px;
     margin-top: 0.8em;
@@ -109,28 +140,33 @@ h1 {
 .bar-fill {
     height: 100%;
     border-radius: 6px;
-    background: #39ff14;
+    background: var(--accent);
     transition: width 0.3s;
     width: 0%;
 }
 
 .bar-fill.gradient {
-    background: linear-gradient(to right, #ff3d00, #ffdd00 50%, #39ff14 100%);
+    background: linear-gradient(
+        to right,
+        var(--c-warning),
+        var(--c-warning-mid) 50%,
+        var(--accent) 100%
+    );
     transition: width 0.5s;
 }
 
 .muted {
-    color: #555;
+    color: var(--fg-dim);
 }
 
-.a {
-    color: #00e5ff;
+.c-battery {
+    color: var(--c-battery);
 }
-.a2 {
-    color: #ff9800;
+.c-psu {
+    color: var(--c-psu);
 }
-.charge-pos {
-    color: #4ade80;
+.c-discharging {
+    color: var(--c-discharging);
 }
 
 .metrics + .metrics {
@@ -143,7 +179,7 @@ h1 {
 
 .chart-title {
     font-size: 1em;
-    color: #555;
+    color: var(--fg-dim);
     margin: 0 0 0.8em 0;
 }
 
@@ -157,7 +193,7 @@ canvas {
     width: 100%;
     margin-top: 0.5em;
     font-size: 0.65em;
-    color: #eee;
+    color: var(--fg);
     border-collapse: collapse;
 }
 
@@ -168,11 +204,11 @@ canvas {
 
 .stats-table td:first-child {
     text-align: left;
-    color: #555;
+    color: var(--fg-dim);
 }
 
 .stats-header td {
-    color: #555;
+    color: var(--fg-dim);
     font-size: 0.9em;
 }
 
@@ -185,12 +221,22 @@ canvas {
     vertical-align: middle;
 }
 
+.legend-dot.v {
+    background: var(--accent);
+}
+.legend-dot.c1 {
+    background: var(--c-battery);
+}
+.legend-dot.c2 {
+    background: var(--c-psu);
+}
+
 /* Forms */
 label {
     display: block;
     margin: 0.8em 0 0.3em;
     font-size: 0.8em;
-    color: #555;
+    color: var(--fg-dim);
 }
 
 select,
@@ -199,10 +245,10 @@ input[type="password"],
 input[type="file"] {
     width: 100%;
     padding: 0.6em;
-    background: #1a1a1a;
-    border: 1px solid #222;
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
     border-radius: 6px;
-    color: #eee;
+    color: var(--fg);
     font-size: 1em;
     box-sizing: border-box;
 }
@@ -254,7 +300,7 @@ button {
     margin-top: 1em;
     width: 100%;
     padding: 0.8em;
-    background: #39ff14;
+    background: var(--accent);
     color: #000;
     border: none;
     border-radius: 6px;
@@ -264,8 +310,8 @@ button {
 }
 
 button:disabled {
-    background: #222;
-    color: #555;
+    background: var(--border);
+    color: var(--fg-dim);
     cursor: not-allowed;
 }
 
@@ -278,20 +324,20 @@ button:disabled {
 }
 
 .msg.ok {
-    background: #1b5e20;
-    color: #a5d6a7;
+    background: var(--bg-inset);
+    color: var(--c-charging);
     display: block;
 }
 
 .msg.err {
-    background: #b71c1c;
-    color: #ef9a9a;
+    background: var(--bg-inset);
+    color: var(--c-discharging);
     display: block;
 }
 
 .msg.progress {
-    background: #1a1a1a;
-    color: #eee;
+    background: var(--bg-inset);
+    color: var(--fg);
     display: block;
 }
 
@@ -308,7 +354,7 @@ button:disabled {
     display: flex;
     gap: 0.6em;
     padding: 0.25em 0;
-    border-bottom: 1px solid #1a1a1a;
+    border-bottom: 1px solid var(--bg-inset);
 }
 
 .errors-list li:last-child {
@@ -316,20 +362,20 @@ button:disabled {
 }
 
 .err-time {
-    color: #555;
+    color: var(--fg-dim);
     flex-shrink: 0;
     min-width: 6em;
 }
 
 .err-src {
-    color: #888;
+    color: var(--fg-muted);
     flex-shrink: 0;
     min-width: 2.5em;
     text-transform: uppercase;
 }
 
 .err-kind {
-    color: #f87171;
+    color: var(--c-discharging);
     flex: 1;
 }
 
@@ -339,7 +385,7 @@ button:disabled {
     max-width: 500px;
     margin-top: 1em;
     font-size: 0.65em;
-    color: #555;
+    color: var(--fg-dim);
 }
 
 .wifi-icon {
@@ -371,5 +417,5 @@ button:disabled {
 }
 
 .wifi-bar.active {
-    background: #4ade80;
+    background: var(--c-charging);
 }
