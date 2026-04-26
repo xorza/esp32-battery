@@ -81,14 +81,17 @@ so bad creds can't overwrite a known-good pair.
 ## Submission status (captive-page UX only)
 
 A `SubmissionStatusHandle` (atomic, shared with the HTTP handler)
-reports `Idle | Pending | Trying | Failed` on `/status` so the captive
-page's spinner / error UI can poll it.
+reports `Idle | Pending | Trying | Failed | Connected` on `/status` so
+the captive page's spinner / success / error UI can poll it.
 
 - `/save` handler sets `Pending` immediately on mailbox-write.
 - Supervisor's `apply_submission` (drain step) sets `Trying`.
 - Supervisor sets `Failed` on the 20 s timeout.
-- Successful association drops the whole captive bundle — the page's
-  `/status` poll then errors, which the page treats as success.
+- On successful association the supervisor sets `Connected` and lingers
+  ~1.5 s before tearing down the captive bundle — long enough for the
+  page's 1 Hz `/status` poll to pick up the explicit `Connected` state
+  before the AP disappears. After the linger the bundle drops, the
+  radio switches to STA-only, and the dashboard comes up.
 
 ## Sketch
 
