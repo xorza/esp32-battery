@@ -389,6 +389,20 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
                         current: s.i_out,
                         power: s.p_out,
                     });
+                    // Setpoint drift = buck is sourcing under unknown
+                    // settings. Latch SettingsDrift; the next supervisor
+                    // tick will emit DisableOutput.
+                    let want_v = supervisor.target_voltage();
+                    let want_i = PACK_PROFILE.regulation_a;
+                    let v_drift = (s.v_set - want_v).abs() >= 0.02;
+                    let i_drift = (s.i_set - want_i).abs() >= 0.02;
+                    if v_drift || i_drift {
+                        error!(
+                            "XY setpoint drift: V_SET want {want_v:.2} got {:.2}, I_SET want {want_i:.2} got {:.2}",
+                            s.v_set, s.i_set
+                        );
+                        supervisor.force_fault(FaultReason::SettingsDrift);
+                    }
                     true
                 }
                 Err(e) => {
@@ -423,6 +437,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
                     FaultReason::ModbusUnhealthy => "modbus link unhealthy",
                     FaultReason::Overvoltage => "pack overvoltage",
                     FaultReason::AbsorbTimeout => "absorb time cap reached",
+                    FaultReason::SettingsDrift => "setpoint readback drift",
                 };
                 match xy.set_output(false) {
                     Ok(()) => {

@@ -132,6 +132,12 @@ pub enum FaultReason {
     /// pinning current above `exit_absorb_a` we'd otherwise sit at CV
     /// forever.
     AbsorbTimeout,
+    /// XY7025 setpoint readback (V_SET or I_SET) disagreed with what we
+    /// commanded. The buck is sourcing under unknown setpoints — disable
+    /// before it can do damage. Triggers immediately, no debounce: the
+    /// caller already verified the read itself succeeded, so this isn't
+    /// a transport glitch.
+    SettingsDrift,
 }
 
 /// What the poll loop should do this tick. The supervisor never enables the
@@ -277,6 +283,18 @@ impl ChargeSupervisor {
         }
     }
 
+    /// Caller-driven latch for faults the supervisor can't observe itself
+    /// (e.g. setpoint readback drift detected by the Modbus thread). No-op
+    /// if already latched — first reason wins, matching the internal paths.
+    pub fn force_fault(&mut self, reason: FaultReason) {
+        if matches!(self.latch, LatchState::Active) {
+            self.latch = LatchState::Tripped {
+                reason,
+                acked: false,
+            };
+        }
+    }
+
     /// Caller invokes this after a successful `set_output(false)` Modbus write.
     /// Until then, the supervisor will keep emitting `DisableOutput` so a
     /// failed disable write gets retried on every tick.
@@ -309,7 +327,10 @@ impl ChargeSupervisor {
             LatchState::Active => {}
         }
 
-        if self.modbus_err.step(!modbus_ok, elapsed, MODBUS_UNHEALTHY_TIMEOUT) {
+        if self
+            .modbus_err
+            .step(!modbus_ok, elapsed, MODBUS_UNHEALTHY_TIMEOUT)
+        {
             return self.latch(FaultReason::ModbusUnhealthy);
         }
 

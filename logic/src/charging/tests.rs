@@ -755,3 +755,26 @@ fn supervisor_latches_on_absorb_timeout() {
     let a = s.tick(true, b(13.5, -3.0), TICK);
     assert!(matches_disable(&a, FaultReason::AbsorbTimeout));
 }
+
+#[test]
+fn force_fault_latches_immediately() {
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    s.force_fault(FaultReason::SettingsDrift);
+    assert!(matches!(s.fault(), Some(FaultReason::SettingsDrift)));
+    // Next tick emits DisableOutput regardless of healthy inputs.
+    let a = s.tick(true, b(13.5, -1.0), TICK);
+    assert!(matches_disable(&a, FaultReason::SettingsDrift));
+}
+
+#[test]
+fn force_fault_does_not_overwrite_existing_latch() {
+    // First latch wins — matches the internal-path behavior where the
+    // supervisor checks faults in priority order and returns on the first hit.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
+        s.tick(false, b(13.5, -0.1), TICK);
+    }
+    assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
+    s.force_fault(FaultReason::SettingsDrift);
+    assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
+}
