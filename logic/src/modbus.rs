@@ -122,6 +122,31 @@ impl std::fmt::Display for ModbusError {
     }
 }
 
+/// Unified error for a Modbus-RTU transaction: transport (UART) or
+/// protocol (codec). Lives here so consumers don't have to define
+/// their own wrapper.
+pub enum RtuError {
+    UartRead,
+    UartWrite,
+    Modbus(ModbusError),
+}
+
+impl std::fmt::Display for RtuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UartRead => write!(f, "UART read failed"),
+            Self::UartWrite => write!(f, "UART write failed"),
+            Self::Modbus(e) => std::fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl From<ModbusError> for RtuError {
+    fn from(e: ModbusError) -> Self {
+        Self::Modbus(e)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

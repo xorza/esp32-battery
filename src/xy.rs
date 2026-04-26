@@ -24,7 +24,7 @@ use esp32_battery_logic::charging::{
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
-use esp32_battery_logic::modbus::ModbusError;
+use esp32_battery_logic::modbus::RtuError;
 
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
@@ -51,64 +51,35 @@ struct XyStatus {
     v_in: f32,
 }
 
-/// Transport-level error for the buck. Wraps the pure-codec
-/// `ModbusError` and carries the two UART-side outcomes that don't
-/// belong in the codec module (which is host-testable and has no I/O).
-/// `UartRead`/`UartWrite` only fire on the real UART path; under
-/// `xy-fake` the fake device never errs, hence the lint allow.
-#[allow(dead_code)]
-pub enum XyIoError {
-    UartRead,
-    UartWrite,
-    Modbus(ModbusError),
-}
-
-impl std::fmt::Display for XyIoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UartRead => write!(f, "UART read failed"),
-            Self::UartWrite => write!(f, "UART write failed"),
-            Self::Modbus(e) => std::fmt::Display::fmt(e, f),
-        }
-    }
-}
-
-impl From<ModbusError> for XyIoError {
-    fn from(e: ModbusError) -> Self {
-        Self::Modbus(e)
-    }
-}
-
 /// The set of operations the charging loop needs from the buck. Real
 /// builds get the UART-backed implementation; `xy-fake` builds get an
 /// in-memory canned device. The thread loop is identical for both.
+/// `RtuError` is the trait error type because every failure mode the
+/// supervisor cares about today is a Modbus-RTU transport failure.
 trait XyDevice {
-    fn read_status(&self) -> Result<XyStatus, XyIoError>;
-    fn set_voltage(&self, volts: f32) -> Result<(), XyIoError>;
-    fn set_current_limit(&self, amps: f32) -> Result<(), XyIoError>;
-    fn set_protection(&self, limits: SafetyLimits) -> Result<(), XyIoError>;
-    fn set_output(&self, on: bool) -> Result<(), XyIoError>;
-    fn set_power_on_default_off(&self) -> Result<(), XyIoError>;
+    fn read_status(&self) -> Result<XyStatus, RtuError>;
+    fn set_voltage(&self, volts: f32) -> Result<(), RtuError>;
+    fn set_current_limit(&self, amps: f32) -> Result<(), RtuError>;
+    fn set_protection(&self, limits: SafetyLimits) -> Result<(), RtuError>;
+    fn set_output(&self, on: bool) -> Result<(), RtuError>;
+    fn set_power_on_default_off(&self) -> Result<(), RtuError>;
 }
 
 // --- Real device ------------------------------------------------------------
 
 #[cfg(not(feature = "xy-fake"))]
 mod real {
-    use std::thread;
     use std::time::Duration;
 
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
     use esp32_battery_logic::charging::SafetyLimits;
-    use esp32_battery_logic::modbus::{
-        build_read_request, build_write_request, parse_read_response, parse_write_response,
-    };
+    use esp32_battery_logic::modbus::RtuError;
 
-    use super::{XyDevice, XyIoError, XyStatus};
+    use super::{XyDevice, XyStatus};
     use crate::board::XyPins;
-    use crate::clock::uptime;
+    use crate::modbus_rtu::{ModbusRtu, RtuConfig};
 
     const SLAVE: u8 = 0x01;
     const REG_V_SET: u16 = 0x0000;
@@ -123,15 +94,9 @@ mod real {
     /// supervising.
     const REG_S_INI: u16 = 0x005D;
     const BAUD: u32 = 115200;
-    const RESPONSE_TIMEOUT_MS: u64 = 500;
-    /// Silence enforced after every write so the XY has time to process the
-    /// previous command and re-arm its Modbus listener. Spec floor at 115200
-    /// baud is 1.75 ms, but cheap Chinese slaves like the XY7025 empirically
-    /// want more.
-    const POST_WRITE_GAP: Duration = Duration::from_millis(10);
 
     pub struct Xy<'d> {
-        uart: UartDriver<'d>,
+        modbus: ModbusRtu<'d>,
     }
 
     impl<'d> Xy<'d> {
@@ -146,48 +111,23 @@ mod real {
                 &config,
             )
             .expect("UART1 init");
-            Self { uart }
-        }
-
-        fn write_holding(&self, addr: u16, value: u16) -> Result<(), XyIoError> {
-            let req = build_write_request(SLAVE, addr, value);
-            let mut resp = [0u8; 8];
-            let result = self
-                .transact(&req, &mut resp)
-                .and_then(|n| Ok(parse_write_response(&resp[..n], &req)?));
-            thread::sleep(POST_WRITE_GAP);
-            result
-        }
-
-        /// UART transaction: write request, collect reply until quiet-deadline.
-        /// Returns the number of response bytes received (>= 1).
-        fn transact(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, XyIoError> {
-            self.uart.clear_rx().ok();
-            self.uart.write(req).map_err(|_| XyIoError::UartWrite)?;
-            self.uart.wait_tx_done(100).ok();
-
-            let mut n = 0usize;
-            let deadline = uptime() + Duration::from_millis(RESPONSE_TIMEOUT_MS);
-            while n < resp.len() && uptime() < deadline {
-                match self.uart.read(&mut resp[n..], 2) {
-                    Ok(k) if k > 0 => n += k,
-                    _ if n > 0 => break,
-                    _ => {}
-                }
-            }
-            if n == 0 {
-                return Err(XyIoError::UartRead);
-            }
-            Ok(n)
+            // 500 ms response window + 10 ms post-write quiet gap are
+            // empirically what the XY7025 wants — tighter values cause
+            // the slave to miss back-to-back writes.
+            let modbus = ModbusRtu::new(
+                uart,
+                RtuConfig {
+                    response_timeout: Duration::from_millis(500),
+                    post_write_gap: Duration::from_millis(10),
+                },
+            );
+            Self { modbus }
         }
     }
 
     impl XyDevice for Xy<'_> {
-        fn read_status(&self) -> Result<XyStatus, XyIoError> {
-            let req = build_read_request(SLAVE, 0x0000, 6);
-            let mut resp = [0u8; 256];
-            let n = self.transact(&req, &mut resp)?;
-            let r = parse_read_response(&resp[..n], SLAVE, 6)?;
+        fn read_status(&self) -> Result<XyStatus, RtuError> {
+            let r = self.modbus.read_holding(SLAVE, 0x0000, 6)?;
             Ok(XyStatus {
                 v_set: r[0] as f32 / 100.0,
                 i_set: r[1] as f32 / 100.0,
@@ -198,31 +138,35 @@ mod real {
             })
         }
 
-        fn set_voltage(&self, volts: f32) -> Result<(), XyIoError> {
-            self.write_holding(REG_V_SET, (volts * 100.0).round() as u16)
+        fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
+            self.modbus
+                .write_holding(SLAVE, REG_V_SET, (volts * 100.0).round() as u16)
         }
 
-        fn set_current_limit(&self, amps: f32) -> Result<(), XyIoError> {
-            self.write_holding(REG_I_SET, (amps * 100.0).round() as u16)
+        fn set_current_limit(&self, amps: f32) -> Result<(), RtuError> {
+            self.modbus
+                .write_holding(SLAVE, REG_I_SET, (amps * 100.0).round() as u16)
         }
 
-        fn set_protection(&self, limits: SafetyLimits) -> Result<(), XyIoError> {
-            self.write_holding(REG_S_OVP, (limits.ovp_v * 100.0).round() as u16)?;
-            self.write_holding(REG_S_OCP, (limits.ocp_a * 100.0).round() as u16)?;
-            self.write_holding(REG_S_LVP, (limits.lvp_v * 100.0).round() as u16)?;
+        fn set_protection(&self, limits: SafetyLimits) -> Result<(), RtuError> {
+            self.modbus
+                .write_holding(SLAVE, REG_S_OVP, (limits.ovp_v * 100.0).round() as u16)?;
+            self.modbus
+                .write_holding(SLAVE, REG_S_OCP, (limits.ocp_a * 100.0).round() as u16)?;
+            self.modbus
+                .write_holding(SLAVE, REG_S_LVP, (limits.lvp_v * 100.0).round() as u16)?;
             Ok(())
         }
 
-        fn set_output(&self, on: bool) -> Result<(), XyIoError> {
-            self.write_holding(REG_OUTPUT_EN, if on { 1 } else { 0 })
+        fn set_output(&self, on: bool) -> Result<(), RtuError> {
+            self.modbus
+                .write_holding(SLAVE, REG_OUTPUT_EN, if on { 1 } else { 0 })
         }
 
-        fn set_power_on_default_off(&self) -> Result<(), XyIoError> {
-            self.write_holding(REG_S_INI, 0)
+        fn set_power_on_default_off(&self) -> Result<(), RtuError> {
+            self.modbus.write_holding(SLAVE, REG_S_INI, 0)
         }
     }
-
-    // Modbus frame tests live in esp32_battery_logic::modbus (host-runnable).
 }
 
 // --- Fake device ------------------------------------------------------------
@@ -235,8 +179,9 @@ mod fake {
     use esp_idf_hal::units::Hertz;
 
     use esp32_battery_logic::charging::SafetyLimits;
+    use esp32_battery_logic::modbus::RtuError;
 
-    use super::{XyDevice, XyIoError, XyStatus};
+    use super::{XyDevice, XyStatus};
     use crate::board::XyPins;
 
     const BAUD: u32 = 115200;
@@ -275,7 +220,7 @@ mod fake {
     }
 
     impl XyDevice for Xy<'_> {
-        fn read_status(&self) -> Result<XyStatus, XyIoError> {
+        fn read_status(&self) -> Result<XyStatus, RtuError> {
             let v = if self.output_on.get() {
                 self.v_set.get()
             } else {
@@ -290,21 +235,21 @@ mod fake {
                 v_in: 24.0,
             })
         }
-        fn set_voltage(&self, volts: f32) -> Result<(), XyIoError> {
+        fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
             self.v_set.set(volts);
             Ok(())
         }
-        fn set_current_limit(&self, _amps: f32) -> Result<(), XyIoError> {
+        fn set_current_limit(&self, _amps: f32) -> Result<(), RtuError> {
             Ok(())
         }
-        fn set_protection(&self, _limits: SafetyLimits) -> Result<(), XyIoError> {
+        fn set_protection(&self, _limits: SafetyLimits) -> Result<(), RtuError> {
             Ok(())
         }
-        fn set_output(&self, on: bool) -> Result<(), XyIoError> {
+        fn set_output(&self, on: bool) -> Result<(), RtuError> {
             self.output_on.set(on);
             Ok(())
         }
-        fn set_power_on_default_off(&self) -> Result<(), XyIoError> {
+        fn set_power_on_default_off(&self) -> Result<(), RtuError> {
             Ok(())
         }
     }
@@ -314,7 +259,7 @@ mod fake {
 
 /// Programs protection + setpoints, then enables output. Any failure
 /// short-circuits — we never enable output with unprogrammed setpoints.
-fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), XyIoError> {
+fn boot_sequence<D: XyDevice>(xy: &D, initial_v_set: f32) -> Result<(), RtuError> {
     xy.set_output(false)?;
     xy.set_power_on_default_off()?;
     xy.set_protection(SAFETY)?;
