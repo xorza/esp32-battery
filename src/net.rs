@@ -92,69 +92,93 @@ pub struct CaptiveBundle {
     pub status: SubmissionStatusHandle,
 }
 
+impl CaptiveBundle {
+    /// Pop a freshly-submitted creds payload, if any. Called once per
+    /// captive-arm tick.
+    pub fn take_creds(&self) -> Option<WifiCredentials> {
+        self.mailbox.lock().unwrap().take()
+    }
+
+    pub fn set_status(&self, s: SubmissionStatus) {
+        self.status.store(s);
+    }
+}
+
 /// Flat FSM over network state. The variant is the source of truth —
 /// radio mode, alive servers, and legal transitions are all bounded by
 /// the type. See `wifi_fsm.md` for the state table and transitions.
 ///
-/// Every variant that *has* credentials at runtime carries them in the
+/// Every variant that has credentials at runtime carries them in the
 /// variant. NVS is the durable store; the FSM doesn't read NVS per
-/// tick. The only state with no creds is `BootNoCreds` (cold boot, NVS
-/// empty) and the user-visible-error states `CaptiveFailed`, where the
-/// last attempt's creds are intentionally dropped so the captive page
-/// is the source of truth on retry.
+/// tick. `CaptiveIdle` is the only state without creds — cold boot
+/// before any /save, or after a `CaptiveFailed`-style timeout where
+/// the last attempt's creds are intentionally dropped so the captive
+/// page is the source of truth on retry.
 pub enum NetState {
-    BootNoCreds {
+    /// Captive AP up, no in-flight submission. Covers cold boot
+    /// (NVS empty) and post-timeout retry. The captive page reads
+    /// `bundle.status` to know whether to show a "wrong creds" error.
+    CaptiveIdle {
         wifi: MixedWifi<'static>,
         bundle: CaptiveBundle,
     },
+    /// /save creds applied to the radio, association in flight (≤ 20 s).
     CaptiveTrying {
         wifi: MixedWifi<'static>,
         bundle: CaptiveBundle,
         creds: WifiCredentials,
         since: Duration,
     },
-    CaptiveFailed {
-        wifi: MixedWifi<'static>,
-        bundle: CaptiveBundle,
-    },
+    /// STA→Captive carry-over. Radio is Mixed with the known
+    /// (last-good) creds; STA half retries in the background while
+    /// the captive page lets the user re-enter creds if needed.
     CaptiveFallbackRetrying {
         wifi: MixedWifi<'static>,
         bundle: CaptiveBundle,
         creds: WifiCredentials,
     },
+    /// STA-only, never associated this session. Dashboard server is
+    /// up but mDNS isn't (mDNS needs the netif live, only true after
+    /// first associated tick).
     StaConnecting {
         wifi: StaWifi<'static>,
         server: EspHttpServer<'static>,
         creds: WifiCredentials,
         session_start: Duration,
     },
-    StaHost {
+    /// STA-only, dashboard + mDNS up. `link` is the most recent
+    /// `is_connected()` result; mDNS stays up across `Down` windows
+    /// since it'll be valid again on re-link without re-init.
+    StaServing {
         wifi: StaWifi<'static>,
         server: EspHttpServer<'static>,
         mdns: EspMdns,
         creds: WifiCredentials,
-        last_assoc: Duration,
+        link: LinkState,
     },
-    StaReassociating {
-        wifi: StaWifi<'static>,
-        server: EspHttpServer<'static>,
-        mdns: EspMdns,
-        creds: WifiCredentials,
-        last_assoc: Duration,
-    },
+}
+
+/// `StaServing` link status. `Up` means the radio is associated this
+/// tick; `Down { since }` means it's not, and the captive-fallback
+/// timer counts from `since`. The variant encodes the invariant
+/// "we only need a timer when we're disconnected" — no
+/// always-present `last_assoc` field whose meaning depends on a
+/// sibling boolean.
+pub enum LinkState {
+    Up,
+    Down { since: Duration },
 }
 
 impl NetState {
     pub fn lcd_status(&self) -> NetStatus {
         match self {
-            NetState::BootNoCreds { .. }
-            | NetState::CaptiveFailed { .. }
-            | NetState::CaptiveFallbackRetrying { .. } => NetStatus::Captive,
-            NetState::CaptiveTrying { .. } => NetStatus::CaptiveTrying,
-            NetState::StaConnecting { .. } | NetState::StaReassociating { .. } => {
-                NetStatus::Connecting
+            NetState::CaptiveIdle { .. } | NetState::CaptiveFallbackRetrying { .. } => {
+                NetStatus::Captive
             }
-            NetState::StaHost { .. } => NetStatus::Host,
+            NetState::CaptiveTrying { .. } => NetStatus::CaptiveTrying,
+            NetState::StaConnecting { .. } => NetStatus::Connecting,
+            NetState::StaServing { link: LinkState::Up, .. } => NetStatus::Host,
+            NetState::StaServing { link: LinkState::Down { .. }, .. } => NetStatus::Connecting,
         }
     }
 }

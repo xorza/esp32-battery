@@ -15,13 +15,19 @@ representable.
 
 | # | State | Radio | Servers up | Creds on radio | LCD |
 |---|---|---|---|---|---|
-| 1 | `BootNoCreds` | Mixed | captive | none | `Captive` |
+| 1 | `CaptiveIdle` | Mixed | captive | none, or last attempt failed | `Captive` (with error if `status==Failed`) |
 | 2 | `CaptiveTrying` | Mixed | captive | applied, association in flight (≤ 20 s) | `CaptiveTrying` |
-| 3 | `CaptiveFailed` | Mixed | captive | last attempt failed | `Captive` (with error) |
-| 4 | `CaptiveFallbackRetrying` | Mixed | captive | known-good creds, STA half retrying in background | `Captive` |
-| 5 | `StaConnecting` | STA-only | dashboard | known, never associated this session | `Connecting` |
-| 6 | `StaHost` | STA-only | dashboard + mDNS | known, associated | `Host` |
-| 7 | `StaReassociating` | STA-only | dashboard + mDNS | known, link briefly dropped | `Connecting` |
+| 3 | `CaptiveFallbackRetrying` | Mixed | captive | known-good creds, STA half retrying in background | `Captive` |
+| 4 | `StaConnecting` | STA-only | dashboard | known, never associated this session | `Connecting` |
+| 5 | `StaServing` | STA-only | dashboard + mDNS | known | `Host` if `link == Up`, else `Connecting` |
+
+`CaptiveIdle` covers both cold boot (`status == Idle`) and post-failure
+retry (`status == Failed`); the captive page reads the
+`SubmissionStatus` atomic to decide whether to render a "wrong
+credentials" error. `StaServing` carries a `link: LinkState` enum
+(`Up | Down { since }`) recomputed each tick from `is_connected()`;
+the dashboard server stays up across `Down` windows so re-associations
+are silent.
 
 ## Transitions
 
@@ -43,60 +49,61 @@ late-but-successful association can't disconnect us.
 
 | From | Trigger | To | Action |
 |---|---|---|---|
-| (start) | boot, no NVS creds | `BootNoCreds` | start Mixed, mount captive |
+| (start) | boot, no NVS creds | `CaptiveIdle` | start Mixed, mount captive |
 | (start) | boot, NVS creds present | `StaConnecting` | start STA-only with creds, start dashboard |
-| `BootNoCreds` | /save (drain) | `CaptiveTrying` | apply creds, status → Trying, 20 s deadline starts |
-| `CaptiveFailed` | /save (drain) | `CaptiveTrying` | apply creds, status → Trying, 20 s deadline starts |
+| `CaptiveIdle` | /save (drain) | `CaptiveTrying` | apply creds, status → Trying, 20 s deadline starts |
 | `CaptiveFallbackRetrying` | /save (drain) | `CaptiveTrying` | apply creds, status → Trying (overrides carry-over) |
-| `CaptiveTrying` | /save (drain) | `CaptiveTrying` | apply new creds, restart 20 s window (overrides in-flight attempt; only fires if assoc didn't already succeed this tick) |
-| `CaptiveTrying` | tick:assoc | `StaHost` | persist creds to NVS, drop captive bundle, switch radio to STA-only, start dashboard + mDNS |
-| `CaptiveTrying` | timeout:20s | `CaptiveFailed` | status → Failed, captive page shows error |
-| `CaptiveFallbackRetrying` | tick:assoc | `StaHost` | drop captive bundle, switch radio to STA-only, start dashboard + mDNS |
-| `StaConnecting` | tick:assoc | `StaHost` | take mDNS |
+| `CaptiveTrying` | /save (drain) | `CaptiveTrying` | apply new creds, restart 20 s window (overrides in-flight; only fires if assoc didn't already succeed this tick) |
+| `CaptiveTrying` | tick:assoc | `StaServing { link: Up }` | persist creds to NVS, drop captive bundle, switch radio to STA-only, start dashboard + mDNS |
+| `CaptiveTrying` | timeout:20s | `CaptiveIdle` | status → Failed, captive page shows error |
+| `CaptiveFallbackRetrying` | tick:assoc | `StaServing { link: Up }` | drop captive bundle, switch radio to STA-only, start dashboard + mDNS |
+| `StaConnecting` | tick:assoc | `StaServing { link: Up }` | take mDNS |
 | `StaConnecting` | timeout:2h | `CaptiveFallbackRetrying` | drop dashboard, switch radio to Mixed (carry creds), mount captive |
-| `StaHost` | tick:!assoc | `StaReassociating` | servers stay up |
-| `StaReassociating` | tick:assoc | `StaHost` | bump `last_assoc` |
-| `StaReassociating` | timeout:2h since last assoc | `CaptiveFallbackRetrying` | drop dashboard + mDNS, switch radio to Mixed (carry creds), mount captive |
+| `StaServing` | tick (any) | `StaServing` | refresh `link` from `is_connected()`: `Up` while associated, `Down { since: now }` on first miss, `Down { since }` carried while still missing |
+| `StaServing { link: Down }` | timeout:2h since `since` | `CaptiveFallbackRetrying` | drop dashboard + mDNS, switch radio to Mixed (carry creds), mount captive |
 
-States 1/3/4 and 5/7 with no listed trigger simply stay put.
+States 1, 3, 4 with no listed trigger simply stay put.
 
 ## Credential ownership
 
 NVS is the durable store. Every variant that has creds at runtime
 carries them in the variant — the supervisor never reads NVS per tick.
 NVS is written exactly once per successful association
-(`CaptiveTrying → StaHost`, `CaptiveFallbackRetrying → StaHost`) so
-bad creds can't overwrite a known-good pair.
+(`CaptiveTrying → StaServing`, `CaptiveFallbackRetrying → StaServing`)
+so bad creds can't overwrite a known-good pair.
 
 | Variant | Creds in variant? |
 |---|---|
-| `BootNoCreds` | no (NVS is empty by definition) |
-| `CaptiveFailed` | no (last attempt's creds intentionally dropped — captive page is source of truth on retry) |
+| `CaptiveIdle` | no (NVS empty pre-first-/save, or last attempt's creds intentionally dropped on retry) |
 | `CaptiveTrying`, `CaptiveFallbackRetrying` | **yes** |
-| `StaConnecting`, `StaHost`, `StaReassociating` | **yes** |
+| `StaConnecting`, `StaServing` | **yes** |
 
 ## Submission status (captive-page UX only)
 
-A separate `SubmissionStatusHandle` (atomic, shared with the HTTP
-handler) reports `Idle | Pending | Trying | Failed` on `/status` so the
-captive page's spinner / error UI can poll it. The supervisor writes
-this atomic at the same moments it transitions: `Pending` on
-mailbox-write (from `/save`), `Trying` on `CaptiveSubmitted →
-CaptiveTrying`, `Failed` on the 20 s timeout. Successful association
-just drops the captive bundle — the page's `/status` poll then errors,
-which it treats as success.
+A `SubmissionStatusHandle` (atomic, shared with the HTTP handler)
+reports `Idle | Pending | Trying | Failed` on `/status` so the captive
+page's spinner / error UI can poll it.
+
+- `/save` handler sets `Pending` immediately on mailbox-write.
+- Supervisor's `apply_submission` (drain step) sets `Trying`.
+- Supervisor sets `Failed` on the 20 s timeout.
+- Successful association drops the whole captive bundle — the page's
+  `/status` poll then errors, which the page treats as success.
 
 ## Sketch
 
 ```rust
 enum NetState {
-    BootNoCreds              { wifi: MixedWifi, bundle: CaptiveBundle },
+    CaptiveIdle              { wifi: MixedWifi, bundle: CaptiveBundle },
     CaptiveTrying            { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds, since: Duration },
-    CaptiveFailed            { wifi: MixedWifi, bundle: CaptiveBundle },
     CaptiveFallbackRetrying  { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds },
     StaConnecting            { wifi: StaWifi,   server: HttpServer, creds: Creds, session_start: Duration },
-    StaHost                  { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, creds: Creds, last_assoc: Duration },
-    StaReassociating         { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, creds: Creds, last_assoc: Duration },
+    StaServing               { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, creds: Creds, link: LinkState },
+}
+
+enum LinkState {
+    Up,
+    Down { since: Duration },
 }
 ```
 
@@ -111,7 +118,7 @@ relevant captive-arm ticks; latest submission wins.
 
 - 20 s — `CaptiveTrying` association budget.
 - 2 h — STA-side fallback grace (`StaConnecting` from boot, or
-  `StaReassociating` since last associated tick).
+  `StaServing { link: Down }` since the moment we went Down).
 - 10 s — captive scan-cache TTL (refreshed by the supervisor on every
-  captive-arm tick where STA is not mid-association — states
-  `BootNoCreds`, `CaptiveFailed`, `CaptiveFallbackRetrying`).
+  captive-arm tick where STA is not mid-association —
+  `CaptiveIdle`, `CaptiveFallbackRetrying`).
