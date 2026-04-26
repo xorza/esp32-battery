@@ -71,7 +71,8 @@ impl SubmissionStatusHandle {
     }
 
     pub fn load(&self) -> SubmissionStatus {
-        SubmissionStatus::from_repr(self.0.load(Ordering::Relaxed)).unwrap()
+        let v = self.0.load(Ordering::Relaxed);
+        SubmissionStatus::from_repr(v).expect("invalid SubmissionStatus discriminant")
     }
 }
 

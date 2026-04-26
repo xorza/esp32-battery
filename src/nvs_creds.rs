@@ -9,6 +9,25 @@ pub struct WifiCredentials {
     pub password: String,
 }
 
+impl WifiCredentials {
+    /// Construct after validating ssid/password lengths against the
+    /// 802.11 + WPA2 limits the radio enforces. Centralised here so
+    /// every site that produces credentials (form parse, NVS load,
+    /// future callers) gets the same checks — without this the
+    /// `try_into()` inside `wifi::sta_config` would panic on overlong
+    /// inputs with a confusing "TryFromSliceError" message.
+    pub fn new(ssid: String, password: String) -> Self {
+        assert!(!ssid.is_empty(), "SSID must not be empty");
+        assert!(ssid.len() <= 32, "SSID too long ({} > 32)", ssid.len());
+        assert!(
+            password.is_empty() || (8..=63).contains(&password.len()),
+            "password must be empty or 8-63 chars (got {})",
+            password.len()
+        );
+        Self { ssid, password }
+    }
+}
+
 pub fn open(partition: esp_idf_svc::nvs::EspDefaultNvsPartition) -> EspNvs<NvsDefault> {
     EspNvs::new(partition, NAMESPACE, true).unwrap()
 }
@@ -24,23 +43,13 @@ pub fn load(nvs: &EspNvs<NvsDefault>) -> Option<WifiCredentials> {
         return None;
     }
 
-    Some(WifiCredentials {
-        ssid: ssid.to_string(),
-        password: password.to_string(),
-    })
+    Some(WifiCredentials::new(ssid.to_string(), password.to_string()))
 }
 
-pub fn save(nvs: &EspNvs<NvsDefault>, ssid: &str, password: &str) {
-    assert!(!ssid.is_empty(), "SSID must not be empty");
-    assert!(ssid.len() <= 32, "SSID too long");
-    assert!(
-        password.is_empty() || (8..=63).contains(&password.len()),
-        "password must be empty or 8-63 chars"
-    );
-
-    nvs.set_str("ssid", ssid).unwrap();
-    nvs.set_str("pass", password).unwrap();
-    info!("WiFi credentials saved for '{}'", ssid);
+pub fn save(nvs: &EspNvs<NvsDefault>, creds: &WifiCredentials) {
+    nvs.set_str("ssid", &creds.ssid).unwrap();
+    nvs.set_str("pass", &creds.password).unwrap();
+    info!("WiFi credentials saved for '{}'", creds.ssid);
 }
 
 pub fn clear(nvs: &EspNvs<NvsDefault>) {

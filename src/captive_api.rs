@@ -48,7 +48,9 @@ pub fn mount(
     mount_post(server, "/save", move |mut req| {
         let mut body_buf = [0u8; 256];
         let filled = read_to_buf(&mut req, &mut body_buf)?;
-        let body = std::str::from_utf8(&body_buf[..filled]).unwrap_or("");
+        let Ok(body) = std::str::from_utf8(&body_buf[..filled]) else {
+            return text_response(req, 400, b"Body is not valid UTF-8");
+        };
 
         let Some((ssid_raw, pass_raw)) = form::parse_form(body) else {
             return text_response(req, 400, b"Missing SSID");
@@ -56,11 +58,15 @@ pub fn mount(
 
         let mut ssid_buf = [0u8; 33];
         let ssid_len = form::url_decode(ssid_raw, &mut ssid_buf);
-        let ssid = std::str::from_utf8(&ssid_buf[..ssid_len]).unwrap_or("");
+        let Ok(ssid) = std::str::from_utf8(&ssid_buf[..ssid_len]) else {
+            return text_response(req, 400, b"SSID is not valid UTF-8");
+        };
 
         let mut pass_buf = [0u8; 65];
         let pass_len = form::url_decode(pass_raw, &mut pass_buf);
-        let password = std::str::from_utf8(&pass_buf[..pass_len]).unwrap_or("");
+        let Ok(password) = std::str::from_utf8(&pass_buf[..pass_len]) else {
+            return text_response(req, 400, b"Password is not valid UTF-8");
+        };
 
         if ssid.is_empty() || ssid.len() > 32 {
             return text_response(req, 400, b"Invalid SSID");
@@ -70,10 +76,7 @@ pub fn mount(
             return text_response(req, 400, b"Password must be 8-63 characters");
         }
 
-        let creds = WifiCredentials {
-            ssid: ssid.to_string(),
-            password: password.to_string(),
-        };
+        let creds = WifiCredentials::new(ssid.to_string(), password.to_string());
 
         // Latest-wins: a second /save before the supervisor drains
         // overwrites the first.

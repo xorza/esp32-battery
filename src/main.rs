@@ -319,7 +319,7 @@ fn promote_to_serving(
     creds: WifiCredentials,
     ctx: &StaCtx,
 ) -> NetState {
-    nvs_creds::save(&ctx.nvs, &creds.ssid, &creds.password);
+    nvs_creds::save(&ctx.nvs, &creds);
     drop(bundle);
     let sta_wifi = wifi.into_sta(&creds);
     let server = ctx.start_dashboard();
