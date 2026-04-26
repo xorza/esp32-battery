@@ -53,11 +53,6 @@ pub fn uptime() -> std::time::Duration {
     std::time::Duration::from_micros(micros)
 }
 
-/// Whole seconds since boot — for serialization to `u32` (JSON, LCD).
-pub fn uptime_s() -> u32 {
-    uptime().as_secs() as u32
-}
-
 /// Pairs the event log with the wall clock used to timestamp entries.
 /// Sensor threads always need both together — bundling them here removes
 /// the per-thread `record(log, clock, kind)` helper duplicated in `ina.rs`

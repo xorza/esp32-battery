@@ -166,7 +166,8 @@ type GraphBuf = Framebuf<GRAPH_W, GRAPH_H>;
 
 // --- Drawing helpers ---
 
-fn format_uptime(secs: u32) -> heapless::String<16> {
+fn format_uptime(uptime: core::time::Duration) -> heapless::String<16> {
+    let secs = uptime.as_secs();
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
@@ -388,7 +389,7 @@ pub fn start(
                         sd.ps_reading().unwrap_or_default(),
                     )
                 };
-                let uptime = crate::clock::uptime_s();
+                let uptime = crate::clock::uptime();
                 buf.clear();
 
                 // Values

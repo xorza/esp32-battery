@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use esp32_battery_logic::battery;
 use esp32_battery_logic::data::{Sample, SensorData};
 
-use crate::clock::uptime_s;
+use crate::clock::uptime;
 use crate::http::{JsonBuf, mount_json_get};
 use crate::wifi::sta_rssi;
 
@@ -102,7 +102,7 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
             let bat = store.battery_reading().unwrap_or_default();
             let ps = store.ps_reading().unwrap_or_default();
             let response = ApiResponse {
-                uptime: uptime_s(),
+                uptime: uptime().as_secs() as u32,
                 rssi: sta_rssi(),
                 voltage: bat.voltage,
                 power_online: store.power_online(),
