@@ -427,6 +427,10 @@ mod fake {
 /// and wrong-slave wiring before the supervisor can ask for output enable.
 fn boot_sequence<D: XyDevice>(xy: &D) -> Result<(), BootError> {
     xy.set_output(false)?;
+    // Wipe any latched protection cause from a prior session — power
+    // outages and unrelated crashes leave 0x0010 set, and we don't want
+    // that stale value contaminating the per-tick read in `poll`.
+    xy.clear_protection_status()?;
     xy.set_power_on_default_off()?;
     xy.set_protection(SAFETY)?;
     xy.set_voltage(PACK_PROFILE.float_v)?;
@@ -608,6 +612,18 @@ fn poll<D: XyDevice>(
             None
         }
     };
+    // When the buck reports output OFF, ask why. PROTECT (0x0010) was
+    // wiped during boot_sequence, so any non-Normal value here is a
+    // protection trip from the current session — diagnostically useful
+    // and (eventually) the gate for `should_restart`. While output is on
+    // PROTECT is necessarily Normal so we save the round-trip.
+    if output_on == Some(false) {
+        match xy.read_protection_status() {
+            Ok(XyProtectionStatus::Normal) => {}
+            Ok(status) => warn!("XY PROTECT latched: {status}"),
+            Err(e) => warn!("XY read_protection_status: {e}"),
+        }
+    }
     let battery = sd.battery_reading().map(|b| BatterySample {
         voltage: b.voltage,
         current: b.current,
