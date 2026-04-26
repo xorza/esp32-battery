@@ -256,19 +256,27 @@ fn draw_captive_portal(gb: &mut GraphBuf, trying: bool) {
     let value = MonoTextStyle::new(&FONT_10X20, COLOR_VOLTAGE);
     let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
 
-    Text::new("WiFi Setup", Point::new(20, 24), title)
+    Text::new("WiFi Setup", Point::new(20, 14), title)
         .draw(gb)
         .unwrap();
-    Text::new("SSID", Point::new(20, 44), label)
+    Text::new("SSID", Point::new(20, 26), label)
         .draw(gb)
         .unwrap();
-    Text::new(crate::wifi::AP_SSID, Point::new(20, 64), value)
+    Text::new(crate::wifi::AP_SSID, Point::new(20, 42), value)
         .draw(gb)
         .unwrap();
-    Text::new("PASSWORD", Point::new(20, 82), label)
+    Text::new("PASSWORD", Point::new(20, 54), label)
         .draw(gb)
         .unwrap();
-    Text::new(crate::wifi::AP_PASS, Point::new(20, 102), value)
+    Text::new(crate::wifi::AP_PASS, Point::new(20, 70), value)
+        .draw(gb)
+        .unwrap();
+    Text::new("OPEN", Point::new(20, 82), label)
+        .draw(gb)
+        .unwrap();
+    let [a, b, c, d] = crate::wifi::AP_GATEWAY;
+    let url = format!("http://{a}.{b}.{c}.{d}/");
+    Text::new(&url, Point::new(20, 98), value)
         .draw(gb)
         .unwrap();
 
@@ -277,7 +285,7 @@ fn draw_captive_portal(gb: &mut GraphBuf, trying: bool) {
         // is mid-association on the user's submitted creds.
         Text::new(
             "Connecting...",
-            Point::new(190, 24),
+            Point::new(190, 14),
             MonoTextStyle::new(&FONT_6X10, COLOR_DISCHARGING),
         )
         .draw(gb)
