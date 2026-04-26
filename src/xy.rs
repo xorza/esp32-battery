@@ -58,11 +58,42 @@ struct XyStatus {
 /// supervisor cares about today is a Modbus-RTU transport failure.
 trait XyDevice {
     fn read_status(&self) -> Result<XyStatus, RtuError>;
+    fn read_protection(&self) -> Result<SafetyLimits, RtuError>;
     fn set_voltage(&self, volts: f32) -> Result<(), RtuError>;
     fn set_current_limit(&self, amps: f32) -> Result<(), RtuError>;
     fn set_protection(&self, limits: SafetyLimits) -> Result<(), RtuError>;
     fn set_output(&self, on: bool) -> Result<(), RtuError>;
     fn set_power_on_default_off(&self) -> Result<(), RtuError>;
+}
+
+/// Boot-time failure: either the Modbus transport gave up, or a register
+/// read back a different value than we wrote (wrong slave, scale-divider
+/// mismatch, write rejected by the device, etc.). Either way, we must not
+/// enable output.
+enum BootError {
+    Rtu(RtuError),
+    Verify {
+        what: &'static str,
+        expected: f32,
+        actual: f32,
+    },
+}
+
+impl From<RtuError> for BootError {
+    fn from(e: RtuError) -> Self {
+        Self::Rtu(e)
+    }
+}
+
+impl std::fmt::Display for BootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rtu(e) => std::fmt::Display::fmt(e, f),
+            Self::Verify { what, expected, actual } => {
+                write!(f, "{what} readback mismatch: expected {expected:.2}, got {actual:.2}")
+            }
+        }
+    }
 }
 
 // --- Real device ------------------------------------------------------------
@@ -138,6 +169,16 @@ mod real {
             })
         }
 
+        fn read_protection(&self) -> Result<SafetyLimits, RtuError> {
+            // 0x0052 LVP, 0x0053 OVP, 0x0054 OCP — contiguous, one read.
+            let r = self.modbus.read_holding(SLAVE, REG_S_LVP, 3)?;
+            Ok(SafetyLimits {
+                lvp_v: r[0] as f32 / 100.0,
+                ovp_v: r[1] as f32 / 100.0,
+                ocp_a: r[2] as f32 / 100.0,
+            })
+        }
+
         fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
             self.modbus
                 .write_holding(SLAVE, REG_V_SET, (volts * 100.0).round() as u16)
@@ -191,6 +232,8 @@ mod fake {
     /// last commanded — exercises the same control flow as the real path.
     pub struct Xy<'d> {
         v_set: Cell<f32>,
+        i_set: Cell<f32>,
+        protection: Cell<SafetyLimits>,
         output_on: Cell<bool>,
         // Real UART driver, constructed but never written to. Held so the
         // peripheral and its GPIOs are genuinely configured and claimed
@@ -213,6 +256,12 @@ mod fake {
             .expect("UART1 init");
             Self {
                 v_set: Cell::new(13.5),
+                i_set: Cell::new(0.0),
+                protection: Cell::new(SafetyLimits {
+                    ovp_v: 0.0,
+                    ocp_a: 0.0,
+                    lvp_v: 0.0,
+                }),
                 output_on: Cell::new(false),
                 _uart: uart,
             }
@@ -228,21 +277,26 @@ mod fake {
             };
             Ok(XyStatus {
                 v_set: self.v_set.get(),
-                i_set: 10.0,
+                i_set: self.i_set.get(),
                 v_out: v,
                 i_out: 0.0,
                 p_out: 0.0,
                 v_in: 24.0,
             })
         }
+        fn read_protection(&self) -> Result<SafetyLimits, RtuError> {
+            Ok(self.protection.get())
+        }
         fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
             self.v_set.set(volts);
             Ok(())
         }
-        fn set_current_limit(&self, _amps: f32) -> Result<(), RtuError> {
+        fn set_current_limit(&self, amps: f32) -> Result<(), RtuError> {
+            self.i_set.set(amps);
             Ok(())
         }
-        fn set_protection(&self, _limits: SafetyLimits) -> Result<(), RtuError> {
+        fn set_protection(&self, limits: SafetyLimits) -> Result<(), RtuError> {
+            self.protection.set(limits);
             Ok(())
         }
         fn set_output(&self, on: bool) -> Result<(), RtuError> {
@@ -257,16 +311,39 @@ mod fake {
 
 // --- Shared thread loop -----------------------------------------------------
 
-/// Programs protection + setpoints, then enables output. Any failure
-/// short-circuits — we never enable output with unprogrammed setpoints.
-fn boot_sequence<D: XyDevice>(xy: &D) -> Result<(), RtuError> {
+/// Programs protection + setpoints, reads them back to confirm the device
+/// accepted the writes, then enables output. Any failure short-circuits —
+/// we never enable output with unverified setpoints. Readback catches
+/// dropped Modbus writes, scale-divider mismatches, and wrong-slave wiring
+/// before the buck can source into the pack.
+fn boot_sequence<D: XyDevice>(xy: &D) -> Result<(), BootError> {
     xy.set_output(false)?;
     xy.set_power_on_default_off()?;
     xy.set_protection(SAFETY)?;
     xy.set_voltage(PACK_PROFILE.float_v)?;
     xy.set_current_limit(PACK_PROFILE.regulation_a)?;
+
+    let s = xy.read_status()?;
+    verify("V_SET", PACK_PROFILE.float_v, s.v_set)?;
+    verify("I_SET", PACK_PROFILE.regulation_a, s.i_set)?;
+    let p = xy.read_protection()?;
+    verify("OVP", SAFETY.ovp_v, p.ovp_v)?;
+    verify("OCP", SAFETY.ocp_a, p.ocp_a)?;
+    verify("LVP", SAFETY.lvp_v, p.lvp_v)?;
+
     xy.set_output(true)?;
     Ok(())
+}
+
+/// One register quantum is 0.01 (V or A); allow up to two quanta for
+/// IEEE-float round-trip slack on values like 14.4 V whose binary repr
+/// isn't exact.
+fn verify(what: &'static str, expected: f32, actual: f32) -> Result<(), BootError> {
+    if (expected - actual).abs() < 0.02 {
+        Ok(())
+    } else {
+        Err(BootError::Verify { what, expected, actual })
+    }
 }
 
 /// Cold-boot retry budget for `boot_sequence`. The XY7025's UART is
