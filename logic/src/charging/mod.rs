@@ -74,6 +74,11 @@ const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long Modbus reads to the XY can keep failing before we fail closed.
 const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Allowed drift between commanded and observed setpoint. One register
+/// quantum is 0.01; two-quantum slack absorbs IEEE-float round-trip
+/// quirks on values like 14.4 V whose binary repr isn't exact.
+const SETPOINT_DRIFT_TOL: f32 = 0.02;
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone)]
@@ -127,11 +132,6 @@ pub struct PollResult {
     pub setpoints: Option<Setpoints>,
     pub battery: Option<BatterySample>,
 }
-
-/// Allowed drift between commanded and observed setpoint. One register
-/// quantum is 0.01; two-quantum slack absorbs IEEE-float round-trip
-/// quirks on values like 14.4 V whose binary repr isn't exact.
-const SETPOINT_DRIFT_TOL: f32 = 0.02;
 
 #[derive(Copy, Clone, PartialEq, Eq, IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
@@ -312,14 +312,10 @@ impl Profile {
 impl ChargeSupervisor {
     pub fn new(profile: Profile) -> Self {
         assert!(profile.absorb_v > profile.float_v);
-        // Always boot in Float — never resume Absorb across a reset, even if
-        // we crashed mid-absorb. Conservative by design: re-derive phase from
-        // observed current. Don't add NVS-backed phase persistence.
-        //
-        // Always boot Pending — output stays OFF until the supervisor sees
-        // a healthy first tick (drift-free setpoints, fresh battery sample
-        // below OV). Bringing up the buck is the supervisor's job, not
-        // boot_sequence's, so the cold-boot moment can't bypass safety.
+        // Boot conservative: Phase::Float (re-derive from observed current,
+        // never resume Absorb across a reset) and LatchState::Pending
+        // (output stays OFF until the first healthy tick — bringing up the
+        // buck is the supervisor's job, so cold-boot can't bypass safety).
         Self {
             profile,
             phase: Phase::Float,
@@ -440,14 +436,13 @@ impl ChargeSupervisor {
             return Action::None;
         };
 
-        let ov = b.voltage > self.profile.absorb_v + OV_MARGIN_V;
         // OV is undebounced in Pending — a pack already over the threshold
-        // at boot must never see EnableOutput. In Active the existing 3 s
-        // debounce filters transients caused by switching noise / load steps.
-        if pending && ov {
-            return self.latch(FaultReason::Overvoltage);
-        }
-        if self.ov.step(ov, elapsed, OV_DURATION) {
+        // at boot must never see EnableOutput. In Active the 3 s debounce
+        // filters transients caused by switching noise / load steps. Always
+        // step the debouncer so its state stays coherent for Active.
+        let ov = b.voltage > self.profile.absorb_v + OV_MARGIN_V;
+        let ov_debounced = self.ov.step(ov, elapsed, OV_DURATION);
+        if (pending && ov) || ov_debounced {
             return self.latch(FaultReason::Overvoltage);
         }
 

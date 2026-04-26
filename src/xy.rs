@@ -134,6 +134,12 @@ mod real {
     const REG_S_INI: u16 = 0x005D;
     const BAUD: u32 = 115200;
 
+    /// XY7025 holding registers store voltage / current as hundredths
+    /// (e.g. 1440 = 14.40 V). 25 A worst case → 2500, well under u16::MAX.
+    fn to_reg(v: f32) -> u16 {
+        (v * 100.0).round() as u16
+    }
+
     pub struct Xy<'d> {
         modbus: ModbusRtu<'d>,
     }
@@ -188,22 +194,20 @@ mod real {
         }
 
         fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
-            self.modbus
-                .write_holding(SLAVE, REG_V_SET, (volts * 100.0).round() as u16)
+            self.modbus.write_holding(SLAVE, REG_V_SET, to_reg(volts))
         }
 
         fn set_current_limit(&self, amps: f32) -> Result<(), RtuError> {
-            self.modbus
-                .write_holding(SLAVE, REG_I_SET, (amps * 100.0).round() as u16)
+            self.modbus.write_holding(SLAVE, REG_I_SET, to_reg(amps))
         }
 
         fn set_protection(&self, limits: SafetyLimits) -> Result<(), RtuError> {
             self.modbus
-                .write_holding(SLAVE, REG_S_OVP, (limits.ovp_v * 100.0).round() as u16)?;
+                .write_holding(SLAVE, REG_S_OVP, to_reg(limits.ovp_v))?;
             self.modbus
-                .write_holding(SLAVE, REG_S_OCP, (limits.ocp_a * 100.0).round() as u16)?;
+                .write_holding(SLAVE, REG_S_OCP, to_reg(limits.ocp_a))?;
             self.modbus
-                .write_holding(SLAVE, REG_S_LVP, (limits.lvp_v * 100.0).round() as u16)?;
+                .write_holding(SLAVE, REG_S_LVP, to_reg(limits.lvp_v))?;
             Ok(())
         }
 
@@ -365,21 +369,20 @@ const BOOT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const BOOT_RETRY_COUNT: u32 = 10;
 
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
-    let mut last_err = None;
-    let booted = (0..BOOT_RETRY_COUNT).any(|attempt| {
+    let mut boot_err = None;
+    for attempt in 0..BOOT_RETRY_COUNT {
         if attempt > 0 {
             thread::sleep(BOOT_RETRY_DELAY);
         }
         match boot_sequence(&xy) {
-            Ok(()) => true,
-            Err(e) => {
-                last_err = Some(e);
-                false
+            Ok(()) => {
+                boot_err = None;
+                break;
             }
+            Err(e) => boot_err = Some(e),
         }
-    });
-    if !booted {
-        let e = last_err.expect("retry loop ran at least once");
+    }
+    if let Some(e) = boot_err {
         error!(
             "XY boot failed after {BOOT_RETRY_COUNT} attempts: {e} — falling through to supervisor for fail-closed retries"
         );
@@ -466,19 +469,19 @@ fn apply_action<D: XyDevice>(
                 recorder.record(Event::Xy(XyError::SetVoltage));
             }
         }
-        Action::DisableOutput(reason) => match xy.set_output(false) {
-            Ok(()) => {
-                error!("CHARGE FAULT ({}): PS output DISABLED", reason.label());
-                supervisor.ack_disable();
+        Action::DisableOutput(reason) => {
+            let label = reason.label();
+            match xy.set_output(false) {
+                Ok(()) => {
+                    error!("CHARGE FAULT ({label}): PS output DISABLED");
+                    supervisor.ack_disable();
+                }
+                Err(e) => {
+                    error!("CHARGE FAULT ({label}): set_output(false) failed: {e} — will retry");
+                    recorder.record(Event::Xy(XyError::SetOutput));
+                }
             }
-            Err(e) => {
-                error!(
-                    "CHARGE FAULT ({}): set_output(false) failed: {e} — will retry",
-                    reason.label()
-                );
-                recorder.record(Event::Xy(XyError::SetOutput));
-            }
-        },
+        }
     }
 }
 
