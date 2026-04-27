@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use strum::IntoStaticStr;
 
+pub use xy_modbus::{ProtectionStatus, SafetyLimits, Setpoints};
+
 // ─── Tunables ────────────────────────────────────────────────────────────────
 
 /// CC charge rate as a fraction of pack capacity. 0.2C is the
@@ -121,24 +123,6 @@ pub struct Profile {
     pub exit_absorb_a: f32,
 }
 
-/// Hard trip limits programmed into the buck's own protection registers.
-/// Last-resort backstops above the supervisor's debounced fault thresholds.
-#[derive(Copy, Clone)]
-pub struct SafetyLimits {
-    pub ovp_v: f32,
-    pub ocp_a: f32,
-    pub lvp_v: f32,
-}
-
-/// Setpoints read back from the buck (V_SET / I_SET register pair). Fed
-/// to the supervisor each tick so it can detect drift between what we
-/// commanded and what the buck claims to be regulating to.
-#[derive(Copy, Clone)]
-pub struct Setpoints {
-    pub v_set: f32,
-    pub i_set: f32,
-}
-
 /// One poll cycle's view of the world for the supervisor.
 /// `setpoints` is from the V_SET/I_SET readback; `setpoints.is_some()`
 /// doubles as the modbus-healthy signal. `battery` is independent —
@@ -163,54 +147,21 @@ pub enum BuckOutput {
     /// OUTPUT_EN reads 0. `cause` carries the PROTECT register value if
     /// we managed to read it; `None` means the PROTECT read itself
     /// failed.
-    Off { cause: Option<XyProtectionStatus> },
+    Off { cause: Option<ProtectionStatus> },
 }
 
-/// Latched protection cause read from XY register 0x0010 (PROTECT). Per
-/// the XY6020L Modbus interface doc (Note 3 — same module family as the
-/// XY7025), 0 means normal operation; non-zero values name which
-/// hardware protection most recently tripped. The register stays latched
-/// until the caller writes 0 to 0x0010.
-#[derive(Copy, Clone, PartialEq, Eq, strum::Display)]
-#[strum(serialize_all = "lowercase")]
-pub enum XyProtectionStatus {
-    Normal,
-    /// Output overvoltage. Also fires transiently when V_SET is raised
-    /// above current V_OUT.
-    Ovp,
-    /// Output overcurrent.
-    Ocp,
-    /// Output overpower.
-    Opp,
-    /// Input undervoltage (LVP setpoint, not pack-side).
-    Lvp,
-    /// Over amp-hour.
-    Oah,
-    /// Output high-power time exceeded.
-    Ohp,
-    /// Over temperature.
-    Otp,
-    /// Over energy.
-    Oep,
-    /// Over watt-hour.
-    Owh,
-    /// Input overcurrent.
-    Icp,
-    /// Register read back a value not in the documented 0–10 range. We
-    /// don't trust the device in this state — recovery treats Unknown as
-    /// not-Normal so it stays gated.
-    #[strum(to_string = "unknown({0})")]
-    Unknown(u16),
+/// Policy: whether a self-disable for a given protection cause is safe
+/// to auto-recover from. Conservative — only causes that are *likely*
+/// transient and pose no fresh risk if they re-fire after a wait.
+/// OCP/OPP can signal a real downstream fault (short, sticky FET); OVP
+/// means pack-side trouble; energy/time limits hit programmed budgets.
+/// Reboot-required for those.
+pub trait ProtectionRecovery {
+    fn is_recoverable(self) -> bool;
 }
 
-impl XyProtectionStatus {
-    /// Whether a self-disable for this cause is safe to auto-recover
-    /// from. Conservative: only causes that are *likely* transient and
-    /// pose no fresh risk if they re-fire after a wait. OCP/OPP can
-    /// signal a real downstream fault (short, sticky FET); OVP means
-    /// pack-side trouble; energy/time limits hit programmed budgets.
-    /// Reboot-required for those.
-    pub fn is_recoverable(self) -> bool {
+impl ProtectionRecovery for ProtectionStatus {
+    fn is_recoverable(self) -> bool {
         match self {
             // Input-side and over-temp issues that genuinely clear with
             // time (AC sag returns, fan cools the case).
@@ -233,23 +184,6 @@ impl XyProtectionStatus {
             | Self::Icp => false,
             // Off-spec read — don't trust ourselves.
             Self::Unknown(_) => false,
-        }
-    }
-
-    pub fn from_register(raw: u16) -> Self {
-        match raw {
-            0 => Self::Normal,
-            1 => Self::Ovp,
-            2 => Self::Ocp,
-            3 => Self::Opp,
-            4 => Self::Lvp,
-            5 => Self::Oah,
-            6 => Self::Ohp,
-            7 => Self::Otp,
-            8 => Self::Oep,
-            9 => Self::Owh,
-            10 => Self::Icp,
-            other => Self::Unknown(other),
         }
     }
 }
@@ -298,7 +232,7 @@ pub enum FaultReason {
     /// The buck self-disabled — its own hardware OVP / OCP / LVP /
     /// over-temp tripped, or someone toggled the front panel. Payload is
     /// the cause from PROTECT (0x0010); `None` if that read failed.
-    OutputUnexpectedlyOff(Option<XyProtectionStatus>),
+    OutputUnexpectedlyOff(Option<ProtectionStatus>),
     /// Buck's OUTPUT_EN register read 1 while the supervisor was Pending —
     /// output is supposed to be off until the supervisor itself enables it.
     /// Means the boot disable / S_INI=0 didn't stick or the front panel

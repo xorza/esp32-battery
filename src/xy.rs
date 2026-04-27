@@ -17,12 +17,11 @@ use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
     self, Action, BatterySample, BuckOutput, ChargeSupervisor, Chemistry, PollResult, Profile,
-    SafetyLimits as LogicSafetyLimits, Setpoints as LogicSetpoints, XyProtectionStatus,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
 
-use xy_modbus::{Model, ModelCheck, RtuError, Status};
+use xy_modbus::{Model, ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Setpoints, Status};
 
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
@@ -39,7 +38,7 @@ const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
 /// Hard trip thresholds programmed into the XY's protection registers.
 /// Derived from the profile so a chemistry/cell-count change moves them
 /// in lockstep — no chance the OVP ceiling drifts below the absorb target.
-const SAFETY: LogicSafetyLimits = PACK_PROFILE.safety_limits();
+const SAFETY: SafetyLimits = PACK_PROFILE.safety_limits();
 /// Buck variant on this board. Sets the per-register scales (I-OUT,
 /// POWER, S-OCP, S-OPP) — wrong family silently shifts readings by 10×,
 /// so this also drives the boot-time `verify_model` check and the fake
@@ -53,12 +52,12 @@ const PACK_MODEL: Model = Model::Xy7025;
 trait XyDevice {
     fn verify_model(&mut self) -> Result<ModelCheck, RtuError>;
     fn read_status(&mut self) -> Result<Status, RtuError>;
-    fn read_protection(&mut self) -> Result<LogicSafetyLimits, RtuError>;
-    fn read_protection_status(&mut self) -> Result<XyProtectionStatus, RtuError>;
+    fn read_protection(&mut self) -> Result<SafetyLimits, RtuError>;
+    fn read_protection_status(&mut self) -> Result<ProtectionStatus, RtuError>;
     fn read_output_on(&mut self) -> Result<bool, RtuError>;
     fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError>;
     fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError>;
-    fn set_protection(&mut self, limits: LogicSafetyLimits) -> Result<(), RtuError>;
+    fn set_protection(&mut self, limits: SafetyLimits) -> Result<(), RtuError>;
     /// Write 0 to PROTECT (0x0010) to clear a latched protection cause.
     fn clear_protection_status(&mut self) -> Result<(), RtuError>;
     fn set_output(&mut self, on: bool) -> Result<(), RtuError>;
@@ -131,41 +130,8 @@ mod real {
     use xy_modbus::esp_idf::EspIdfTransport;
     use xy_modbus::{ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Status};
 
-    use super::{LogicSafetyLimits, PACK_MODEL, XyDevice, XyProtectionStatus};
+    use super::{PACK_MODEL, XyDevice};
     use crate::board::XyPins;
-
-    fn to_logic_safety(s: SafetyLimits) -> LogicSafetyLimits {
-        LogicSafetyLimits {
-            ovp_v: s.ovp_v,
-            ocp_a: s.ocp_a,
-            lvp_v: s.lvp_v,
-        }
-    }
-
-    fn from_logic_safety(s: LogicSafetyLimits) -> SafetyLimits {
-        SafetyLimits {
-            ovp_v: s.ovp_v,
-            ocp_a: s.ocp_a,
-            lvp_v: s.lvp_v,
-        }
-    }
-
-    fn to_logic_protection(p: ProtectionStatus) -> XyProtectionStatus {
-        match p {
-            ProtectionStatus::Normal => XyProtectionStatus::Normal,
-            ProtectionStatus::Ovp => XyProtectionStatus::Ovp,
-            ProtectionStatus::Ocp => XyProtectionStatus::Ocp,
-            ProtectionStatus::Opp => XyProtectionStatus::Opp,
-            ProtectionStatus::Lvp => XyProtectionStatus::Lvp,
-            ProtectionStatus::Oah => XyProtectionStatus::Oah,
-            ProtectionStatus::Ohp => XyProtectionStatus::Ohp,
-            ProtectionStatus::Otp => XyProtectionStatus::Otp,
-            ProtectionStatus::Oep => XyProtectionStatus::Oep,
-            ProtectionStatus::Owh => XyProtectionStatus::Owh,
-            ProtectionStatus::Icp => XyProtectionStatus::Icp,
-            ProtectionStatus::Unknown(v) => XyProtectionStatus::Unknown(v),
-        }
-    }
 
     const BAUD: u32 = 115200;
 
@@ -198,12 +164,12 @@ mod real {
             self.0.read_status()
         }
 
-        fn read_protection(&mut self) -> Result<LogicSafetyLimits, RtuError> {
-            self.0.read_protection().map(to_logic_safety)
+        fn read_protection(&mut self) -> Result<SafetyLimits, RtuError> {
+            self.0.read_protection()
         }
 
-        fn read_protection_status(&mut self) -> Result<XyProtectionStatus, RtuError> {
-            self.0.read_protection_status().map(to_logic_protection)
+        fn read_protection_status(&mut self) -> Result<ProtectionStatus, RtuError> {
+            self.0.read_protection_status()
         }
 
         fn read_output_on(&mut self) -> Result<bool, RtuError> {
@@ -218,8 +184,8 @@ mod real {
             self.0.set_current_limit(amps)
         }
 
-        fn set_protection(&mut self, limits: LogicSafetyLimits) -> Result<(), RtuError> {
-            self.0.set_protection(from_logic_safety(limits))
+        fn set_protection(&mut self, limits: SafetyLimits) -> Result<(), RtuError> {
+            self.0.set_protection(limits)
         }
 
         fn clear_protection_status(&mut self) -> Result<(), RtuError> {
@@ -243,9 +209,9 @@ mod fake {
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
-    use xy_modbus::{ModelCheck, RtuError, Status};
+    use xy_modbus::{ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Status};
 
-    use super::{LogicSafetyLimits, PACK_MODEL, XyDevice, XyProtectionStatus};
+    use super::{PACK_MODEL, XyDevice};
     use crate::board::XyPins;
 
     const BAUD: u32 = 115200;
@@ -256,8 +222,8 @@ mod fake {
     pub struct Xy<'d> {
         v_set: f32,
         i_set: f32,
-        protection: LogicSafetyLimits,
-        protection_status: XyProtectionStatus,
+        protection: SafetyLimits,
+        protection_status: ProtectionStatus,
         output_on: bool,
         // Real UART driver, constructed but never written to. Held so the
         // peripheral and its GPIOs are genuinely configured and claimed
@@ -281,12 +247,12 @@ mod fake {
             Self {
                 v_set: 13.5,
                 i_set: 0.0,
-                protection: LogicSafetyLimits {
+                protection: SafetyLimits {
+                    lvp_v: 0.0,
                     ovp_v: 0.0,
                     ocp_a: 0.0,
-                    lvp_v: 0.0,
                 },
-                protection_status: XyProtectionStatus::Normal,
+                protection_status: ProtectionStatus::Normal,
                 output_on: false,
                 _uart: uart,
             }
@@ -318,10 +284,10 @@ mod fake {
                 v_in: 24.0,
             })
         }
-        fn read_protection(&mut self) -> Result<LogicSafetyLimits, RtuError> {
+        fn read_protection(&mut self) -> Result<SafetyLimits, RtuError> {
             Ok(self.protection)
         }
-        fn read_protection_status(&mut self) -> Result<XyProtectionStatus, RtuError> {
+        fn read_protection_status(&mut self) -> Result<ProtectionStatus, RtuError> {
             Ok(self.protection_status)
         }
         fn read_output_on(&mut self) -> Result<bool, RtuError> {
@@ -335,12 +301,12 @@ mod fake {
             self.i_set = amps;
             Ok(())
         }
-        fn set_protection(&mut self, limits: LogicSafetyLimits) -> Result<(), RtuError> {
+        fn set_protection(&mut self, limits: SafetyLimits) -> Result<(), RtuError> {
             self.protection = limits;
             Ok(())
         }
         fn clear_protection_status(&mut self) -> Result<(), RtuError> {
-            self.protection_status = XyProtectionStatus::Normal;
+            self.protection_status = ProtectionStatus::Normal;
             Ok(())
         }
         fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
@@ -596,7 +562,7 @@ fn read_setpoints<D: XyDevice>(
     xy: &mut D,
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
-) -> Option<LogicSetpoints> {
+) -> Option<Setpoints> {
     match xy.read_status() {
         Ok(s) => {
             sensor_data.lock().unwrap().update_ps(PsReading {
@@ -604,7 +570,7 @@ fn read_setpoints<D: XyDevice>(
                 current: s.i_out,
                 power: s.p_out,
             });
-            Some(LogicSetpoints {
+            Some(Setpoints {
                 v_set: s.v_set,
                 i_set: s.i_set,
             })
@@ -628,7 +594,7 @@ fn read_output<D: XyDevice>(xy: &mut D, recorder: &EventRecorder) -> Option<Buck
         Ok(false) => {
             let cause = match xy.read_protection_status() {
                 Ok(status) => {
-                    if status != XyProtectionStatus::Normal {
+                    if status != ProtectionStatus::Normal {
                         warn!("XY PROTECT latched: {status}");
                     }
                     Some(status)

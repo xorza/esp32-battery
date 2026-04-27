@@ -111,7 +111,7 @@ fn enter_absorb(s: &mut ChargeSupervisor) {
 /// Recovery tests pass a recoverable cause (LVP); gate tests pass a
 /// non-recoverable one. The cause governs whether `tick` will eventually
 /// emit `Action::RestartSupervisor`.
-fn latch_self_disable(s: &mut ChargeSupervisor, cause: Option<XyProtectionStatus>) {
+fn latch_self_disable(s: &mut ChargeSupervisor, cause: Option<ProtectionStatus>) {
     let p = PollResult {
         output: Some(BuckOutput::Off { cause }),
         ..expected_poll(s, b(OK_V, -0.1))
@@ -1046,7 +1046,7 @@ fn should_restart_after_healthy_window() {
     // Action::RestartSupervisor (caller's cue to throw this supervisor
     // away and re-run boot_sequence).
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         // Recovery accumulates via tick; pre-threshold ticks return None.
@@ -1063,7 +1063,7 @@ fn should_restart_after_healthy_window() {
 #[test]
 fn should_restart_resets_on_overvoltage() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1082,7 +1082,7 @@ fn should_restart_resets_on_overvoltage() {
 #[test]
 fn should_restart_resets_on_modbus_down() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1099,7 +1099,7 @@ fn should_restart_resets_on_modbus_down() {
 #[test]
 fn should_restart_resets_on_missing_battery() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1114,7 +1114,7 @@ fn should_restart_resets_on_unexpected_output_on() {
     // Buck spontaneously came back on (panel toggle, EMC, whatever) —
     // we want a stable OFF state before signalling restart.
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1134,7 +1134,7 @@ fn should_restart_repeats_across_cycles() {
     // supervisor will happily emit RestartSupervisor over and over if its
     // latch keeps re-asserting (no flap budget at this layer).
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..OUTPUT_RECOVERY_HEALTHY.as_secs() {
         restart_ready(&mut s, p, TICK);
@@ -1181,14 +1181,14 @@ fn should_restart_false_for_non_recoverable_protection_cause() {
     // what the gate exists to prevent. Same goes for Unread (we don't
     // know the cause) and Unknown(_) (off-spec read).
     for cause in [
-        Some(XyProtectionStatus::Ocp),
-        Some(XyProtectionStatus::Ovp),
-        Some(XyProtectionStatus::Opp),
-        Some(XyProtectionStatus::Icp),
-        Some(XyProtectionStatus::Unknown(99)),
+        Some(ProtectionStatus::Ocp),
+        Some(ProtectionStatus::Ovp),
+        Some(ProtectionStatus::Opp),
+        Some(ProtectionStatus::Icp),
+        Some(ProtectionStatus::Unknown(99)),
         // PROTECT=Normal: panel toggle / external write / EMI on the
         // button GPIO. Warrants a human, not an auto-restart.
-        Some(XyProtectionStatus::Normal),
+        Some(ProtectionStatus::Normal),
         None, // PROTECT read failed
     ] {
         let mut s = active(lfp_4s());
@@ -1336,7 +1336,7 @@ fn restart_resets_on_nan_battery() {
     // `should_restart_resets_on_missing_battery` but with NaN/Inf, which
     // a misbehaving INA228 might emit. Resets the clock identically.
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
