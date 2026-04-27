@@ -88,7 +88,7 @@ pub enum ProtectionStatus {
 }
 
 impl ProtectionStatus {
-    pub const fn from_register(raw: u16) -> Self {
+    pub const fn from_reg(raw: u16) -> Self {
         match raw {
             0 => Self::Normal,
             1 => Self::Ovp,
@@ -203,10 +203,10 @@ mod tests {
     use std::format;
 
     /// Pin every documented protection code (0..=10) plus an out-of-range
-    /// case. A reordering of the match arms in `from_register` would surface
+    /// case. A reordering of the match arms in `from_reg` would surface
     /// here.
     #[test]
-    fn protection_status_from_register_full_mapping() {
+    fn protection_status_from_reg_full_mapping() {
         let cases = [
             (0, ProtectionStatus::Normal),
             (1, ProtectionStatus::Ovp),
@@ -223,7 +223,7 @@ mod tests {
             (0xFFFF, ProtectionStatus::Unknown(0xFFFF)),
         ];
         for (raw, expected) in cases {
-            assert_eq!(ProtectionStatus::from_register(raw), expected);
+            assert_eq!(ProtectionStatus::from_reg(raw), expected);
         }
     }
 

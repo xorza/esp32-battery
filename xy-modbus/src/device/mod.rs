@@ -118,17 +118,19 @@ impl<T: ModbusTransport> Xy<T> {
         // Indexing below uses absolute register addresses as array offsets,
         // which is only valid because the bulk read starts at address 0.
         const _: () = assert!(REG_V_SET == 0);
-        let mut r = [0u16; 0x13];
+        const LEN: usize = REG_OUTPUT_EN as usize + 1;
+        let mut r = [0u16; LEN];
         self.transport.read_holding(self.slave, REG_V_SET, &mut r)?;
         let i_scale = self.model.current_scale();
+        let p_scale = self.model.power_scale();
         Ok(Status {
-            v_set: from_reg_u16(r[0], 100.0),
-            i_set: from_reg_u16(r[1], i_scale),
-            v_out: from_reg_u16(r[2], 100.0),
-            i_out: from_reg_u16(r[3], i_scale),
-            p_out: from_reg_u16(r[4], self.model.power_scale()),
-            v_in: from_reg_u16(r[5], 100.0),
-            protection: ProtectionStatus::from_register(r[REG_PROTECT as usize]),
+            v_set: from_reg_u16(r[REG_V_SET as usize], 100.0),
+            i_set: from_reg_u16(r[REG_I_SET as usize], i_scale),
+            v_out: from_reg_u16(r[REG_V_OUT as usize], 100.0),
+            i_out: from_reg_u16(r[REG_I_OUT as usize], i_scale),
+            p_out: from_reg_u16(r[REG_P_OUT as usize], p_scale),
+            v_in: from_reg_u16(r[REG_V_IN as usize], 100.0),
+            protection: ProtectionStatus::from_reg(r[REG_PROTECT as usize]),
             reg_mode: RegMode::from_reg(r[REG_CVCC as usize]),
             output_on: r[REG_OUTPUT_EN as usize] != 0,
         })
@@ -235,7 +237,7 @@ impl<T: ModbusTransport> Xy<T> {
     /// output is on, this register is necessarily `Normal` — only worth
     /// reading after observing OUTPUT_EN go low.
     pub fn read_protection_status(&mut self) -> Result<ProtectionStatus, RtuError> {
-        Ok(ProtectionStatus::from_register(self.read_one(REG_PROTECT)?))
+        Ok(ProtectionStatus::from_reg(self.read_one(REG_PROTECT)?))
     }
 
     /// Clear a latched protection cause (write 0 to PROTECT). This
