@@ -433,8 +433,9 @@ fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
         if attempt > 0 {
             thread::sleep(BOOT_RETRY_DELAY);
         }
-        if boot_sequence(xy).is_ok() {
-            return;
+        match boot_sequence(xy) {
+            Ok(()) => return,
+            Err(e) => warn!("XY boot attempt {}/{BOOT_RETRY_COUNT}: {e}", attempt + 1),
         }
     }
     error!("XY boot failed after {BOOT_RETRY_COUNT} attempts — rebooting MCU");
@@ -449,10 +450,9 @@ fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
     // `reboot_after`) doesn't trip the deadman before the restart fires.
     task_wdt::unsubscribe();
     reboot::reboot_after("XY boot failed: rebooting now");
-    // Park this thread until the reboot fires. Anything below would race
-    // the restart and add no value.
+    // Park until the reboot fires — nothing below would matter.
     loop {
-        thread::sleep(Duration::from_secs(60));
+        thread::park();
     }
 }
 
@@ -475,16 +475,16 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         boot_with_retries(&xy, &recorder);
         let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
-        // Inner loop = supervise. Returns Ok(()) when the supervisor
-        // signals should_restart (caller's cue to tear down + redo
-        // boot_sequence); panics propagate out as Err.
+        // Inner loop = supervise. Returns Ok(()) when tick_recovery
+        // signals ready (caller's cue to tear down + redo boot_sequence);
+        // panics propagate out as Err.
         let result = catch_unwind(AssertUnwindSafe(|| {
             loop {
                 task_wdt::reset();
                 let p = poll(&xy, &sensor_data, &recorder);
                 let action = supervisor.tick(p, POLL_INTERVAL);
                 apply_action(&xy, &mut supervisor, action, &recorder);
-                if supervisor.should_restart(&p, POLL_INTERVAL) {
+                if supervisor.tick_recovery(&p, POLL_INTERVAL) {
                     return;
                 }
                 thread::sleep(POLL_INTERVAL);

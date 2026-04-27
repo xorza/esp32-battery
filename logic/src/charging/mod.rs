@@ -371,7 +371,7 @@ pub struct BatterySample {
 /// - `Active`: output is on, phase machine + drift + fault paths run.
 /// - `Tripped { acked: false }`: a fault latched; emit `DisableOutput`.
 /// - `Tripped { acked: true }`: caller successfully disabled; emit None.
-///   For recoverable faults the caller polls `should_restart` and, when
+///   For recoverable faults the caller polls `tick_recovery` and, when
 ///   it returns true, throws this supervisor away and restarts the
 ///   supervise loop with a fresh `boot_sequence`.
 enum LatchState {
@@ -412,7 +412,7 @@ pub struct ChargeSupervisor {
     modbus_err: Debounce,
     latch: LatchState,
     /// Continuous healthy-state time accumulated since the current
-    /// Tripped latch, advanced only by `should_restart`. Reset on each
+    /// Tripped latch, advanced only by `tick_recovery`. Reset on each
     /// new latch. Only meaningful when the latched fault has a recovery
     /// policy.
     recovery_elapsed: Duration,
@@ -729,7 +729,7 @@ impl ChargeSupervisor {
     /// the OV threshold, and the buck still reporting output OFF (any
     /// spontaneous re-enable is unmodeled — reset the clock until we see
     /// a clean stable state).
-    pub fn should_restart(&mut self, p: &PollResult, elapsed: Duration) -> bool {
+    pub fn tick_recovery(&mut self, p: &PollResult, elapsed: Duration) -> bool {
         let LatchState::Tripped {
             reason,
             acked: true,

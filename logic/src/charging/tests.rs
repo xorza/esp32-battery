@@ -1069,13 +1069,13 @@ fn should_restart_after_healthy_window() {
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
-        assert!(!s.should_restart(&p, TICK));
+        assert!(!s.tick_recovery(&p, TICK));
         // tick during recovery returns None — phase machine is gated off.
         assert!(matches!(s.tick(p, TICK), Action::None));
         assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff(_))));
     }
     // The Nth healthy call crosses the threshold.
-    assert!(s.should_restart(&p, TICK));
+    assert!(s.tick_recovery(&p, TICK));
 }
 
 #[test]
@@ -1084,7 +1084,7 @@ fn should_restart_resets_on_overvoltage() {
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
-        assert!(!s.should_restart(&p, TICK));
+        assert!(!s.tick_recovery(&p, TICK));
     }
     // A single tick with the pack over OV resets the clock.
     let absorb = lfp_4s().absorb_v;
@@ -1092,9 +1092,9 @@ fn should_restart_resets_on_overvoltage() {
         battery: b(absorb + OV_MARGIN_V + 0.5, -0.1),
         ..p
     };
-    assert!(!s.should_restart(&p_ov, TICK));
+    assert!(!s.tick_recovery(&p_ov, TICK));
     // One more healthy call must NOT cross — clock is back to 1.
-    assert!(!s.should_restart(&p, TICK));
+    assert!(!s.tick_recovery(&p, TICK));
 }
 
 #[test]
@@ -1103,15 +1103,15 @@ fn should_restart_resets_on_modbus_down() {
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
-        assert!(!s.should_restart(&p, TICK));
+        assert!(!s.tick_recovery(&p, TICK));
     }
     let p_modbus_down = PollResult {
         setpoints: None,
         output: None,
         ..p
     };
-    assert!(!s.should_restart(&p_modbus_down, TICK));
-    assert!(!s.should_restart(&p, TICK));
+    assert!(!s.tick_recovery(&p_modbus_down, TICK));
+    assert!(!s.tick_recovery(&p, TICK));
 }
 
 #[test]
@@ -1120,11 +1120,11 @@ fn should_restart_resets_on_missing_battery() {
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
-        assert!(!s.should_restart(&p, TICK));
+        assert!(!s.tick_recovery(&p, TICK));
     }
     let p_no_batt = PollResult { battery: None, ..p };
-    assert!(!s.should_restart(&p_no_batt, TICK));
-    assert!(!s.should_restart(&p, TICK));
+    assert!(!s.tick_recovery(&p_no_batt, TICK));
+    assert!(!s.tick_recovery(&p, TICK));
 }
 
 #[test]
@@ -1135,14 +1135,14 @@ fn should_restart_resets_on_unexpected_output_on() {
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
-        assert!(!s.should_restart(&p, TICK));
+        assert!(!s.tick_recovery(&p, TICK));
     }
     let p_on = PollResult {
         output: Some(BuckOutput::On),
         ..p
     };
-    assert!(!s.should_restart(&p_on, TICK));
-    assert!(!s.should_restart(&p, TICK));
+    assert!(!s.tick_recovery(&p_on, TICK));
+    assert!(!s.tick_recovery(&p, TICK));
 }
 
 #[test]
@@ -1155,13 +1155,13 @@ fn should_restart_repeats_across_cycles() {
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..OUTPUT_RECOVERY_HEALTHY.as_secs() {
-        s.should_restart(&p, TICK);
+        s.tick_recovery(&p, TICK);
     }
-    assert!(s.should_restart(&p, TICK));
+    assert!(s.tick_recovery(&p, TICK));
     // Even after firing once, calling again with healthy state still
     // returns true — the caller is expected to react by tearing the
     // supervisor down, not to wait for a state transition.
-    assert!(s.should_restart(&p, TICK));
+    assert!(s.tick_recovery(&p, TICK));
 }
 
 #[test]
@@ -1177,7 +1177,7 @@ fn should_restart_false_for_non_recoverable_fault() {
     s.ack_disable();
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() * 5) {
-        assert!(!s.should_restart(&p, TICK));
+        assert!(!s.tick_recovery(&p, TICK));
     }
     assert!(matches!(s.fault(), Some(FaultReason::Overvoltage)));
 }
@@ -1187,9 +1187,9 @@ fn should_restart_false_in_pending_and_active() {
     // Outside Tripped, should_restart is always false regardless of input.
     let mut s = ChargeSupervisor::new(lfp_4s());
     let p = healthy_recovery_poll(&s);
-    assert!(!s.should_restart(&p, TICK)); // Pending
+    assert!(!s.tick_recovery(&p, TICK)); // Pending
     let mut s = active(lfp_4s());
-    assert!(!s.should_restart(&p, TICK)); // Active
+    assert!(!s.tick_recovery(&p, TICK)); // Active
 }
 
 #[test]
@@ -1210,7 +1210,7 @@ fn should_restart_false_for_non_recoverable_protection_cause() {
         latch_self_disable(&mut s, cause);
         let p = healthy_recovery_poll(&s);
         for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() * 2) {
-            assert!(!s.should_restart(&p, TICK));
+            assert!(!s.tick_recovery(&p, TICK));
         }
     }
 }
