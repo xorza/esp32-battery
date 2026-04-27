@@ -1023,18 +1023,20 @@ fn buck_self_disable_in_active_latches() {
     assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(None)));
 }
 
-/// Drive `s` from Active into Tripped(OutputUnexpectedlyOff, acked:true).
-/// Shared by every recovery test: latch → ack disable.
-fn latch_self_disable(s: &mut ChargeSupervisor) {
+/// Drive `s` from Active into Tripped(OutputUnexpectedlyOff(cause), acked:true).
+/// Shared by every recovery test: latch → ack disable. The cause governs
+/// whether `should_restart` will eventually fire — recovery tests pass a
+/// recoverable cause (LVP), gate tests pass a non-recoverable one.
+fn latch_self_disable(s: &mut ChargeSupervisor, cause: Option<XyProtectionStatus>) {
     let a = s.tick(
         PollResult {
             setpoints: Some(s.expected_setpoints()),
-            output: Some(BuckOutput::Off { cause: None }),
+            output: Some(BuckOutput::Off { cause }),
             battery: b(OK_V, -0.1),
         },
         TICK,
     );
-    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(None)));
+    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(cause)));
     s.ack_disable();
 }
 
@@ -1049,14 +1051,13 @@ fn healthy_recovery_poll(s: &ChargeSupervisor) -> PollResult {
 }
 
 #[test]
-#[ignore = "auto-recovery temporarily disabled — recovery_healthy_for returns None"]
 fn should_restart_after_healthy_window() {
     // Active → buck self-disables → latch → ack. After
     // OUTPUT_RECOVERY_HEALTHY of continuously-healthy ticks, should_restart
     // returns true (caller's cue to throw this supervisor away and re-run
     // boot_sequence).
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s);
+    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!s.should_restart(&p, TICK));
@@ -1071,7 +1072,7 @@ fn should_restart_after_healthy_window() {
 #[test]
 fn should_restart_resets_on_overvoltage() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s);
+    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!s.should_restart(&p, TICK));
@@ -1090,7 +1091,7 @@ fn should_restart_resets_on_overvoltage() {
 #[test]
 fn should_restart_resets_on_modbus_down() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s);
+    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!s.should_restart(&p, TICK));
@@ -1107,7 +1108,7 @@ fn should_restart_resets_on_modbus_down() {
 #[test]
 fn should_restart_resets_on_missing_battery() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s);
+    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!s.should_restart(&p, TICK));
@@ -1122,7 +1123,7 @@ fn should_restart_resets_on_unexpected_output_on() {
     // Buck spontaneously came back on (panel toggle, EMC, whatever) —
     // we want a stable OFF state before signalling restart.
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s);
+    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!s.should_restart(&p, TICK));
@@ -1136,14 +1137,13 @@ fn should_restart_resets_on_unexpected_output_on() {
 }
 
 #[test]
-#[ignore = "auto-recovery temporarily disabled — recovery_healthy_for returns None"]
 fn should_restart_repeats_across_cycles() {
     // The supervisor itself doesn't cap recovery attempts — that lives in
     // the caller, which is what gets thrown away on each restart. A single
     // supervisor will happily fire `should_restart=true` over and over if
     // its latch keeps re-asserting (no flap budget at this layer).
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s);
+    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
     let p = healthy_recovery_poll(&s);
     for _ in 0..OUTPUT_RECOVERY_HEALTHY.as_secs() {
         s.should_restart(&p, TICK);
@@ -1181,6 +1181,29 @@ fn should_restart_false_in_pending_and_active() {
     assert!(!s.should_restart(&p, TICK)); // Pending
     let mut s = active(lfp_4s());
     assert!(!s.should_restart(&p, TICK)); // Active
+}
+
+#[test]
+fn should_restart_false_for_non_recoverable_protection_cause() {
+    // OCP / OVP / OPP / etc. are causes we don't auto-recover from —
+    // re-energizing into a sticky short or pack-side fault is exactly
+    // what the gate exists to prevent. Same goes for Unread (we don't
+    // know the cause) and Unknown(_) (off-spec read).
+    for cause in [
+        Some(XyProtectionStatus::Ocp),
+        Some(XyProtectionStatus::Ovp),
+        Some(XyProtectionStatus::Opp),
+        Some(XyProtectionStatus::Icp),
+        Some(XyProtectionStatus::Unknown(99)),
+        None, // PROTECT read failed
+    ] {
+        let mut s = active(lfp_4s());
+        latch_self_disable(&mut s, cause);
+        let p = healthy_recovery_poll(&s);
+        for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() * 2) {
+            assert!(!s.should_restart(&p, TICK));
+        }
+    }
 }
 
 #[test]

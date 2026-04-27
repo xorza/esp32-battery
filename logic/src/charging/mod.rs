@@ -84,7 +84,6 @@ const SETPOINT_DRIFT_TOL: f32 = 0.02;
 /// transient causes (input LVP from AC sag, over-temp cooldown) to
 /// genuinely clear; short enough that operationally a brief input glitch
 /// doesn't require a manual reboot.
-#[allow(dead_code)] // re-wired once `recovery_healthy_for` returns a real value again
 const OUTPUT_RECOVERY_HEALTHY: Duration = Duration::from_secs(60);
 /// Total recoveries from `OutputUnexpectedlyOff` allowed since boot. After
 /// this many flap cycles, the caller stops restarting and leaves the buck
@@ -202,6 +201,34 @@ pub enum XyProtectionStatus {
 }
 
 impl XyProtectionStatus {
+    /// Whether a self-disable for this cause is safe to auto-recover
+    /// from. Conservative: only causes that are *likely* transient and
+    /// pose no fresh risk if they re-fire after a wait. OCP/OPP can
+    /// signal a real downstream fault (short, sticky FET); OVP means
+    /// pack-side trouble; energy/time limits hit programmed budgets.
+    /// Reboot-required for those.
+    pub fn is_recoverable(self) -> bool {
+        match self {
+            // Input-side and over-temp issues that genuinely clear with
+            // time (AC sag returns, fan cools the case).
+            Self::Lvp | Self::Otp => true,
+            // Output went off but the device reports no protection —
+            // front-panel toggle or external write. Safe to bring back.
+            Self::Normal => true,
+            // Output / pack / load problems that need someone to look.
+            Self::Ovp
+            | Self::Ocp
+            | Self::Opp
+            | Self::Oah
+            | Self::Ohp
+            | Self::Oep
+            | Self::Owh
+            | Self::Icp => false,
+            // Off-spec read — don't trust ourselves.
+            Self::Unknown(_) => false,
+        }
+    }
+
     pub fn from_register(raw: u16) -> Self {
         match raw {
             0 => Self::Normal,
@@ -289,12 +316,17 @@ impl FaultReason {
     /// clear without operator intervention. Hard safety faults (OV, drift,
     /// absorb timeout) stay reboot-only.
     pub fn recovery_healthy_for(self) -> Option<Duration> {
-        // Auto-recovery temporarily disabled while we wire `should_restart`
-        // to gate on `OutputUnexpectedlyOff(Some(Normal))` — without that
-        // gate, restarting after an OCP/OTP trip would re-energize into a
-        // possibly-still-tripped condition. Re-enable per-fault here once
-        // the gate lands.
-        None
+        match self {
+            // Only recover when the device-reported cause is one we
+            // believe is transient (LVP/OTP/Normal). For OCP/OVP/etc.
+            // we'd be re-energizing into a possibly-still-tripped
+            // condition — require a reboot. Cause=None (PROTECT read
+            // failed): conservative, treat as non-recoverable.
+            Self::OutputUnexpectedlyOff(Some(cause)) if cause.is_recoverable() => {
+                Some(OUTPUT_RECOVERY_HEALTHY)
+            }
+            _ => None,
+        }
     }
 }
 
