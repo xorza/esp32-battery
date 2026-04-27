@@ -17,11 +17,7 @@ use serde::ser::{SerializeMap, SerializeSeq};
 
 use esp32_battery_logic::error_log::{Event, EventLog};
 
-use crate::http::{JsonBuf, mount_json_get};
-
-/// EventLog is bounded (32 entries × ~40 chars + ~30 small counters), well
-/// under 4 KiB even with worst-case float-ish formatting.
-const RESPONSE_BUF_SIZE: usize = 4096;
+use crate::http::mount_json_get;
 
 struct InaCountsView<'a>(&'a EventLog);
 
@@ -74,7 +70,6 @@ pub fn mount(server: &mut EspHttpServer<'static>, event_log: Arc<Mutex<EventLog>
     mount_json_get(
         server,
         "/api/errors",
-        JsonBuf::<RESPONSE_BUF_SIZE>::new(),
         move |buf| {
             let log = event_log.lock().unwrap();
             let response = ErrorsResponse {

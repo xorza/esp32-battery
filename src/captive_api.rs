@@ -13,13 +13,10 @@ use log::info;
 
 use esp32_battery_logic::form;
 
-use crate::http::{JsonBuf, json_err, json_ok, mount_get, mount_json_get, mount_post, read_to_buf};
+use crate::http::{json_err, json_ok, mount_get, mount_json_get, mount_post, read_to_buf};
 use crate::net::{CredsMailbox, SubmissionStatus, SubmissionStatusHandle};
 use crate::nvs_creds::WifiCredentials;
 use crate::wifi::ScanCache;
-
-const SCAN_BUF_SIZE: usize = 1024;
-const STATUS_BUF_SIZE: usize = 64;
 
 pub fn mount(
     server: &mut EspHttpServer<'static>,
@@ -30,7 +27,6 @@ pub fn mount(
     mount_json_get(
         server,
         "/scan",
-        JsonBuf::<SCAN_BUF_SIZE>::new(),
         move |buf| {
             let cached = scan_cache.lock().unwrap();
             let rows: Vec<(&str, i8)> = cached
@@ -90,7 +86,6 @@ pub fn mount(
     mount_json_get(
         server,
         "/status",
-        JsonBuf::<STATUS_BUF_SIZE>::new(),
         move |buf| {
             let name: &'static str = status_state.load().into();
             let response = StatusResponse { state: name };

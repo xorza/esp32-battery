@@ -213,22 +213,18 @@ where
     }
 }
 
-/// Heap-allocated, mutex-guarded scratch buffer for JSON handlers. Sized at
-/// the type level so each handler picks its own response budget. The buffer
-/// is allocated once at handler-mount time and reused across requests, so
-/// concurrent calls serialize on the lock — fine because esp-idf's httpd
-/// already serializes work to a single task by default.
-pub(crate) struct JsonBuf<const N: usize>(Mutex<Box<[u8; N]>>);
+/// Single 16 KiB BSS-resident scratch buffer shared by all JSON handlers.
+/// Sized to the largest consumer (`api::RESPONSE_BUF_SIZE`); smaller handlers
+/// just use a prefix. Each `EspHttpServer` runs on a single httpd task so
+/// handlers within one server are serial, but the main HTTPS server and the
+/// captive HTTP server are separate tasks — the mutex makes the sharing safe
+/// either way and is uncontended on the hot path.
+const JSON_BUF_SIZE: usize = 16_384;
+static JSON_BUF: Mutex<[u8; JSON_BUF_SIZE]> = Mutex::new([0u8; JSON_BUF_SIZE]);
 
-impl<const N: usize> JsonBuf<N> {
-    pub fn new() -> Self {
-        Self(Mutex::new(Box::new([0u8; N])))
-    }
-
-    pub fn with<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
-        let mut guard = self.0.lock().unwrap();
-        f(guard.as_mut_slice())
-    }
+pub(crate) fn with_json_buf<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let mut guard = JSON_BUF.lock().unwrap();
+    f(guard.as_mut_slice())
 }
 
 /// Register a URI handler, panicking with the URI in the message on failure.
@@ -256,23 +252,20 @@ where
     mount_uri(server, uri, Method::Get, f);
 }
 
-/// Mount a `GET` route that owns a reusable JSON scratch buffer and
-/// serializes whatever `build` writes into it. Collapses the
-/// `mount_get → JsonBuf::with → json_response` triple-closure that
-/// every JSON handler used to spell out by hand. `build` runs inside
-/// the buffer-mutex critical section, so it can hold the data lock
-/// across `to_slice` without leaking it into the network write.
-pub(crate) fn mount_json_get<F, E, const N: usize>(
+/// Mount a `GET` route that serializes a JSON response into the shared
+/// scratch buffer. `build` runs inside the buffer-mutex critical section,
+/// so it can hold the data lock across `to_slice` without leaking it into
+/// the network write.
+pub(crate) fn mount_json_get<F, E>(
     server: &mut EspHttpServer<'static>,
     uri: &'static str,
-    buf: JsonBuf<N>,
     build: F,
 ) where
     F: Fn(&mut [u8]) -> Result<usize, E> + Send + 'static,
     E: core::fmt::Debug,
 {
     mount_get(server, uri, move |req| {
-        buf.with(|b| json_response(req, b, |inner| build(inner)))
+        with_json_buf(|b| json_response(req, b, |inner| build(inner)))
     });
 }
 

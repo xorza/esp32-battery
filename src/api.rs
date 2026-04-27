@@ -14,7 +14,7 @@ use esp32_battery_logic::battery;
 use esp32_battery_logic::data::{Sample, SensorData};
 
 use crate::clock::uptime;
-use crate::http::{JsonBuf, mount_json_get};
+use crate::http::mount_json_get;
 use crate::wifi::sta_rssi;
 
 #[derive(Serialize)]
@@ -84,16 +84,10 @@ pub struct ApiResponse<'a> {
     pub history: HistoryView<'a>,
 }
 
-/// Response buffer. Typical size is ~5 KiB (144 rows × ~30 chars). Bad sensor readings
-/// (NaN, denormals) can push ryu up to ~17 chars per float → 144 × 85 = 12 KiB worst case,
-/// so 16 KiB leaves margin. If serialization still overflows we return 500 instead of panicking.
-pub const RESPONSE_BUF_SIZE: usize = 16_384;
-
 pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorData>>) {
     mount_json_get(
         server,
         "/api",
-        JsonBuf::<RESPONSE_BUF_SIZE>::new(),
         move |buf| {
             // Sensor-data lock held only through serialization — history
             // is borrowed, not cloned. Lock drops at closure end, before
@@ -120,12 +114,10 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
                 history: HistoryView(store.history()),
             };
             let history_len = response.history.0.len();
+            let cap = buf.len();
             let result = serde_json_core::to_slice(&response, buf);
             if let Ok(len) = result {
-                debug!(
-                    "API: history={} json={}/{}",
-                    history_len, len, RESPONSE_BUF_SIZE
-                );
+                debug!("API: history={} json={}/{}", history_len, len, cap);
             }
             result
         },
