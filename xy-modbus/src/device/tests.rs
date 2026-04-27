@@ -409,8 +409,8 @@ fn one_shot_setters_use_correct_addr_and_value() {
     check!(REG_BACKLIGHT, 3, |x: &mut Xy<_>| x.set_backlight(3));
     check!(REG_SLEEP, 12, |x: &mut Xy<_>| x.set_sleep_minutes(12));
     check!(REG_BUZZER, 1, |x: &mut Xy<_>| x.set_buzzer(true));
-    // -2.5 °C → -25 raw → clamped to 0 by `to_reg`.
-    check!(REG_T_IN_OFFSET, 0, |x: &mut Xy<_>| x
+    // -2.5 °C → -25 raw → 0xFFE7 as i16 two's complement.
+    check!(REG_T_IN_OFFSET, 0xFFE7, |x: &mut Xy<_>| x
         .set_temp_offset_internal(-2.5));
     check!(REG_T_IN_OFFSET, 15, |x: &mut Xy<_>| x
         .set_temp_offset_internal(1.5));
@@ -464,6 +464,13 @@ fn one_shot_getters_use_correct_addr_and_scale() {
         15,
         |x: &mut Xy<_>| x.read_temp_offset_internal(),
         1.5
+    );
+    // 0xFFE7 = -25 as i16 → -2.5 °C; signed decoding must not read 6551.1.
+    check!(
+        REG_T_IN_OFFSET,
+        0xFFE7,
+        |x: &mut Xy<_>| x.read_temp_offset_internal(),
+        -2.5
     );
     check!(
         REG_T_EX_OFFSET,

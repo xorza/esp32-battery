@@ -10,24 +10,43 @@ use crate::types::{
 
 // Fixed-point conversion. Inputs are clamped to u16 — caller is responsible
 // for staying within the device's documented ranges (per-model V/A/W limits).
-fn to_reg(v: f32, scale: f32) -> u16 {
+// Negative or NaN inputs are a logic error: the device's V/A/W are all
+// non-negative, and silently saturating NaN to 0 would mask bad math upstream.
+fn to_reg_u16(v: f32, scale: f32) -> u16 {
+    assert!(v >= 0.0, "to_reg_u16: negative or NaN input ({v})");
     let r = (v * scale + 0.5) as i32;
     r.clamp(0, u16::MAX as i32) as u16
 }
 
-fn from_reg(raw: u16, scale: f32) -> f32 {
+fn from_reg_u16(raw: u16, scale: f32) -> f32 {
     raw as f32 / scale
+}
+
+// Signed variants for registers the firmware encodes as i16 two's
+// complement (currently only the temperature calibration offsets at
+// 0x001A / 0x001B — both can legitimately be negative).
+fn to_reg_i16(v: f32, scale: f32) -> u16 {
+    assert!(!v.is_nan(), "to_reg_i16: NaN input");
+    let scaled = v * scale;
+    // Round-half-away-from-zero without pulling in libm's `round`.
+    let r = if scaled >= 0.0 { scaled + 0.5 } else { scaled - 0.5 } as i32;
+    r.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16
+}
+
+fn from_reg_i16(raw: u16, scale: f32) -> f32 {
+    raw as i16 as f32 / scale
 }
 
 /// `low` / `high` match the on-wire register pair order (low word at the
 /// lower address — see `REG_AH_LOW` / `REG_AH_HIGH`).
-fn from_reg32(low: u16, high: u16, scale: f32) -> f32 {
+fn from_reg_u32(low: u16, high: u16, scale: f32) -> f32 {
     let raw = ((high as u32) << 16) | low as u32;
     raw as f32 / scale
 }
 
 /// Returns `(low, high)` words, matching the on-wire register pair order.
-fn to_reg32(v: f32, scale: f32) -> (u16, u16) {
+fn to_reg_u32(v: f32, scale: f32) -> (u16, u16) {
+    assert!(v >= 0.0, "to_reg_u32: negative or NaN input ({v})");
     let r = (v * scale + 0.5) as i64;
     let r = r.clamp(0, u32::MAX as i64) as u32;
     (r as u16, (r >> 16) as u16)
@@ -86,8 +105,8 @@ impl<T: ModbusTransport> Xy<T> {
         let mut r = [0u16; 2];
         self.transport.read_holding(self.slave, REG_V_SET, &mut r)?;
         Ok(Setpoints {
-            v_set: from_reg(r[0], 100.0),
-            i_set: from_reg(r[1], self.model.current_scale()),
+            v_set: from_reg_u16(r[0], 100.0),
+            i_set: from_reg_u16(r[1], self.model.current_scale()),
         })
     }
 
@@ -103,12 +122,12 @@ impl<T: ModbusTransport> Xy<T> {
         self.transport.read_holding(self.slave, REG_V_SET, &mut r)?;
         let i_scale = self.model.current_scale();
         Ok(Status {
-            v_set: from_reg(r[0], 100.0),
-            i_set: from_reg(r[1], i_scale),
-            v_out: from_reg(r[2], 100.0),
-            i_out: from_reg(r[3], i_scale),
-            p_out: from_reg(r[4], self.model.power_scale()),
-            v_in: from_reg(r[5], 100.0),
+            v_set: from_reg_u16(r[0], 100.0),
+            i_set: from_reg_u16(r[1], i_scale),
+            v_out: from_reg_u16(r[2], 100.0),
+            i_out: from_reg_u16(r[3], i_scale),
+            p_out: from_reg_u16(r[4], self.model.power_scale()),
+            v_in: from_reg_u16(r[5], 100.0),
             protection: ProtectionStatus::from_register(r[REG_PROTECT as usize]),
             reg_mode: RegMode::from_reg(r[REG_CVCC as usize]),
             output_on: r[REG_OUTPUT_EN as usize] != 0,
@@ -116,22 +135,22 @@ impl<T: ModbusTransport> Xy<T> {
     }
 
     pub fn read_voltage_out(&mut self) -> Result<f32, RtuError> {
-        Ok(from_reg(self.read_one(REG_V_OUT)?, 100.0))
+        Ok(from_reg_u16(self.read_one(REG_V_OUT)?, 100.0))
     }
     pub fn read_current_out(&mut self) -> Result<f32, RtuError> {
-        Ok(from_reg(
+        Ok(from_reg_u16(
             self.read_one(REG_I_OUT)?,
             self.model.current_scale(),
         ))
     }
     pub fn read_power_out(&mut self) -> Result<f32, RtuError> {
-        Ok(from_reg(
+        Ok(from_reg_u16(
             self.read_one(REG_P_OUT)?,
             self.model.power_scale(),
         ))
     }
     pub fn read_voltage_in(&mut self) -> Result<f32, RtuError> {
-        Ok(from_reg(self.read_one(REG_V_IN)?, 100.0))
+        Ok(from_reg_u16(self.read_one(REG_V_IN)?, 100.0))
     }
 
     // ─── Cumulative totals ───────────────────────────────────────────────────
@@ -143,8 +162,8 @@ impl<T: ModbusTransport> Xy<T> {
         self.transport
             .read_holding(self.slave, REG_AH_LOW, &mut r)?;
         Ok(Totals {
-            charge_ah: from_reg32(r[0], r[1], 1000.0),
-            energy_wh: from_reg32(r[2], r[3], 1000.0),
+            charge_ah: from_reg_u32(r[0], r[1], 1000.0),
+            energy_wh: from_reg_u32(r[2], r[3], 1000.0),
             on_time: OnTime {
                 hours: r[4],
                 minutes: r[5],
@@ -159,20 +178,20 @@ impl<T: ModbusTransport> Xy<T> {
     /// V-SET higher than the current S-OVP latches OVP immediately —
     /// program protection (see [`Self::set_protection`]) first.
     pub fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
-        self.write_one(REG_V_SET, to_reg(volts, 100.0))
+        self.write_one(REG_V_SET, to_reg_u16(volts, 100.0))
     }
 
     pub fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError> {
-        self.write_one(REG_I_SET, to_reg(amps, self.model.current_scale()))
+        self.write_one(REG_I_SET, to_reg_u16(amps, self.model.current_scale()))
     }
 
     /// Program LVP / OVP / OCP into the active group's protection
     /// registers (0x0052–0x0054) in one bulk write.
     pub fn set_protection(&mut self, l: SafetyLimits) -> Result<(), RtuError> {
         let values = [
-            to_reg(l.lvp_v, 100.0),
-            to_reg(l.ovp_v, 100.0),
-            to_reg(l.ocp_a, self.model.current_scale()),
+            to_reg_u16(l.lvp_v, 100.0),
+            to_reg_u16(l.ovp_v, 100.0),
+            to_reg_u16(l.ocp_a, self.model.current_scale()),
         ];
         self.transport
             .write_multiple_holdings(self.slave, REG_S_LVP, &values)
@@ -183,9 +202,9 @@ impl<T: ModbusTransport> Xy<T> {
         let mut r = [0u16; 3];
         self.transport.read_holding(self.slave, REG_S_LVP, &mut r)?;
         Ok(SafetyLimits {
-            lvp_v: from_reg(r[0], 100.0),
-            ovp_v: from_reg(r[1], 100.0),
-            ocp_a: from_reg(r[2], self.model.current_scale()),
+            lvp_v: from_reg_u16(r[0], 100.0),
+            ovp_v: from_reg_u16(r[1], 100.0),
+            ocp_a: from_reg_u16(r[2], self.model.current_scale()),
         })
     }
 
@@ -237,7 +256,7 @@ impl<T: ModbusTransport> Xy<T> {
     pub fn read_temperatures(&mut self) -> Result<(f32, f32), RtuError> {
         let mut r = [0u16; 2];
         self.transport.read_holding(self.slave, REG_T_IN, &mut r)?;
-        Ok((from_reg(r[0], 10.0), from_reg(r[1], 10.0)))
+        Ok((from_reg_u16(r[0], 10.0), from_reg_u16(r[1], 10.0)))
     }
 
     pub fn read_temp_unit(&mut self) -> Result<TempUnit, RtuError> {
@@ -248,16 +267,16 @@ impl<T: ModbusTransport> Xy<T> {
     }
 
     pub fn read_temp_offset_internal(&mut self) -> Result<f32, RtuError> {
-        Ok(from_reg(self.read_one(REG_T_IN_OFFSET)?, 10.0))
+        Ok(from_reg_i16(self.read_one(REG_T_IN_OFFSET)?, 10.0))
     }
     pub fn set_temp_offset_internal(&mut self, offset: f32) -> Result<(), RtuError> {
-        self.write_one(REG_T_IN_OFFSET, to_reg(offset, 10.0))
+        self.write_one(REG_T_IN_OFFSET, to_reg_i16(offset, 10.0))
     }
     pub fn read_temp_offset_external(&mut self) -> Result<f32, RtuError> {
-        Ok(from_reg(self.read_one(REG_T_EX_OFFSET)?, 10.0))
+        Ok(from_reg_i16(self.read_one(REG_T_EX_OFFSET)?, 10.0))
     }
     pub fn set_temp_offset_external(&mut self, offset: f32) -> Result<(), RtuError> {
-        self.write_one(REG_T_EX_OFFSET, to_reg(offset, 10.0))
+        self.write_one(REG_T_EX_OFFSET, to_reg_i16(offset, 10.0))
     }
 
     // ─── Front panel & misc ──────────────────────────────────────────────────
@@ -418,39 +437,39 @@ fn decode_group(r: &[u16; GROUP_LEN as usize], model: Model) -> GroupParams {
         s_ini,
     ] = *r;
     GroupParams {
-        v_set: from_reg(v_set, 100.0),
-        i_set: from_reg(i_set, i_scale),
-        s_lvp_v: from_reg(s_lvp, 100.0),
-        s_ovp_v: from_reg(s_ovp, 100.0),
-        s_ocp_a: from_reg(s_ocp, i_scale),
-        s_opp_w: from_reg(s_opp, model.opp_scale()),
+        v_set: from_reg_u16(v_set, 100.0),
+        i_set: from_reg_u16(i_set, i_scale),
+        s_lvp_v: from_reg_u16(s_lvp, 100.0),
+        s_ovp_v: from_reg_u16(s_ovp, 100.0),
+        s_ocp_a: from_reg_u16(s_ocp, i_scale),
+        s_opp_w: from_reg_u16(s_opp, model.opp_scale()),
         s_ohp_h,
         s_ohp_m,
-        s_oah_ah: from_reg32(s_oah_low, s_oah_high, 1000.0),
-        s_owh_wh: from_reg32(s_owh_low, s_owh_high, 100.0),
-        s_otp: from_reg(s_otp, 10.0),
+        s_oah_ah: from_reg_u32(s_oah_low, s_oah_high, 1000.0),
+        s_owh_wh: from_reg_u32(s_owh_low, s_owh_high, 100.0),
+        s_otp: from_reg_u16(s_otp, 10.0),
         power_on_output: s_ini != 0,
     }
 }
 
 fn encode_group(p: &GroupParams, model: Model) -> [u16; GROUP_LEN as usize] {
     let i_scale = model.current_scale();
-    let (oah_low, oah_high) = to_reg32(p.s_oah_ah, 1000.0);
-    let (owh_low, owh_high) = to_reg32(p.s_owh_wh, 100.0);
+    let (oah_low, oah_high) = to_reg_u32(p.s_oah_ah, 1000.0);
+    let (owh_low, owh_high) = to_reg_u32(p.s_owh_wh, 100.0);
     [
-        to_reg(p.v_set, 100.0),
-        to_reg(p.i_set, i_scale),
-        to_reg(p.s_lvp_v, 100.0),
-        to_reg(p.s_ovp_v, 100.0),
-        to_reg(p.s_ocp_a, i_scale),
-        to_reg(p.s_opp_w, model.opp_scale()),
+        to_reg_u16(p.v_set, 100.0),
+        to_reg_u16(p.i_set, i_scale),
+        to_reg_u16(p.s_lvp_v, 100.0),
+        to_reg_u16(p.s_ovp_v, 100.0),
+        to_reg_u16(p.s_ocp_a, i_scale),
+        to_reg_u16(p.s_opp_w, model.opp_scale()),
         p.s_ohp_h,
         p.s_ohp_m,
         oah_low,
         oah_high,
         owh_low,
         owh_high,
-        to_reg(p.s_otp, 10.0),
+        to_reg_u16(p.s_otp, 10.0),
         p.power_on_output as u16,
     ]
 }

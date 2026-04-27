@@ -26,6 +26,11 @@ use crate::framing::{
 };
 use crate::transport::{BlockingRead, ModbusTransport, RtuError};
 
+// `write_multiple_holdings` builds the request frame into `self.buf` and
+// `expect`s success — sound only because the buffer fits the largest
+// possible Write Multiple frame (slave + fc + addr + qty + bc + 2*regs + crc).
+const _: () = assert!(MAX_ADU >= 9 + 2 * MAX_WRITE_REGS);
+
 // ─── UartTransport ───────────────────────────────────────────────────────────
 
 /// Generic Modbus-RTU transport over any blocking-with-timeout UART.
