@@ -2,50 +2,74 @@
 //!
 //! The project ships with `CONFIG_ESP_TASK_WDT_INIT=n` and idle tasks
 //! unsubscribed (see `sdkconfig.defaults`) — OTA flash writes block the
-//! IDLE task for more than 5 s and would otherwise trip the WDT. Only
-//! safety-critical tasks (currently just the xy supervisor) opt in by
-//! calling [`init_and_subscribe`] once and [`reset`] every loop iteration.
+//! IDLE task for more than 5 s and would otherwise trip the WDT. `main`
+//! calls [`init`] once at boot; safety-critical threads then call
+//! [`subscribe`] (returning a [`WdtToken`]) and feed it every loop
+//! iteration.
+//!
+//! [`WdtToken`] is `!Send + !Sync`: the TWDT subscription is bound to
+//! the FreeRTOS task that called `esp_task_wdt_add`, so feeding from a
+//! different thread would feed the wrong subscription. The marker
+//! makes that a compile error.
 //!
 //! On timeout the WDT panics → core reboots → S_INI=OFF brings the buck
 //! up disabled.
 
+use std::marker::PhantomData;
 use std::time::Duration;
 
 use esp_idf_svc::sys::{
-    ESP_OK, esp, esp_task_wdt_add, esp_task_wdt_config_t, esp_task_wdt_delete, esp_task_wdt_init,
-    esp_task_wdt_reconfigure, esp_task_wdt_reset,
+    esp, esp_task_wdt_add, esp_task_wdt_config_t, esp_task_wdt_delete, esp_task_wdt_init,
+    esp_task_wdt_reset,
 };
 
-/// Initialize the task watchdog with `timeout` and subscribe the **current**
-/// task to it. Safe to call from a thread that wasn't auto-subscribed.
-///
-/// Idempotent re-init: if the WDT was already initialized (e.g. by another
-/// safety-critical task that came up first), falls back to `reconfigure`.
-pub fn init_and_subscribe(timeout: Duration) {
+/// Shared timeout for all subscribed tasks. Long enough to ride out
+/// the slowest legitimate work item, short enough that a wedged loop
+/// reboots within ~10 s.
+pub const WDT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Initialize the task watchdog. Call exactly once from `main` before
+/// any thread calls [`subscribe`].
+pub fn init() {
     let cfg = esp_task_wdt_config_t {
-        timeout_ms: timeout.as_millis() as u32,
+        timeout_ms: WDT_TIMEOUT.as_millis() as u32,
         // Bitmask of cores to monitor for idle-task hangs. 0 = none —
-        // we only care about *this* task missing its reset.
+        // we only care about subscribed tasks missing their reset.
         idle_core_mask: 0,
         // Trigger panic (→ reboot) on timeout instead of just logging.
         trigger_panic: true,
     };
-    if unsafe { esp_task_wdt_init(&cfg) } != ESP_OK {
-        esp!(unsafe { esp_task_wdt_reconfigure(&cfg) }).expect("WDT reconfigure");
-    }
+    esp!(unsafe { esp_task_wdt_init(&cfg) }).expect("WDT init");
+}
+
+/// Per-thread WDT subscription handle. `!Send + !Sync` so the type
+/// system enforces that [`reset`](Self::reset) and `Drop` run on the
+/// same FreeRTOS task that called [`subscribe`].
+pub struct WdtToken {
+    _not_send_sync: PhantomData<*const ()>,
+}
+
+/// Subscribe the **current** task to the watchdog. Must be called from
+/// inside the thread to be monitored, after [`init`]. Drop the returned
+/// token to unsubscribe.
+pub fn subscribe() -> WdtToken {
     esp!(unsafe { esp_task_wdt_add(std::ptr::null_mut()) }).expect("WDT subscribe current task");
-}
-
-/// Feed the watchdog from the current task. Must be called at least once
-/// per `timeout` interval after [`init_and_subscribe`].
-pub fn reset() {
-    unsafe {
-        esp_task_wdt_reset();
+    WdtToken {
+        _not_send_sync: PhantomData,
     }
 }
 
-/// Unsubscribe the current task. Call this before a deliberate thread
-/// exit so the WDT doesn't reboot the MCU once feeds stop arriving.
-pub fn unsubscribe() {
-    esp!(unsafe { esp_task_wdt_delete(std::ptr::null_mut()) }).expect("WDT unsubscribe");
+impl WdtToken {
+    /// Feed the watchdog. Must be called at least once per [`WDT_TIMEOUT`].
+    pub fn reset(&self) {
+        unsafe {
+            esp_task_wdt_reset();
+        }
+    }
+}
+
+impl Drop for WdtToken {
+    fn drop(&mut self) {
+        esp!(unsafe { esp_task_wdt_delete(std::ptr::null_mut()) }).expect("WDT unsubscribe");
+    }
 }

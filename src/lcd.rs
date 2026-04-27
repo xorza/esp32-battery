@@ -461,7 +461,10 @@ fn run(
     // and these statics are not referenced anywhere else.
     static mut SPI_BUF: [u8; SPI_BUF_SIZE] = [0; SPI_BUF_SIZE];
     static mut SCRATCH_PIXELS: [Rgb565; SCRATCH_PX] = [COLOR_BG; SCRATCH_PX];
+    // `&raw mut` is a raw pointer; clippy's `deref_addrof` misfires here.
+    #[allow(clippy::deref_addrof)]
     let spi_buf: &'static mut [u8] = unsafe { &mut *&raw mut SPI_BUF };
+    #[allow(clippy::deref_addrof)]
     let scratch_pixels: &'static mut [Rgb565] = unsafe { &mut *&raw mut SCRATCH_PIXELS };
 
     let timer = LedcTimerDriver::new(

@@ -19,11 +19,9 @@ AI coding rules for Rust projects:
 
 ## Verification
 
-- After changing code, run before confirming:
-  ```
-  cargo nextest run && cargo fmt && cargo check && cargo clippy --all-targets -- -D warnings
-  ```
-  Skip doc-tests.
+- After changing code, run `./run_tests.sh` before confirming. It runs host-side
+  logic tests + clippy + fmt, then firmware clippy on both esp32c6 and esp32c3
+  with and without fake-hardware features. Fails fast on the first error.
 - Check test run times are reasonable. Research and fix slow tests.
 - Check online documentation for best practices and patterns.
 

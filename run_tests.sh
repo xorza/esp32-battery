@@ -8,9 +8,12 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
-HOST_TARGET="x86_64-unknown-linux-gnu"
 C6_TARGET="riscv32imac-esp-espidf"
 C3_TARGET="riscv32imc-esp-espidf"
+
+# Host target = whatever this machine is. Keeps the script working on
+# both Linux CI and macOS dev boxes (Intel + Apple Silicon).
+HOST_TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
 
 run() {
     echo

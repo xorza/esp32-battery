@@ -434,8 +434,7 @@ const BOOT_RETRY_COUNT: u32 = 10;
 /// generous headroom — long enough that a single slow tick never trips
 /// the WDT, short enough that a wedged loop reboots within ~10 s and
 /// `S_INI=OFF` brings the buck back up disabled.
-const WDT_TIMEOUT: Duration = Duration::from_secs(10);
-const _: () = assert!(WDT_TIMEOUT.as_secs() > POLL_INTERVAL.as_secs() * 2);
+const _: () = assert!(task_wdt::WDT_TIMEOUT.as_secs() > POLL_INTERVAL.as_secs() * 2);
 
 /// Try `boot_sequence` up to `BOOT_RETRY_COUNT` times. On total failure,
 /// best-effort disable output and reboot the MCU — the alternative is
@@ -467,9 +466,10 @@ fn supervise_loop<D: XyDevice>(
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
     supervisor: &mut ChargeSupervisor,
+    wdt: &task_wdt::WdtToken,
 ) {
     loop {
-        task_wdt::reset();
+        wdt.reset();
         let p = poll(xy, sensor_data, recorder);
         let action = supervisor.tick(p, POLL_INTERVAL);
         if matches!(action, Action::RestartSupervisor) {
@@ -483,7 +483,8 @@ fn supervise_loop<D: XyDevice>(
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     // Subscribe once for the lifetime of this thread. Restarts of the
     // supervise loop (below) keep feeding the same WDT subscription.
-    task_wdt::init_and_subscribe(WDT_TIMEOUT);
+    // The token is `!Send`, so it stays bound to this FreeRTOS task.
+    let wdt = task_wdt::subscribe();
 
     // Outer loop = recovery restarts. Each iteration re-runs boot_sequence
     // (which reprograms + verifies OVP/OCP/LVP/V_SET/I_SET) and constructs
@@ -502,7 +503,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         // catch_unwind shields the recovery loop from panics in tick /
         // apply_action. Ok(()) = tick asked for restart; Err = panic.
         let result = catch_unwind(AssertUnwindSafe(|| {
-            supervise_loop(&xy, &sensor_data, &recorder, &mut supervisor)
+            supervise_loop(&xy, &sensor_data, &recorder, &mut supervisor, &wdt)
         }));
 
         if let Err(panic) = result {
@@ -513,6 +514,10 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
                 .unwrap_or("<non-string panic>");
             error!("XY supervisor thread PANICKED: {msg} — forcing output OFF");
             recorder.record(Event::Xy(XyError::SupervisorPanic));
+            // Drop before shutdown_or_reboot — its reboot path parks
+            // forever, which would otherwise hold the subscription
+            // through the 2 s reboot grace and trip the deadman.
+            drop(wdt);
             shutdown_or_reboot(&xy, "post-panic", false, &recorder);
             return;
         }
@@ -522,6 +527,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         "XY recovery budget exhausted ({} attempts) — forcing output OFF",
         charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
     );
+    drop(wdt);
     shutdown_or_reboot(&xy, "recovery-exhausted", false, &recorder);
 }
 
@@ -547,9 +553,6 @@ fn shutdown_or_reboot<D: XyDevice>(
             false
         }
     };
-    // Releases the WDT subscription so the reboot grace period (2 s in
-    // `reboot_after`) doesn't trip the deadman before the restart fires.
-    task_wdt::unsubscribe();
     if force_reboot || !disable_ok {
         reboot::reboot_after("XY shutdown: rebooting now");
         loop {
