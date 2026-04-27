@@ -95,12 +95,12 @@ fn read_status_decodes_six_regs() {
     assert_eq!(s.v_in, 24.00);
 }
 
-/// Same wire bytes decoded under XY7025 vs SK120 must yield 10× different
-/// physical values for I-SET, IOUT, S-OCP and POWER (per DATASHEET §3
-/// model scale table). Locks in that `Model` actually changes behavior —
-/// a no-op `current_scale` would silently report the same numbers.
+/// Same wire bytes decoded under XY7025 vs a Custom (SK-style) scale family
+/// must yield 10× different physical values for I-SET, IOUT, S-OCP and POWER.
+/// Locks in that `Model` actually changes behavior — a no-op `current_scale`
+/// would silently report the same numbers.
 #[test]
-fn model_scales_diverge_between_xy7025_and_sk120() {
+fn model_scales_diverge_between_xy7025_and_sk_custom() {
     // 1000 raw with /100 → 10.00 A, with /1000 → 1.000 A.
     // 675 raw with /10 → 67.5 W, with /100 → 6.75 W.
     let xy7025_mock = MockTransport::new(vec![Op::Read {
@@ -117,7 +117,14 @@ fn model_scales_diverge_between_xy7025_and_sk120() {
         addr: REG_V_SET,
         values: vec![1440, 1000, 1350, 1000, 675, 2400],
     }]);
-    let mut xy = Xy::new(sk_mock, Model::Sk120);
+    let mut xy = Xy::new(
+        sk_mock,
+        Model::Custom {
+            current_scale: 1000.0,
+            power_scale: 100.0,
+            opp_scale: 10.0,
+        },
+    );
     let s = xy.read_status().unwrap();
     assert_eq!(s.i_set, 1.000);
     assert_eq!(s.i_out, 1.000);
@@ -263,6 +270,8 @@ fn read_group_decodes_14_regs() {
     assert_eq!(g.v_set, 14.40);
     assert_eq!(g.s_ovp_v, 15.00);
     assert_eq!(g.s_opp_w, 1800.0);
+    assert_eq!(g.s_oah_ah, 0.0);
+    assert_eq!(g.s_owh_wh, 0.0);
     assert_eq!(g.s_otp, 95.0);
     assert!(!g.power_on_output);
 }
@@ -278,10 +287,8 @@ fn write_group_round_trips_through_encode() {
         s_opp_w: 1800.0,
         s_ohp_h: 0,
         s_ohp_m: 0,
-        s_oah_low: 0,
-        s_oah_high: 0,
-        s_owh_low: 0,
-        s_owh_high: 0,
+        s_oah_ah: 0.0,
+        s_owh_wh: 0.0,
         s_otp: 95.0,
         power_on_output: true,
     };
@@ -319,6 +326,8 @@ fn baud_round_trip() {
 fn group_encode_decode_round_trip() {
     // Pin all 14 register offsets in one go — an offset swap would
     // surface as a field mismatch here.
+    // S-OAH raw = (2<<16) | 500 = 131_572 → 131.572 Ah (scale 1000).
+    // S-OWH raw = 12_345 → 123.45 Wh (scale 100).
     let p = GroupParams {
         v_set: 14.40,
         i_set: 10.00,
@@ -328,14 +337,14 @@ fn group_encode_decode_round_trip() {
         s_opp_w: 1800.0,
         s_ohp_h: 7,
         s_ohp_m: 30,
-        s_oah_low: 500,
-        s_oah_high: 2,
-        s_owh_low: 12_345,
-        s_owh_high: 0,
+        s_oah_ah: 131.572,
+        s_owh_wh: 123.45,
         s_otp: 95.0,
         power_on_output: true,
     };
     let regs = encode_group(&p, Model::Xy7025);
+    // Pin the encoded oah/owh register pair layout (low, high).
+    assert_eq!(regs[8..12], [500, 2, 12_345, 0]);
     let decoded = decode_group(&regs, Model::Xy7025);
     assert_eq!(decoded.v_set, p.v_set);
     assert_eq!(decoded.i_set, p.i_set);
@@ -345,10 +354,8 @@ fn group_encode_decode_round_trip() {
     assert_eq!(decoded.s_opp_w, p.s_opp_w);
     assert_eq!(decoded.s_ohp_h, p.s_ohp_h);
     assert_eq!(decoded.s_ohp_m, p.s_ohp_m);
-    assert_eq!(decoded.s_oah_low, p.s_oah_low);
-    assert_eq!(decoded.s_oah_high, p.s_oah_high);
-    assert_eq!(decoded.s_owh_low, p.s_owh_low);
-    assert_eq!(decoded.s_owh_high, p.s_owh_high);
+    assert_eq!(decoded.s_oah_ah, p.s_oah_ah);
+    assert_eq!(decoded.s_owh_wh, p.s_owh_wh);
     assert_eq!(decoded.s_otp, p.s_otp);
     assert_eq!(decoded.power_on_output, p.power_on_output);
 }
@@ -508,17 +515,15 @@ fn temp_unit_round_trip() {
     assert_eq!(xy.read_temp_unit().unwrap(), TempUnit::Fahrenheit);
 }
 
-/// All five preset variants must report the documented scales (DATASHEET §3).
-/// Custom is verified separately in `custom_model_routes_user_supplied_scales`.
+/// Both preset variants must report the documented XY6100-family scales
+/// (DATASHEET §3). `Custom` is verified separately in
+/// `custom_model_routes_user_supplied_scales`.
 #[test]
 fn preset_models_match_datasheet_scales() {
     // (model, current, power, opp)
     let presets = [
         (Model::Xy6020L, 100.0, 10.0, 1.0),
         (Model::Xy7025, 100.0, 10.0, 1.0),
-        (Model::Sk60, 1000.0, 100.0, 10.0),
-        (Model::Sk120, 1000.0, 100.0, 10.0),
-        (Model::Sk120x, 1000.0, 100.0, 10.0),
     ];
     for (m, i, p, o) in presets {
         assert_eq!(m.current_scale(), i);
@@ -527,11 +532,11 @@ fn preset_models_match_datasheet_scales() {
     }
 }
 
-/// Group encode under SK-family must use opp_scale=10 (S-OPP raw stores
+/// `Custom` with SK-style scales must use `opp_scale=10` (S-OPP raw stores
 /// 0.1 W units), distinct from XY7025/XY6020L which store whole watts.
 #[test]
-fn group_encode_under_sk120_uses_opp_scale_10() {
-    // 18.0 W S-OPP → raw 180 on SK family, would be 18 on XY7025.
+fn group_encode_under_custom_sk_scales_uses_opp_scale_10() {
+    // 18.0 W S-OPP → raw 180 with opp_scale=10, would be 18 on XY7025.
     let p = GroupParams {
         v_set: 5.0,
         i_set: 1.0,
@@ -541,19 +546,24 @@ fn group_encode_under_sk120_uses_opp_scale_10() {
         s_opp_w: 18.0,
         s_ohp_h: 0,
         s_ohp_m: 0,
-        s_oah_low: 0,
-        s_oah_high: 0,
-        s_owh_low: 0,
-        s_owh_high: 0,
+        s_oah_ah: 0.0,
+        s_owh_wh: 0.0,
         s_otp: 0.0,
         power_on_output: false,
     };
     let mock = MockTransport::new(vec![Op::WriteMany {
         addr: group_addr(0),
-        // v_set=500, i_set=1000 (×1000 SK), s_opp=180, s_otp=0.
+        // v_set=500, i_set=1000 (current_scale=1000), s_opp=180, s_otp=0.
         values: vec![500, 1000, 0, 0, 0, 180, 0, 0, 0, 0, 0, 0, 0, 0],
     }]);
-    let mut xy = Xy::new(mock, Model::Sk120);
+    let mut xy = Xy::new(
+        mock,
+        Model::Custom {
+            current_scale: 1000.0,
+            power_scale: 100.0,
+            opp_scale: 10.0,
+        },
+    );
     xy.write_group(0, &p).unwrap();
 }
 
@@ -627,23 +637,6 @@ fn verify_model_mismatch_when_codes_differ() {
             expected_code: 0x6100,
             device_code: 0x7700,
         }
-    );
-}
-
-#[test]
-fn verify_model_inconclusive_for_sk_family() {
-    // SK-family codes aren't pinned in this crate yet → Inconclusive
-    // regardless of what the device reports.
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_MODEL,
-            values: vec![0x1234],
-        }]),
-        Model::Sk120,
-    );
-    assert_eq!(
-        xy.verify_model().unwrap(),
-        ModelCheck::Inconclusive { device_code: 0x1234 }
     );
 }
 

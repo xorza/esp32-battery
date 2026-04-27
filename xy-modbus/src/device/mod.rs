@@ -19,6 +19,18 @@ fn from_reg(raw: u16, scale: f32) -> f32 {
     raw as f32 / scale
 }
 
+fn from_reg32(high: u16, low: u16, scale: f32) -> f32 {
+    let raw = ((high as u32) << 16) | low as u32;
+    raw as f32 / scale
+}
+
+/// Returns `(low, high)` words, matching the on-wire register pair order.
+fn to_reg32(v: f32, scale: f32) -> (u16, u16) {
+    let r = (v * scale + 0.5) as i64;
+    let r = r.clamp(0, u32::MAX as i64) as u32;
+    (r as u16, (r >> 16) as u16)
+}
+
 /// Driver for the XY-series buck converter.
 ///
 /// Construct with [`Xy::new`] (default slave `0x01`) or
@@ -120,20 +132,14 @@ impl<T: ModbusTransport> Xy<T> {
         let mut r = [0u16; 7];
         self.transport
             .read_holding(self.slave, REG_AH_LOW, &mut r)?;
-        let ah_raw = ((r[1] as u32) << 16) | r[0] as u32;
-        let wh_raw = ((r[3] as u32) << 16) | r[2] as u32;
         Ok(Totals {
-            charge_ah: ah_raw as f32 / 1000.0,
-            energy_wh: wh_raw as f32 / 1000.0,
+            charge_ah: from_reg32(r[1], r[0], 1000.0),
+            energy_wh: from_reg32(r[3], r[2], 1000.0),
             on_time: OnTime {
                 hours: r[4],
                 minutes: r[5],
                 seconds: r[6],
             },
-            ah_low_raw: r[0],
-            ah_high_raw: r[1],
-            wh_low_raw: r[2],
-            wh_high_raw: r[3],
         })
     }
 
@@ -404,10 +410,8 @@ fn decode_group(r: &[u16; GROUP_LEN as usize], model: Model) -> GroupParams {
         s_opp_w: from_reg(s_opp, model.opp_scale()),
         s_ohp_h,
         s_ohp_m,
-        s_oah_low,
-        s_oah_high,
-        s_owh_low,
-        s_owh_high,
+        s_oah_ah: from_reg32(s_oah_high, s_oah_low, 1000.0),
+        s_owh_wh: from_reg32(s_owh_high, s_owh_low, 100.0),
         s_otp: from_reg(s_otp, 10.0),
         power_on_output: s_ini != 0,
     }
@@ -415,6 +419,8 @@ fn decode_group(r: &[u16; GROUP_LEN as usize], model: Model) -> GroupParams {
 
 fn encode_group(p: &GroupParams, model: Model) -> [u16; GROUP_LEN as usize] {
     let i_scale = model.current_scale();
+    let (oah_low, oah_high) = to_reg32(p.s_oah_ah, 1000.0);
+    let (owh_low, owh_high) = to_reg32(p.s_owh_wh, 100.0);
     [
         to_reg(p.v_set, 100.0),
         to_reg(p.i_set, i_scale),
@@ -424,10 +430,10 @@ fn encode_group(p: &GroupParams, model: Model) -> [u16; GROUP_LEN as usize] {
         to_reg(p.s_opp_w, model.opp_scale()),
         p.s_ohp_h,
         p.s_ohp_m,
-        p.s_oah_low,
-        p.s_oah_high,
-        p.s_owh_low,
-        p.s_owh_high,
+        oah_low,
+        oah_high,
+        owh_low,
+        owh_high,
         to_reg(p.s_otp, 10.0),
         p.power_on_output as u16,
     ]

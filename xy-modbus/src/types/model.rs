@@ -6,8 +6,8 @@
 /// scale table.
 ///
 /// Cross-check by reading `MODEL` (`0x0016`): `0x6100`-class is
-/// XY6020L / XY7025; SK-family codes differ. The crate does not probe
-/// automatically — pick the variant that matches your hardware.
+/// XY6020L / XY7025. The crate does not probe automatically — pick
+/// the variant that matches your hardware.
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -18,9 +18,6 @@ pub enum Model {
     Xy6020L,
     /// Protocol-identical to [`Self::Xy6020L`].
     Xy7025,
-    Sk60,
-    Sk120,
-    Sk120x,
     /// Escape hatch for hardware not covered by the preset variants.
     /// Supply the per-register scales directly; cross-check against the
     /// vendor docs for your unit.
@@ -32,32 +29,26 @@ pub enum Model {
 }
 
 impl Model {
-    /// Scale for I-SET, IOUT, S-OCP. 100 on XY6020L/XY7025 (10 mA),
-    /// 1000 on SK family (1 mA).
+    /// Scale for I-SET, IOUT, S-OCP. 100 on XY6020L/XY7025 (10 mA).
     pub const fn current_scale(self) -> f32 {
         match self {
             Self::Xy6020L | Self::Xy7025 => 100.0,
-            Self::Sk60 | Self::Sk120 | Self::Sk120x => 1000.0,
             Self::Custom { current_scale, .. } => current_scale,
         }
     }
 
-    /// Scale for POWER (`0x0004`). 10 on XY6020L/XY7025 (100 mW),
-    /// 100 on SK family (10 mW).
+    /// Scale for POWER (`0x0004`). 10 on XY6020L/XY7025 (100 mW).
     pub const fn power_scale(self) -> f32 {
         match self {
             Self::Xy6020L | Self::Xy7025 => 10.0,
-            Self::Sk60 | Self::Sk120 | Self::Sk120x => 100.0,
             Self::Custom { power_scale, .. } => power_scale,
         }
     }
 
-    /// Scale for S-OPP in memory groups (`0x0055`). 1 W on
-    /// XY6020L/XY7025, 0.1 W on SK family.
+    /// Scale for S-OPP in memory groups (`0x0055`). 1 W on XY6020L/XY7025.
     pub const fn opp_scale(self) -> f32 {
         match self {
             Self::Xy6020L | Self::Xy7025 => 1.0,
-            Self::Sk60 | Self::Sk120 | Self::Sk120x => 10.0,
             Self::Custom { opp_scale, .. } => opp_scale,
         }
     }
@@ -68,12 +59,11 @@ impl Model {
     ///
     /// `0x6100` is shared by XY6020L and XY7025 — they have identical
     /// register scales, so the choice doesn't affect protocol behavior.
-    /// SK-family codes are not yet pinned in this crate; `verify_model`
-    /// reports `Inconclusive` for them.
+    /// `Custom` returns `None` (no canonical code).
     pub const fn expected_model_code(self) -> Option<u16> {
         match self {
             Self::Xy6020L | Self::Xy7025 => Some(0x6100),
-            Self::Sk60 | Self::Sk120 | Self::Sk120x | Self::Custom { .. } => None,
+            Self::Custom { .. } => None,
         }
     }
 }
@@ -98,6 +88,6 @@ pub enum ModelCheck {
     },
     /// Verification was not possible: either the device returned a
     /// code outside the documented set, or the configured model is
-    /// `Custom` / SK-family (no canonical expected code).
+    /// `Custom` (no canonical expected code).
     Inconclusive { device_code: u16 },
 }
