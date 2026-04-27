@@ -17,10 +17,11 @@
 //! println!("{:.2} V @ {:.2} A", s.v_out, s.i_out);
 //! ```
 //!
-//! The crate is `no_std` and has no dependencies. Bring your own
-//! Modbus-RTU transport by implementing [`ModbusTransport`]; the
-//! [`framing`] module exposes the on-wire codec so a transport
-//! implementation is typically <100 lines over a UART.
+//! The crate is `no_std`. With the default `embedded-io` feature, the
+//! [`uart`] module provides a ready-to-use [`ModbusTransport`] over any
+//! `embedded-io` UART. To use a different transport, disable default
+//! features and implement [`ModbusTransport`] yourself; the [`framing`]
+//! module exposes the on-wire codec.
 
 #![no_std]
 
@@ -29,6 +30,12 @@ pub mod framing;
 pub mod regs;
 pub mod transport;
 pub mod types;
+
+#[cfg(feature = "embedded-io")]
+pub mod uart;
+
+#[cfg(feature = "embedded-io")]
+pub use uart::UartTransport;
 
 pub use device::Xy;
 pub use transport::{ModbusError, ModbusTransport, RtuError};
