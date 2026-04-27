@@ -392,7 +392,12 @@ pub struct BatterySample {
 ///   we have but `ack_enable` hasn't been called yet (write may have
 ///   failed). Same safety checks as `Active`, but tick emits
 ///   `EnableOutput` instead of running the phase machine.
-/// - `Active`: output is on, phase machine + drift + fault paths run.
+/// - `Active { pending_voltage }`: output is on, phase machine + drift +
+///   fault paths run. `pending_voltage` is `Some(next)` while a
+///   Float↔Absorb V_SET write is in flight: tick re-emits `UpdateVoltage`
+///   each cycle (so a transient Modbus glitch retries instead of latching
+///   `SettingsDrift`), and `target_voltage` keeps reporting the **old**
+///   phase's voltage until `ack_voltage_update` commits the transition.
 /// - `Tripped { acked: false }`: a fault latched; emit `DisableOutput`.
 /// - `Tripped { acked: true }`: caller successfully disabled. For
 ///   recoverable faults the supervisor accumulates a healthy-window
@@ -400,7 +405,7 @@ pub struct BatterySample {
 ///   `tick`. Non-recoverable faults stay parked in `Action::None`.
 enum LatchState {
     Pending,
-    Active,
+    Active { pending_voltage: Option<Phase> },
     Tripped { reason: FaultReason, acked: bool },
 }
 
@@ -440,15 +445,6 @@ pub struct ChargeSupervisor {
     /// new latch. Only meaningful when the latched fault has a recovery
     /// policy.
     recovery_elapsed: Duration,
-    /// Phase the supervisor wants to transition into. Set when the phase
-    /// machine fires Float↔Absorb; cleared (and committed) by
-    /// `ack_voltage_update` once the caller's `set_voltage` write
-    /// succeeds. While set, `tick` re-emits `UpdateVoltage` instead of
-    /// running the phase machine, and `target_voltage` keeps reporting
-    /// the **old** phase's voltage so the drift check still matches the
-    /// buck's readback. This is the same retry pattern as
-    /// EnableOutput / `ack_enable`.
-    pending_phase: Option<Phase>,
 }
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
@@ -517,7 +513,6 @@ impl ChargeSupervisor {
             modbus_err: Debounce::default(),
             latch: LatchState::Pending,
             recovery_elapsed: Duration::ZERO,
-            pending_phase: None,
         }
     }
 
@@ -538,8 +533,8 @@ impl ChargeSupervisor {
 
     pub fn fault(&self) -> Option<FaultReason> {
         match self.latch {
-            LatchState::Pending | LatchState::Active => None,
             LatchState::Tripped { reason, .. } => Some(reason),
+            _ => None,
         }
     }
 
@@ -551,7 +546,7 @@ impl ChargeSupervisor {
     /// drift check relies on this never changing at runtime. If a future
     /// feature ever varies the current setpoint (CC tapering, dynamic
     /// limits, etc.), it must use the same defer-and-ack pattern as
-    /// `pending_phase` for V_SET, otherwise a successful write to a new
+    /// `pending_voltage` for V_SET, otherwise a successful write to a new
     /// I_SET will trip `SettingsDrift` on the very next tick.
     pub fn expected_setpoints(&self) -> Setpoints {
         Setpoints {
@@ -565,7 +560,7 @@ impl ChargeSupervisor {
     /// Active. Used to detect when the buck self-disabled (hardware
     /// OVP/OCP/LVP, panel toggle, etc.).
     pub fn expected_output_on(&self) -> bool {
-        matches!(self.latch, LatchState::Active)
+        matches!(self.latch, LatchState::Active { .. })
     }
 
     /// Caller invokes this after a successful `set_output(false)` Modbus write.
@@ -574,9 +569,7 @@ impl ChargeSupervisor {
     pub fn ack_disable(&mut self) {
         match &mut self.latch {
             LatchState::Tripped { acked, .. } => *acked = true,
-            LatchState::Pending | LatchState::Active => {
-                panic!("ack_disable without latched fault")
-            }
+            _ => panic!("ack_disable without latched fault"),
         }
     }
 
@@ -586,7 +579,11 @@ impl ChargeSupervisor {
     /// `EnableOutput` so a failed enable write gets retried.
     pub fn ack_enable(&mut self) {
         match self.latch {
-            LatchState::Pending => self.latch = LatchState::Active,
+            LatchState::Pending => {
+                self.latch = LatchState::Active {
+                    pending_voltage: None,
+                }
+            }
             _ => panic!("ack_enable from non-Pending state"),
         }
     }
@@ -600,10 +597,16 @@ impl ChargeSupervisor {
     /// the old phase, drift check keeps matching old V_SET, and the next
     /// tick re-emits `UpdateVoltage` for retry.
     pub fn ack_voltage_update(&mut self) {
-        let Some(next) = self.pending_phase.take() else {
+        let LatchState::Active {
+            pending_voltage: Some(next),
+        } = self.latch
+        else {
             panic!("ack_voltage_update without pending phase");
         };
         self.phase = next;
+        self.latch = LatchState::Active {
+            pending_voltage: None,
+        };
         // Reset both timers explicitly: a Float→Absorb transition can
         // immediately follow an Absorb→Float, with no intervening Float
         // dwell to clear stale counts.
@@ -626,7 +629,7 @@ impl ChargeSupervisor {
     /// stuck sensor mask overvoltage. Routes through the same
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
-        let pending = match self.latch {
+        match self.latch {
             LatchState::Tripped {
                 reason,
                 acked: true,
@@ -635,9 +638,9 @@ impl ChargeSupervisor {
                 reason,
                 acked: false,
             } => return Action::DisableOutput(reason),
-            LatchState::Pending => true,
-            LatchState::Active => false,
-        };
+            _ => {}
+        }
+        let pre_enable = matches!(self.latch, LatchState::Pending);
 
         if let Some(sp) = p.setpoints {
             let want = self.expected_setpoints();
@@ -654,7 +657,7 @@ impl ChargeSupervisor {
         // Pending expects OFF: any ON means our boot disable / S_INI=0
         // didn't stick — fail closed and reboot rather than trust
         // unknown regulation.
-        match (pending, p.output) {
+        match (pre_enable, p.output) {
             (false, Some(BuckOutput::Off { cause })) => {
                 return self.latch(FaultReason::OutputUnexpectedlyOff(cause));
             }
@@ -693,7 +696,7 @@ impl ChargeSupervisor {
         // step the debouncer so its state stays coherent for Active.
         let ov = b.voltage > self.profile.absorb_v + OV_MARGIN_V;
         let ov_debounced = self.ov.step(ov, elapsed, OV_DURATION);
-        if (pending && ov) || ov_debounced {
+        if (pre_enable && ov) || ov_debounced {
             return self.latch(FaultReason::Overvoltage);
         }
 
@@ -709,7 +712,7 @@ impl ChargeSupervisor {
         // The modbus_err debounce above eventually fails closed on
         // sustained read failures, but takes 5 s; this gate avoids
         // emitting EnableOutput in the meantime.
-        if pending {
+        if pre_enable {
             return if p.setpoints.is_some() {
                 Action::EnableOutput
             } else {
@@ -722,7 +725,10 @@ impl ChargeSupervisor {
         // flight — drift check keeps matching the old V_SET (since
         // `target_voltage` reflects the still-current phase), and the
         // caller retries on every tick by writing again.
-        if let Some(next) = self.pending_phase {
+        if let LatchState::Active {
+            pending_voltage: Some(next),
+        } = self.latch
+        {
             return Action::UpdateVoltage {
                 target_v: self.voltage_for_phase(next),
             };
@@ -743,7 +749,9 @@ impl ChargeSupervisor {
             // `target_voltage` matching the buck's actual V_SET so a
             // failed write doesn't trigger SettingsDrift on the next
             // tick. Caller invokes `ack_voltage_update` on success.
-            self.pending_phase = Some(next);
+            self.latch = LatchState::Active {
+                pending_voltage: Some(next),
+            };
             return Action::UpdateVoltage {
                 target_v: self.voltage_for_phase(next),
             };
