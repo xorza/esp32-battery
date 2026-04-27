@@ -48,7 +48,6 @@ const PACK_MODEL: Model = Model::Xy7025;
 /// The set of operations the charging loop needs from the buck. Real
 /// builds get the `xy_modbus`-backed implementation; `xy-fake` builds
 /// get an in-memory canned device. The thread loop is identical.
-#[allow(dead_code)] // protection-status methods wired in once the supervisor gates recovery on them
 trait XyDevice {
     fn verify_model(&mut self) -> Result<ModelCheck, RtuError>;
     /// Live + control snapshot (regs 0x0000–0x0012). One Modbus

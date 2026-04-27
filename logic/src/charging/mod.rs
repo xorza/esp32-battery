@@ -99,7 +99,7 @@ pub const OUTPUT_RECOVERY_MAX_ATTEMPTS: u32 = 3;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum Chemistry {
     /// Daily-cycling LFP: 3.60 V/cell absorb, 3.375 V/cell float.
     /// Matches Victron / Battle Born defaults — gentler on cells than 3.65 V,
@@ -113,7 +113,7 @@ pub enum Chemistry {
     LiIon,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Profile {
     pub absorb_v: f32,
     pub float_v: f32,
@@ -318,7 +318,7 @@ pub enum Action {
 
 /// Latest fresh battery reading fed to the supervisor. Voltage is used for
 /// OV detection, current drives the phase machine. Power isn't needed.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct BatterySample {
     pub voltage: f32,
     pub current: f32,

@@ -37,9 +37,7 @@ impl InaError {
 pub enum XyError {
     ReadStatus,
     SetVoltage,
-    SetCurrent,
     SetOutput,
-    SetProtection,
     BootSequence,
     SupervisorPanic,
 }

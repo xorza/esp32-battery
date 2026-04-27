@@ -331,10 +331,12 @@ mod tests {
         assert_eq!(h.samples.len(), HALF + 1);
         assert_eq!(h.interval, 2);
 
+        // Pairs (12,1,2) + (14,3,4) average to (13,2,3); all halves are
+        // exact in f32 so equality is appropriate.
         for s in &h.samples[..HALF] {
-            assert!((s.voltage - 13.0).abs() < 0.01);
-            assert!((s.battery_current - 2.0).abs() < 0.01);
-            assert!((s.ps_current - 3.0).abs() < 0.01);
+            assert_eq!(s.voltage, 13.0);
+            assert_eq!(s.battery_current, 2.0);
+            assert_eq!(s.ps_current, 3.0);
         }
         assert_eq!(h.samples[0].time_s, 10);
         assert_eq!(h.samples[1].time_s, 30);

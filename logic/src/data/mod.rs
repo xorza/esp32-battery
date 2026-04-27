@@ -540,22 +540,25 @@ mod tests {
         sd.update_ps(ps_reading(13.0, 2.5));
         sd.tick(Some(1000));
         assert_eq!(sd.history().len(), 1);
-        assert!((sd.history()[0].ps_current - 2.5).abs() < 0.001);
-        assert!((sd.history()[0].power_online - 1.0).abs() < 0.001);
-        assert!(sd.ps_reading().is_some());
+        assert_eq!(sd.history()[0].ps_current, 2.5);
+        assert_eq!(sd.history()[0].power_online, 1.0);
+        let ps0 = sd.ps_reading().expect("ps fresh after first update");
+        assert_eq!(ps0.current, 2.5);
+        assert_eq!(ps0.voltage, 13.0);
 
         for i in 1..STALE {
             sd.update_battery(bat_reading(13.0, 1.0));
             sd.tick(Some(1000 + i));
         }
-        assert!(sd.ps_reading().is_some(), "PS still fresh at STALE_TICKS");
+        let ps_late = sd.ps_reading().expect("PS still fresh at STALE_TICKS");
+        assert_eq!(ps_late.current, 2.5);
 
         sd.update_battery(bat_reading(13.0, 1.0));
         sd.tick(Some(1000 + STALE));
         assert!(sd.ps_reading().is_none());
         let latest = sd.history().last().unwrap();
-        assert!(latest.ps_current.abs() < 0.001);
-        assert!(latest.power_online.abs() < 0.001);
+        assert_eq!(latest.ps_current, 0.0);
+        assert_eq!(latest.power_online, 0.0);
     }
 
     #[test]
@@ -566,7 +569,7 @@ mod tests {
         sd.update_ps(ps_reading(13.0, 2.0));
         sd.tick(Some(2000));
         assert_eq!(sd.history().len(), 1);
-        assert!((sd.history()[0].voltage - 13.0).abs() < 0.001);
+        assert_eq!(sd.history()[0].voltage, 13.0);
 
         let ticks = STALE + 3;
         for i in 1..=ticks {
@@ -576,8 +579,8 @@ mod tests {
         assert_eq!(sd.history().len(), 1 + ticks as usize);
         assert!(sd.battery_reading().is_none());
         let latest = sd.history().last().unwrap();
-        assert!(latest.voltage.abs() < 0.001);
-        assert!(latest.battery_current.abs() < 0.001);
-        assert!((latest.ps_current - 2.0).abs() < 0.001);
+        assert_eq!(latest.voltage, 0.0);
+        assert_eq!(latest.battery_current, 0.0);
+        assert_eq!(latest.ps_current, 2.0);
     }
 }
