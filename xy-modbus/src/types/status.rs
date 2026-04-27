@@ -70,3 +70,42 @@ pub struct SafetyLimits {
     pub ovp_v: f32,
     pub ocp_a: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn on_time_total_seconds() {
+        assert_eq!(OnTime::default().total_seconds(), 0);
+        assert_eq!(
+            OnTime {
+                hours: 0,
+                minutes: 0,
+                seconds: 1,
+            }
+            .total_seconds(),
+            1
+        );
+        // 1h 23m 45s = 3600 + 1380 + 45.
+        assert_eq!(
+            OnTime {
+                hours: 1,
+                minutes: 23,
+                seconds: 45,
+            }
+            .total_seconds(),
+            5025
+        );
+        // No overflow with full u16 hours: 65535 * 3600 = 235_926_000 < u32::MAX.
+        assert_eq!(
+            OnTime {
+                hours: u16::MAX,
+                minutes: 0,
+                seconds: 0,
+            }
+            .total_seconds(),
+            65535u32 * 3600
+        );
+    }
+}

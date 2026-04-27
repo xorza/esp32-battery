@@ -100,3 +100,49 @@ pub trait ModbusTransport {
         values: &[u16],
     ) -> Result<(), RtuError>;
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use std::format;
+
+    #[test]
+    fn modbus_error_display_strings() {
+        assert_eq!(
+            format!("{}", ModbusError::ShortResponse(3)),
+            "short response (3 bytes)"
+        );
+        assert_eq!(
+            format!("{}", ModbusError::BadSlave(0x02)),
+            "wrong slave id 0x02"
+        );
+        assert_eq!(format!("{}", ModbusError::BadHeader), "malformed header");
+        assert_eq!(format!("{}", ModbusError::BadCrc), "CRC mismatch");
+        assert_eq!(
+            format!("{}", ModbusError::Exception(0x03)),
+            "modbus exception 0x03"
+        );
+    }
+
+    #[test]
+    fn rtu_error_display_strings() {
+        assert_eq!(format!("{}", RtuError::Timeout), "UART response timed out");
+        assert_eq!(format!("{}", RtuError::Io), "UART I/O error");
+        // Modbus variant delegates to inner Display.
+        assert_eq!(
+            format!("{}", RtuError::Modbus(ModbusError::BadCrc)),
+            "CRC mismatch"
+        );
+    }
+
+    /// Modbus-variant `RtuError` exposes the underlying error via `Error::source`.
+    #[test]
+    fn rtu_error_source_chain() {
+        use core::error::Error;
+        let e = RtuError::Modbus(ModbusError::BadCrc);
+        assert!(e.source().is_some());
+        assert!(RtuError::Timeout.source().is_none());
+        assert!(RtuError::Io.source().is_none());
+    }
+}

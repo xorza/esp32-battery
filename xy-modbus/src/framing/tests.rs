@@ -203,6 +203,107 @@ fn parse_write_multiple_valid() {
 }
 
 #[test]
+fn parse_write_multiple_rejects_fc_mismatch() {
+    // FC 0x03 instead of 0x10 — should be rejected as BadHeader.
+    let mut frame = [0x01u8, 0x03, 0x00, 0x52, 0x00, 0x03, 0, 0];
+    let crc = crc16_modbus(&frame[..6]);
+    frame[6] = crc as u8;
+    frame[7] = (crc >> 8) as u8;
+    assert!(matches!(
+        parse_write_multiple_response(&frame, 0x01, 0x0052, 3),
+        Err(ModbusError::BadHeader)
+    ));
+}
+
+/// Read at the maximum standard count (125) builds a frame whose response
+/// would be 5 + 250 = 255 bytes — fits inside MAX_ADU.
+#[test]
+fn build_read_at_max_count_is_well_formed() {
+    let req = build_read_request(0x01, 0x0000, MAX_READ_REGS as u16);
+    assert_eq!(u16::from_be_bytes([req[4], req[5]]), 125);
+    let crc = u16::from_le_bytes([req[6], req[7]]);
+    assert_eq!(crc, crc16_modbus(&req[..6]));
+}
+
+/// Write Multiple at the maximum count (123) needs 9 + 246 = 255 bytes.
+#[test]
+fn build_write_multiple_at_max_count() {
+    let mut buf = [0u8; MAX_ADU];
+    let values = [0xABCDu16; MAX_WRITE_REGS];
+    let n = build_write_multiple_request(0x01, 0x0050, &values, &mut buf).unwrap();
+    assert_eq!(n, 9 + 2 * MAX_WRITE_REGS);
+    // Byte count field equals 2 * qty.
+    assert_eq!(buf[6] as usize, 2 * MAX_WRITE_REGS);
+    // CRC is correct.
+    let crc = u16::from_le_bytes([buf[n - 2], buf[n - 1]]);
+    assert_eq!(crc, crc16_modbus(&buf[..n - 2]));
+}
+
+#[test]
+fn build_write_multiple_rejects_oversize_payload() {
+    let mut buf = [0u8; MAX_ADU];
+    let oversized = std::vec![0u16; MAX_WRITE_REGS + 1];
+    assert!(matches!(
+        build_write_multiple_request(0x01, 0x0050, &oversized, &mut buf),
+        Err(FrameError::InvalidLength(n)) if n == MAX_WRITE_REGS + 1
+    ));
+}
+
+#[test]
+fn parse_read_response_short_frame_is_short_response() {
+    // 3 bytes < minimum 5.
+    let frame = [0x01u8, 0x03, 0x02];
+    let mut out = [0u16; 1];
+    assert!(matches!(
+        parse_read_response(&frame, 0x01, &mut out),
+        Err(ModbusError::ShortResponse(3))
+    ));
+}
+
+/// Single-register read response — minimal valid frame is 7 bytes.
+#[test]
+fn parse_read_response_single_register() {
+    let frame = read_resp(0x01, &[0x1234]);
+    assert_eq!(frame.len(), 7);
+    let mut out = [0u16; 1];
+    parse_read_response(&frame, 0x01, &mut out).unwrap();
+    assert_eq!(out[0], 0x1234);
+}
+
+#[test]
+fn parse_read_response_rejects_byte_count_mismatch() {
+    // Header claims byte_count=4 but caller expects 1 register (count=2).
+    let mut frame = std::vec![0x01u8, 0x03, 0x04, 0x00, 0x05];
+    let crc = crc16_modbus(&frame);
+    frame.push(crc as u8);
+    frame.push((crc >> 8) as u8);
+    let mut out = [0u16; 1];
+    assert!(matches!(
+        parse_read_response(&frame, 0x01, &mut out),
+        Err(ModbusError::BadHeader)
+    ));
+}
+
+#[test]
+fn frame_error_display_strings() {
+    use std::format;
+    assert_eq!(
+        format!("{}", FrameError::InvalidLength(0)),
+        "invalid register count 0"
+    );
+    assert_eq!(
+        format!(
+            "{}",
+            FrameError::BufferTooSmall {
+                needed: 15,
+                actual: 10,
+            }
+        ),
+        "buffer too small (need 15, have 10)"
+    );
+}
+
+#[test]
 fn parse_write_multiple_rejects_addr_mismatch() {
     let mut frame = [0x01u8, 0x10, 0x00, 0x52, 0x00, 0x03, 0, 0];
     let crc = crc16_modbus(&frame[..6]);

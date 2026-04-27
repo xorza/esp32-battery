@@ -315,11 +315,102 @@ fn pre_tx_silence_applies_inter_frame_gap() {
 
 #[test]
 #[should_panic(expected = "broadcast")]
-fn slave_zero_panics() {
+fn slave_zero_panics_on_read() {
     let uart = MockUart::new(Vec::new());
     let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
     let mut out = [0u16; 1];
     let _ = t.read_holding(0x00, 0x0000, &mut out);
+}
+
+#[test]
+#[should_panic(expected = "broadcast")]
+fn slave_zero_panics_on_write_single() {
+    let uart = MockUart::new(Vec::new());
+    let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+    let _ = t.write_single_holding(0x00, 0x0000, 0);
+}
+
+#[test]
+#[should_panic(expected = "broadcast")]
+fn slave_zero_panics_on_write_multiple() {
+    let uart = MockUart::new(Vec::new());
+    let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+    let _ = t.write_multiple_holdings(0x00, 0x0000, &[0]);
+}
+
+/// `read_exact` must aggregate across multiple `read()` calls when the
+/// UART hands back a single byte at a time — a real concern with FIFOs
+/// that drain incrementally.
+#[test]
+fn read_exact_aggregates_byte_at_a_time() {
+    struct DribbleUart {
+        response: Vec<u8>,
+        pos: usize,
+        armed: bool,
+    }
+    impl ErrorType for DribbleUart {
+        type Error = core::convert::Infallible;
+    }
+    impl embedded_io::Read for DribbleUart {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            if !self.armed || self.pos >= self.response.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.response[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+    impl embedded_io::ReadReady for DribbleUart {
+        fn read_ready(&mut self) -> Result<bool, Self::Error> {
+            Ok(self.armed && self.pos < self.response.len())
+        }
+    }
+    impl embedded_io::Write for DribbleUart {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.armed = true;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    let resp = frame_with_crc(std::vec![0x01, 0x03, 0x06, 0, 10, 0, 20, 0, 30]);
+    let uart = DribbleUart {
+        response: resp,
+        pos: 0,
+        armed: false,
+    };
+    let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+    let mut out = [0u16; 3];
+    t.read_holding(0x01, 0x0000, &mut out).unwrap();
+    assert_eq!(out, [10, 20, 30]);
+}
+
+/// Exception responses are only 5 bytes — `read_response` must short-circuit
+/// instead of waiting for the full expected length, otherwise the call would
+/// time out.
+#[test]
+fn exception_short_circuits_read() {
+    let frame = frame_with_crc(std::vec![0x01, 0x83, 0x02]);
+    let uart = MockUart::new(frame);
+    // Request 3 regs (would expect 11 bytes) but server returns 5-byte exception.
+    let mut t = UartTransport::new(uart, NoDelay).with_timing(10, 0);
+    let mut out = [0u16; 3];
+    assert_eq!(
+        t.read_holding(0x01, 0x0000, &mut out).unwrap_err(),
+        RtuError::Modbus(ModbusError::Exception(0x02))
+    );
+}
+
+#[test]
+fn release_returns_inner_uart_and_delay() {
+    let uart = MockUart::new(Vec::new());
+    let t = UartTransport::new(uart, NoDelay).with_timing(123, 7);
+    let (uart, _delay) = t.release();
+    // Sanity: tx buffer is empty, no traffic happened.
+    assert!(uart.tx.is_empty());
 }
 
 #[test]

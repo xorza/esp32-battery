@@ -393,52 +393,45 @@ fn one_shot_setters_use_correct_addr_and_value() {
     check!(REG_SLAVE_ADDR, 7, |x: &mut Xy<_>| x.set_slave_address(7));
     check!(REG_S_INI, 1, |x: &mut Xy<_>| x.set_power_on_output(true));
     check!(REG_EXTRACT_M, 3, |x: &mut Xy<_>| x.recall_group(3));
+    check!(REG_BAUD_CODE, 6, |x: &mut Xy<_>| x.set_baud_rate(BaudRate::B115200));
+    check!(REG_BAUD_CODE, 99, |x: &mut Xy<_>| x.set_baud_rate(BaudRate::Unknown(99)));
+    check!(REG_TEMP_UNIT, 1, |x: &mut Xy<_>| x.set_temp_unit(TempUnit::Fahrenheit));
 }
 
-/// Each row pins (register address, returned raw, expected decoded).
+/// Pins (register address, returned raw, expected decoded value) for each
+/// single-register getter. A wrong REG_* constant or scale would surface here.
 #[test]
 fn one_shot_getters_use_correct_addr_and_scale() {
-    // read_voltage_out: REG_V_OUT, scale 100
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_V_OUT,
-            values: vec![1234],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_voltage_out().unwrap(), 12.34);
+    macro_rules! check {
+        ($addr:expr, $raw:expr, $action:expr, $expected:expr) => {{
+            let mock = MockTransport::new(vec![Op::Read {
+                addr: $addr,
+                values: vec![$raw],
+            }]);
+            let mut xy = Xy::new(mock, Model::Xy7025);
+            assert_eq!($action(&mut xy).unwrap(), $expected);
+        }};
+    }
+    check!(REG_V_OUT, 1234, |x: &mut Xy<_>| x.read_voltage_out(), 12.34);
+    check!(REG_I_OUT, 500, |x: &mut Xy<_>| x.read_current_out(), 5.00);
+    check!(REG_P_OUT, 675, |x: &mut Xy<_>| x.read_power_out(), 67.5);
+    check!(REG_V_IN, 2400, |x: &mut Xy<_>| x.read_voltage_in(), 24.00);
+    check!(REG_OUTPUT_EN, 1, |x: &mut Xy<_>| x.read_output(), true);
+    check!(REG_LOCK, 1, |x: &mut Xy<_>| x.read_lock(), true);
+    check!(REG_BACKLIGHT, 4, |x: &mut Xy<_>| x.read_backlight(), 4u8);
+    check!(REG_SLEEP, 15, |x: &mut Xy<_>| x.read_sleep_minutes(), 15u16);
+    check!(REG_BUZZER, 0, |x: &mut Xy<_>| x.read_buzzer(), false);
+    check!(REG_SLAVE_ADDR, 7, |x: &mut Xy<_>| x.read_slave_address(), 7u8);
+    check!(REG_S_INI, 1, |x: &mut Xy<_>| x.read_power_on_output(), true);
+    check!(REG_MODEL, 0x6100, |x: &mut Xy<_>| x.read_model(), 0x6100u16);
+    check!(REG_VERSION, 0x71, |x: &mut Xy<_>| x.read_version(), 0x71u16);
+    check!(REG_T_IN_OFFSET, 15, |x: &mut Xy<_>| x.read_temp_offset_internal(), 1.5);
+    check!(REG_T_EX_OFFSET, 20, |x: &mut Xy<_>| x.read_temp_offset_external(), 2.0);
+    check!(REG_CVCC, 0, |x: &mut Xy<_>| x.read_reg_mode(), RegMode::ConstantVoltage);
+    check!(REG_CVCC, 1, |x: &mut Xy<_>| x.read_reg_mode(), RegMode::ConstantCurrent);
+    check!(REG_BAUD_CODE, 6, |x: &mut Xy<_>| x.read_baud_rate(), BaudRate::B115200);
 
-    // read_current_out: REG_I_OUT, scale 100
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_I_OUT,
-            values: vec![500],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_current_out().unwrap(), 5.00);
-
-    // read_power_out: REG_P_OUT, scale 10
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_P_OUT,
-            values: vec![675],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_power_out().unwrap(), 67.5);
-
-    // read_voltage_in: REG_V_IN, scale 100
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_V_IN,
-            values: vec![2400],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_voltage_in().unwrap(), 24.00);
-
-    // read_setpoints: 2-reg bulk read at REG_V_SET
+    // 2-reg bulk reads.
     let mut xy = Xy::new(
         MockTransport::new(vec![Op::Read {
             addr: REG_V_SET,
@@ -447,10 +440,8 @@ fn one_shot_getters_use_correct_addr_and_scale() {
         Model::Xy7025,
     );
     let s = xy.read_setpoints().unwrap();
-    assert_eq!(s.v_set, 14.40);
-    assert_eq!(s.i_set, 10.00);
+    assert_eq!((s.v_set, s.i_set), (14.40, 10.00));
 
-    // read_temperatures: 2-reg bulk read at REG_T_IN, scale 10 each
     let mut xy = Xy::new(
         MockTransport::new(vec![Op::Read {
             addr: REG_T_IN,
@@ -458,89 +449,7 @@ fn one_shot_getters_use_correct_addr_and_scale() {
         }]),
         Model::Xy7025,
     );
-    let (tin, tex) = xy.read_temperatures().unwrap();
-    assert_eq!(tin, 34.5);
-    assert_eq!(tex, 25.6);
-
-    // read_reg_mode: 0 → CV, nonzero → CC
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_CVCC,
-            values: vec![0],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_reg_mode().unwrap(), RegMode::ConstantVoltage);
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_CVCC,
-            values: vec![1],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_reg_mode().unwrap(), RegMode::ConstantCurrent);
-
-    // read_output: REG_OUTPUT_EN
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_OUTPUT_EN,
-            values: vec![1],
-        }]),
-        Model::Xy7025,
-    );
-    assert!(xy.read_output().unwrap());
-
-    // read_lock, read_backlight, read_sleep_minutes, read_buzzer
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_LOCK,
-            values: vec![1],
-        }]),
-        Model::Xy7025,
-    );
-    assert!(xy.read_lock().unwrap());
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_BACKLIGHT,
-            values: vec![4],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_backlight().unwrap(), 4);
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_SLEEP,
-            values: vec![15],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_sleep_minutes().unwrap(), 15);
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_BUZZER,
-            values: vec![0],
-        }]),
-        Model::Xy7025,
-    );
-    assert!(!xy.read_buzzer().unwrap());
-
-    // read_slave_address, read_power_on_output
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_SLAVE_ADDR,
-            values: vec![7],
-        }]),
-        Model::Xy7025,
-    );
-    assert_eq!(xy.read_slave_address().unwrap(), 7);
-    let mut xy = Xy::new(
-        MockTransport::new(vec![Op::Read {
-            addr: REG_S_INI,
-            values: vec![1],
-        }]),
-        Model::Xy7025,
-    );
-    assert!(xy.read_power_on_output().unwrap());
+    assert_eq!(xy.read_temperatures().unwrap(), (34.5, 25.6));
 }
 
 #[test]
@@ -569,6 +478,55 @@ fn temp_unit_round_trip() {
     assert_eq!(xy.read_temp_unit().unwrap(), TempUnit::Celsius);
     xy.set_temp_unit(TempUnit::Fahrenheit).unwrap();
     assert_eq!(xy.read_temp_unit().unwrap(), TempUnit::Fahrenheit);
+}
+
+/// All five preset variants must report the documented scales (DATASHEET §3).
+/// Custom is verified separately in `custom_model_routes_user_supplied_scales`.
+#[test]
+fn preset_models_match_datasheet_scales() {
+    // (model, current, power, opp)
+    let presets = [
+        (Model::Xy6020L, 100.0, 10.0, 1.0),
+        (Model::Xy7025, 100.0, 10.0, 1.0),
+        (Model::Sk60, 1000.0, 100.0, 10.0),
+        (Model::Sk120, 1000.0, 100.0, 10.0),
+        (Model::Sk120x, 1000.0, 100.0, 10.0),
+    ];
+    for (m, i, p, o) in presets {
+        assert_eq!(m.current_scale(), i);
+        assert_eq!(m.power_scale(), p);
+        assert_eq!(m.opp_scale(), o);
+    }
+}
+
+/// Group encode under SK-family must use opp_scale=10 (S-OPP raw stores
+/// 0.1 W units), distinct from XY7025/XY6020L which store whole watts.
+#[test]
+fn group_encode_under_sk120_uses_opp_scale_10() {
+    // 18.0 W S-OPP → raw 180 on SK family, would be 18 on XY7025.
+    let p = GroupParams {
+        v_set: 5.0,
+        i_set: 1.0,
+        s_lvp_v: 0.0,
+        s_ovp_v: 0.0,
+        s_ocp_a: 0.0,
+        s_opp_w: 18.0,
+        s_ohp_h: 0,
+        s_ohp_m: 0,
+        s_oah_low: 0,
+        s_oah_high: 0,
+        s_owh_low: 0,
+        s_owh_high: 0,
+        s_otp: 0.0,
+        power_on_output: false,
+    };
+    let mock = MockTransport::new(vec![Op::WriteMany {
+        addr: group_addr(0),
+        // v_set=500, i_set=1000 (×1000 SK), s_opp=180, s_otp=0.
+        values: vec![500, 1000, 0, 0, 0, 180, 0, 0, 0, 0, 0, 0, 0, 0],
+    }]);
+    let mut xy = Xy::new(mock, Model::Sk120);
+    xy.write_group(0, &p).unwrap();
 }
 
 #[test]
