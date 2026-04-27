@@ -57,4 +57,43 @@ impl Model {
             Self::Custom { opp_scale, .. } => opp_scale,
         }
     }
+
+    /// Expected value of the device's `MODEL` register (`0x0016`) for
+    /// this variant, if known. Used by [`crate::Xy::verify_model`] to
+    /// catch wrong-scale-family misconfiguration.
+    ///
+    /// `0x6100` is shared by XY6020L and XY7025 — they have identical
+    /// register scales, so the choice doesn't affect protocol behavior.
+    /// SK-family codes are not yet pinned in this crate; `verify_model`
+    /// reports `Inconclusive` for them.
+    pub const fn expected_model_code(self) -> Option<u16> {
+        match self {
+            Self::Xy6020L | Self::Xy7025 => Some(0x6100),
+            Self::Sk60 | Self::Sk120 | Self::Sk120x | Self::Custom { .. } => None,
+        }
+    }
+}
+
+// ─── ModelCheck ──────────────────────────────────────────────────────────────
+
+/// Outcome of [`crate::Xy::verify_model`]. `Mismatch` is the dangerous
+/// case — readings WILL be off by 10× until the configured [`Model`] is
+/// changed to match the hardware.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ModelCheck {
+    /// Device's `MODEL` register matches the configured model's family.
+    Match { device_code: u16 },
+    /// Device reports a code mapped to a different scale family. The
+    /// configured [`Model`] is wrong for this hardware; readings will
+    /// be off until it's corrected.
+    Mismatch {
+        expected_code: u16,
+        device_code: u16,
+    },
+    /// Verification was not possible: either the device returned a
+    /// code outside the documented set, or the configured model is
+    /// `Custom` / SK-family (no canonical expected code).
+    Inconclusive { device_code: u16 },
 }

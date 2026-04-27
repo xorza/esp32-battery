@@ -577,3 +577,91 @@ fn rtu_error_propagates() {
         Err(RtuError::Modbus(ModbusError::BadCrc))
     ));
 }
+
+#[test]
+fn verify_model_match_for_xy7025() {
+    // Configured Xy7025 (expected code 0x6100); device reports 0x6100 → Match.
+    let mut xy = Xy::new(
+        MockTransport::new(vec![Op::Read {
+            addr: REG_MODEL,
+            values: vec![0x6100],
+        }]),
+        Model::Xy7025,
+    );
+    assert_eq!(
+        xy.verify_model().unwrap(),
+        ModelCheck::Match { device_code: 0x6100 }
+    );
+}
+
+#[test]
+fn verify_model_match_for_xy6020l() {
+    // 0x6100 is the documented family code for both XY6020L and XY7025.
+    let mut xy = Xy::new(
+        MockTransport::new(vec![Op::Read {
+            addr: REG_MODEL,
+            values: vec![0x6100],
+        }]),
+        Model::Xy6020L,
+    );
+    assert_eq!(
+        xy.verify_model().unwrap(),
+        ModelCheck::Match { device_code: 0x6100 }
+    );
+}
+
+#[test]
+fn verify_model_mismatch_when_codes_differ() {
+    // Configured XY7025 (expected 0x6100) but device reports a foreign
+    // code → Mismatch (the dangerous case the API exists to surface).
+    let mut xy = Xy::new(
+        MockTransport::new(vec![Op::Read {
+            addr: REG_MODEL,
+            values: vec![0x7700],
+        }]),
+        Model::Xy7025,
+    );
+    assert_eq!(
+        xy.verify_model().unwrap(),
+        ModelCheck::Mismatch {
+            expected_code: 0x6100,
+            device_code: 0x7700,
+        }
+    );
+}
+
+#[test]
+fn verify_model_inconclusive_for_sk_family() {
+    // SK-family codes aren't pinned in this crate yet → Inconclusive
+    // regardless of what the device reports.
+    let mut xy = Xy::new(
+        MockTransport::new(vec![Op::Read {
+            addr: REG_MODEL,
+            values: vec![0x1234],
+        }]),
+        Model::Sk120,
+    );
+    assert_eq!(
+        xy.verify_model().unwrap(),
+        ModelCheck::Inconclusive { device_code: 0x1234 }
+    );
+}
+
+#[test]
+fn verify_model_inconclusive_for_custom() {
+    let mut xy = Xy::new(
+        MockTransport::new(vec![Op::Read {
+            addr: REG_MODEL,
+            values: vec![0x6100],
+        }]),
+        Model::Custom {
+            current_scale: 100.0,
+            power_scale: 10.0,
+            opp_scale: 1.0,
+        },
+    );
+    assert_eq!(
+        xy.verify_model().unwrap(),
+        ModelCheck::Inconclusive { device_code: 0x6100 }
+    );
+}

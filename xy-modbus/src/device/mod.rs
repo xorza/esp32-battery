@@ -4,8 +4,8 @@
 use crate::regs::*;
 use crate::transport::{ModbusTransport, RtuError};
 use crate::types::{
-    BaudRate, GroupParams, Model, OnTime, ProtectionStatus, RegMode, SafetyLimits, Setpoints,
-    Status, TempUnit, Totals,
+    BaudRate, GroupParams, Model, ModelCheck, OnTime, ProtectionStatus, RegMode, SafetyLimits,
+    Setpoints, Status, TempUnit, Totals,
 };
 
 // Fixed-point conversion. Inputs are clamped to u16 — caller is responsible
@@ -286,6 +286,28 @@ impl<T: ModbusTransport> Xy<T> {
     /// Product number (e.g. `0x6100`).
     pub fn read_model(&mut self) -> Result<u16, RtuError> {
         self.read_one(REG_MODEL)
+    }
+
+    /// Read the device's `MODEL` register and check it against the
+    /// configured [`Model`]'s expected family code. Catches the
+    /// "wrong scale family" footgun where `read_status().i_out` would
+    /// silently come back 10× off — a one-call sanity check at boot.
+    ///
+    /// Returns [`ModelCheck::Inconclusive`] when the configured model
+    /// has no canonical code (SK family, `Custom`) or when the device
+    /// reports a code outside the documented set; [`ModelCheck::Match`]
+    /// when codes line up; [`ModelCheck::Mismatch`] when they don't —
+    /// the dangerous case the caller should refuse to proceed past.
+    pub fn verify_model(&mut self) -> Result<ModelCheck, RtuError> {
+        let device_code = self.read_model()?;
+        match self.model.expected_model_code() {
+            Some(expected) if expected == device_code => Ok(ModelCheck::Match { device_code }),
+            Some(expected) => Ok(ModelCheck::Mismatch {
+                expected_code: expected,
+                device_code,
+            }),
+            None => Ok(ModelCheck::Inconclusive { device_code }),
+        }
     }
 
     /// Firmware version (e.g. `0x0071`).

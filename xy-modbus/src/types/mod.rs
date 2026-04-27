@@ -7,5 +7,5 @@ mod status;
 
 pub use enums::{BaudRate, ProtectionStatus, RegMode, TempUnit};
 pub use group::GroupParams;
-pub use model::Model;
+pub use model::{Model, ModelCheck};
 pub use status::{OnTime, SafetyLimits, Setpoints, Status, Totals};
