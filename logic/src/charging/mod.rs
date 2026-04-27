@@ -522,6 +522,13 @@ impl ChargeSupervisor {
     /// What setpoints the supervisor currently expects the buck to be
     /// regulating to. Used by the caller to construct `Setpoints` for tests
     /// and as documentation for what `tick` will compare readbacks against.
+    ///
+    /// `i_set` is the constant `regulation_a` from the profile — the
+    /// drift check relies on this never changing at runtime. If a future
+    /// feature ever varies the current setpoint (CC tapering, dynamic
+    /// limits, etc.), it must use the same defer-and-ack pattern as
+    /// `pending_phase` for V_SET, otherwise a successful write to a new
+    /// I_SET will trip `SettingsDrift` on the very next tick.
     pub fn expected_setpoints(&self) -> Setpoints {
         Setpoints {
             v_set: self.target_voltage(),

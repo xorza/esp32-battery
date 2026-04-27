@@ -30,6 +30,7 @@ use esp32_battery_logic::modbus::RtuError;
 
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
+use crate::reboot;
 use crate::task_wdt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -421,10 +422,12 @@ const WDT_TIMEOUT: Duration = Duration::from_secs(10);
 const _: () = assert!(WDT_TIMEOUT.as_secs() > POLL_INTERVAL.as_secs() * 2);
 
 /// Try `boot_sequence` up to `BOOT_RETRY_COUNT` times. On total failure,
-/// log + record an event + eagerly disable output. Returns either way —
-/// the supervisor will fail closed via ModbusUnhealthy if Modbus is
-/// genuinely dead. Called both at cold boot and on every recovery
-/// restart, so protection + setpoints get re-verified each time.
+/// best-effort disable output and reboot the MCU — the alternative is
+/// falling through to a supervisor that immediately latches
+/// `ModbusUnhealthy` and stays Tripped forever. A reboot might clear
+/// transient causes (XY7025 still powering up, UART state, ESP IDF
+/// driver wedged), and S_INI=OFF means the buck comes back disabled
+/// even if our set_output call below failed.
 fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
     for attempt in 0..BOOT_RETRY_COUNT {
         if attempt > 0 {
@@ -434,15 +437,22 @@ fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
             return;
         }
     }
-    error!(
-        "XY boot failed after {BOOT_RETRY_COUNT} attempts — falling through to supervisor for fail-closed retries"
-    );
+    error!("XY boot failed after {BOOT_RETRY_COUNT} attempts — rebooting MCU");
     recorder.record(Event::Xy(XyError::BootSequence));
-    // Eager disable: cuts time-to-OFF by ~5 s vs. waiting for the
-    // ModbusUnhealthy debounce.
     match xy.set_output(false) {
-        Ok(()) => warn!("XY post-boot-fail set_output(false) succeeded"),
-        Err(e) => error!("XY post-boot-fail set_output(false) FAILED: {e}"),
+        Ok(()) => warn!("XY pre-reboot set_output(false) succeeded"),
+        Err(e) => error!(
+            "XY pre-reboot set_output(false) FAILED: {e} — relying on S_INI=OFF after reboot"
+        ),
+    }
+    // Releases the WDT subscription so the reboot grace period (2 s in
+    // `reboot_after`) doesn't trip the deadman before the restart fires.
+    task_wdt::unsubscribe();
+    reboot::reboot_after("XY boot failed: rebooting now");
+    // Park this thread until the reboot fires. Anything below would race
+    // the restart and add no value.
+    loop {
+        thread::sleep(Duration::from_secs(60));
     }
 }
 
