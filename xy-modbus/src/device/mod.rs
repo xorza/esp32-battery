@@ -19,7 +19,9 @@ fn from_reg(raw: u16, scale: f32) -> f32 {
     raw as f32 / scale
 }
 
-fn from_reg32(high: u16, low: u16, scale: f32) -> f32 {
+/// `low` / `high` match the on-wire register pair order (low word at the
+/// lower address — see `REG_AH_LOW` / `REG_AH_HIGH`).
+fn from_reg32(low: u16, high: u16, scale: f32) -> f32 {
     let raw = ((high as u32) << 16) | low as u32;
     raw as f32 / scale
 }
@@ -138,8 +140,8 @@ impl<T: ModbusTransport> Xy<T> {
         self.transport
             .read_holding(self.slave, REG_AH_LOW, &mut r)?;
         Ok(Totals {
-            charge_ah: from_reg32(r[1], r[0], 1000.0),
-            energy_wh: from_reg32(r[3], r[2], 1000.0),
+            charge_ah: from_reg32(r[0], r[1], 1000.0),
+            energy_wh: from_reg32(r[2], r[3], 1000.0),
             on_time: OnTime {
                 hours: r[4],
                 minutes: r[5],
@@ -421,8 +423,8 @@ fn decode_group(r: &[u16; GROUP_LEN as usize], model: Model) -> GroupParams {
         s_opp_w: from_reg(s_opp, model.opp_scale()),
         s_ohp_h,
         s_ohp_m,
-        s_oah_ah: from_reg32(s_oah_high, s_oah_low, 1000.0),
-        s_owh_wh: from_reg32(s_owh_high, s_owh_low, 100.0),
+        s_oah_ah: from_reg32(s_oah_low, s_oah_high, 1000.0),
+        s_owh_wh: from_reg32(s_owh_low, s_owh_high, 100.0),
         s_otp: from_reg(s_otp, 10.0),
         power_on_output: s_ini != 0,
     }
