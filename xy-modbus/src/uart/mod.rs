@@ -29,6 +29,7 @@ use crate::transport::{ModbusTransport, RtuError};
 // ─── UartTransport ───────────────────────────────────────────────────────────
 
 /// Generic Modbus-RTU transport over any `embedded-io` UART.
+#[derive(Debug)]
 pub struct UartTransport<U, D> {
     uart: U,
     delay: D,

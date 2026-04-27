@@ -8,7 +8,7 @@
 /// Cross-check by reading `MODEL` (`0x0016`): `0x6100`-class is
 /// XY6020L / XY7025; SK-family codes differ. The crate does not probe
 /// automatically — pick the variant that matches your hardware.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Model {

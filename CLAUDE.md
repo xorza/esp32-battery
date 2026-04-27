@@ -10,7 +10,7 @@ AI coding rules for Rust projects:
 
 ## Code Style
 
-- Do not add `#[derive(Debug)]` to structs.
+- Derive `Debug` on public structs and enums so they format in panics, logs, and assertion failures. Also derive `Copy`/`Clone` for small POD types, `PartialEq`/`Eq` where equality is well-defined (skip `Eq` when fields are `f32`/`f64`), and `Default` when a zero/empty value is meaningful. Feature-gate `defmt::Format` and `serde::{Serialize, Deserialize}` via `#[cfg_attr(...)]`.
 - No backward compatibility. Remove old/deprecated code, rename freely, change APIs. Rewrite callers to use new APIs. No compatibility shims, re-exports, or wrappers.
 - Remove unused code. If kept intentionally, add a comment explaining why and silence linter warnings.
 - Keep public API clean and consistent.

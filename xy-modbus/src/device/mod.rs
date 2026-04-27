@@ -26,6 +26,7 @@ fn from_reg(raw: u16, scale: f32) -> f32 {
 /// I-SET / IOUT / S-OCP / POWER / S-OPP — passing the wrong model
 /// silently yields readings off by 10×, so cross-check
 /// [`Self::read_model`] against your hardware.
+#[derive(Debug)]
 pub struct Xy<T: ModbusTransport> {
     transport: T,
     slave: u8,
