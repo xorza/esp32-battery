@@ -111,9 +111,9 @@ fn model_scales_diverge_between_xy7025_and_sk_custom() {
     let mut xy = Xy::new(
         sk_mock,
         Model::Custom {
-            current_scale: 1000.0,
-            power_scale: 100.0,
-            opp_scale: 10.0,
+            current_scale: 1000,
+            power_scale: 100,
+            opp_scale: 10,
         },
     );
     let s = xy.read_status().unwrap();
@@ -133,9 +133,9 @@ fn model_scales_diverge_between_xy7025_and_sk_custom() {
 #[test]
 fn custom_model_routes_user_supplied_scales() {
     let m = Model::Custom {
-        current_scale: 500.0,
-        power_scale: 25.0,
-        opp_scale: 4.0,
+        current_scale: 500,
+        power_scale: 25,
+        opp_scale: 4,
     };
     assert_eq!(m.current_scale(), 500.0);
     assert_eq!(m.power_scale(), 25.0);
@@ -583,9 +583,9 @@ fn group_encode_under_custom_sk_scales_uses_opp_scale_10() {
     let mut xy = Xy::new(
         mock,
         Model::Custom {
-            current_scale: 1000.0,
-            power_scale: 100.0,
-            opp_scale: 10.0,
+            current_scale: 1000,
+            power_scale: 100,
+            opp_scale: 10,
         },
     );
     xy.write_group(0, &p).unwrap();
@@ -672,9 +672,9 @@ fn verify_model_inconclusive_for_custom() {
             values: vec![0x6100],
         }]),
         Model::Custom {
-            current_scale: 100.0,
-            power_scale: 10.0,
-            opp_scale: 1.0,
+            current_scale: 100,
+            power_scale: 10,
+            opp_scale: 1,
         },
     );
     assert_eq!(

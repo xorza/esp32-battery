@@ -8,7 +8,7 @@
 /// Cross-check by reading `MODEL` (`0x0016`): `0x6100`-class is
 /// XY6020L / XY7025. The crate does not probe automatically — pick
 /// the variant that matches your hardware.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Model {
@@ -19,12 +19,15 @@ pub enum Model {
     /// Protocol-identical to [`Self::Xy6020L`].
     Xy7025,
     /// Escape hatch for hardware not covered by the preset variants.
-    /// Supply the per-register scales directly; cross-check against the
+    /// Each scale is the integer denominator the firmware uses on the
+    /// wire — e.g. `current_scale = 100` means a raw register value of
+    /// `1234` represents `12.34 A`. The XY firmware uses integer
+    /// denominators on every known variant; cross-check against the
     /// vendor docs for your unit.
     Custom {
-        current_scale: f32,
-        power_scale: f32,
-        opp_scale: f32,
+        current_scale: u16,
+        power_scale: u16,
+        opp_scale: u16,
     },
 }
 
@@ -33,7 +36,7 @@ impl Model {
     pub const fn current_scale(self) -> f32 {
         match self {
             Self::Xy6020L | Self::Xy7025 => 100.0,
-            Self::Custom { current_scale, .. } => current_scale,
+            Self::Custom { current_scale, .. } => current_scale as f32,
         }
     }
 
@@ -41,7 +44,7 @@ impl Model {
     pub const fn power_scale(self) -> f32 {
         match self {
             Self::Xy6020L | Self::Xy7025 => 10.0,
-            Self::Custom { power_scale, .. } => power_scale,
+            Self::Custom { power_scale, .. } => power_scale as f32,
         }
     }
 
@@ -49,7 +52,7 @@ impl Model {
     pub const fn opp_scale(self) -> f32 {
         match self {
             Self::Xy6020L | Self::Xy7025 => 1.0,
-            Self::Custom { opp_scale, .. } => opp_scale,
+            Self::Custom { opp_scale, .. } => opp_scale as f32,
         }
     }
 
