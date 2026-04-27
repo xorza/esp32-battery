@@ -65,6 +65,10 @@ CONFIG_LWIP_TCP_MSL=2000
 # Reduce FIN_WAIT_2 timeout from 20s to 2s
 CONFIG_LWIP_TCP_FIN_WAIT_TIMEOUT=2000
 
+# SNTP poll interval: default 1h is too long given internal-RC drift between
+# syncs. 5 min keeps wall-clock within RC drift bounds without flooding pool.ntp.
+CONFIG_LWIP_SNTP_UPDATE_DELAY=300000
+
 # Disable WiFi power save to avoid missed packets causing half-open connections
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
 

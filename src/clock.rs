@@ -79,21 +79,24 @@ impl EventRecorder {
 /// the whole process lifetime — it handles WiFi flaps internally.
 pub fn start_sntp(clock: EspClock) -> esp_idf_svc::sntp::EspSntp<'static> {
     info!("Starting NTP sync");
-    esp_idf_svc::sntp::EspSntp::new_with_callback(
-        &esp_idf_svc::sntp::SntpConf::default(),
-        move |synced_at| {
-            // The SNTP callback can fire with a bogus time (bad server, DNS
-            // hijack, pre-sync tick). Only flip the flag once the reported
-            // epoch is within the plausibility window — otherwise a bogus
-            // value reaches SensorData and poisons history.
-            let secs = synced_at.as_secs();
-            if VALID_EPOCH_S.contains(&secs) {
-                info!("NTP synced: epoch={secs}");
-                clock.mark_synced();
-            } else {
-                warn!("NTP sync ignored: implausible epoch={secs}");
-            }
-        },
-    )
+    // Smooth sync gradually nudges the clock instead of snapping it, so EventLog
+    // timestamps stay monotonic even after a long unsynced stretch.
+    let conf = esp_idf_svc::sntp::SntpConf {
+        sync_mode: esp_idf_svc::sntp::SyncMode::Smooth,
+        ..Default::default()
+    };
+    esp_idf_svc::sntp::EspSntp::new_with_callback(&conf, move |synced_at| {
+        // The SNTP callback can fire with a bogus time (bad server, DNS
+        // hijack, pre-sync tick). Only flip the flag once the reported
+        // epoch is within the plausibility window — otherwise a bogus
+        // value reaches SensorData and poisons history.
+        let secs = synced_at.as_secs();
+        if VALID_EPOCH_S.contains(&secs) {
+            info!("NTP synced: epoch={secs}");
+            clock.mark_synced();
+        } else {
+            warn!("NTP sync ignored: implausible epoch={secs}");
+        }
+    })
     .unwrap()
 }
