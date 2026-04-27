@@ -12,7 +12,11 @@
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Model {
+    /// Protocol-identical to [`Self::Xy7025`] (same scales, same `MODEL`
+    /// register code `0x6100`). Pick whichever matches the silkscreen on
+    /// your board — the crate treats them interchangeably.
     Xy6020L,
+    /// Protocol-identical to [`Self::Xy6020L`].
     Xy7025,
     Sk60,
     Sk120,
