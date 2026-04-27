@@ -29,12 +29,18 @@ use crate::transport::{BlockingRead, ModbusTransport, RtuError};
 // ─── UartTransport ───────────────────────────────────────────────────────────
 
 /// Generic Modbus-RTU transport over any blocking-with-timeout UART.
+///
+/// Holds a single [`MAX_ADU`]-sized scratch buffer reused across
+/// transactions — keeps the per-call stack frame small (each
+/// `read_holding` / `write_multiple_holdings` would otherwise allocate
+/// 256 B locally).
 #[derive(Debug)]
 pub struct UartTransport<U, D> {
     uart: U,
     delay: D,
     response_timeout_ms: u32,
     inter_frame_ms: u32,
+    buf: [u8; MAX_ADU],
 }
 
 impl<U, D> UartTransport<U, D>
@@ -50,6 +56,7 @@ where
             delay,
             response_timeout_ms: 500,
             inter_frame_ms: 50,
+            buf: [0u8; MAX_ADU],
         }
     }
 
@@ -66,78 +73,84 @@ where
         (self.uart, self.delay)
     }
 
-    // ─── I/O helpers ─────────────────────────────────────────────────────
-
-    /// Discard whatever is already in the UART RX buffer. Cheap
-    /// non-blocking calls (`timeout_ms = 0`) drain noise that arrived
-    /// during the inter-frame silence so it doesn't masquerade as the
-    /// start of the slave's reply.
-    fn drain_rx(&mut self) {
-        let mut scratch = [0u8; 32];
-        loop {
-            match self.uart.read(&mut scratch, 0) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-        }
-    }
-
     /// Enforce ≥t3.5 bus silence before the next master frame, then
     /// flush any noise that arrived during the gap.
     fn pre_tx_silence(&mut self) {
         self.delay.delay_ms(self.inter_frame_ms);
-        self.drain_rx();
+        drain_rx(&mut self.uart);
     }
+}
 
-    fn write_all(&mut self, mut buf: &[u8]) -> Result<(), RtuError> {
-        while !buf.is_empty() {
-            match self.uart.write(buf) {
-                Ok(0) => return Err(RtuError::Io),
-                Ok(n) => buf = &buf[n..],
-                Err(_) => return Err(RtuError::Io),
-            }
-        }
-        self.uart.flush().map_err(|_| RtuError::Io)?;
-        Ok(())
-    }
+// ─── Free helpers (take `&mut U` so the buffer in `UartTransport` ──────────
+//                  can be borrowed disjointly with the UART)
 
-    /// Fill `buf` from the UART, treating "no bytes within
-    /// `response_timeout_ms`" as a timeout. Each `read` call gets a fresh
-    /// timeout — a slave that starts replying mid-window has the rest of
-    /// its frame protected by the next read's full budget. Worst-case
-    /// wall-clock is a small multiple of `response_timeout_ms` only if the
-    /// slave dribbles bytes with timeout-length pauses between them, which
-    /// no real Modbus device does.
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), RtuError> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            match self.uart.read(&mut buf[filled..], self.response_timeout_ms) {
-                Ok(0) => return Err(RtuError::Timeout),
-                Ok(n) => filled += n,
-                Err(_) => return Err(RtuError::Io),
-            }
+/// Discard whatever is already in the UART RX buffer. Cheap
+/// non-blocking calls (`timeout_ms = 0`) drain noise that arrived during
+/// the inter-frame silence so it doesn't masquerade as the start of the
+/// slave's reply.
+fn drain_rx<U: BlockingRead>(uart: &mut U) {
+    let mut scratch = [0u8; 32];
+    loop {
+        match uart.read(&mut scratch, 0) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
         }
-        Ok(())
     }
+}
 
-    /// Read a response of expected length `full_len`, short-circuiting
-    /// on a 5-byte Modbus exception frame.
-    fn read_response<'b>(
-        &mut self,
-        buf: &'b mut [u8],
-        full_len: usize,
-    ) -> Result<&'b [u8], RtuError> {
-        assert!(full_len >= 5 && full_len <= buf.len());
-        self.read_exact(&mut buf[..3])?;
-        if buf[1] & 0x80 != 0 {
-            self.read_exact(&mut buf[3..5])?;
-            return Ok(&buf[..5]);
+fn write_all<U: Write>(uart: &mut U, mut buf: &[u8]) -> Result<(), RtuError> {
+    while !buf.is_empty() {
+        match uart.write(buf) {
+            Ok(0) => return Err(RtuError::Io),
+            Ok(n) => buf = &buf[n..],
+            Err(_) => return Err(RtuError::Io),
         }
-        if full_len > 3 {
-            self.read_exact(&mut buf[3..full_len])?;
-        }
-        Ok(&buf[..full_len])
     }
+    uart.flush().map_err(|_| RtuError::Io)?;
+    Ok(())
+}
+
+/// Fill `buf` from the UART, treating "no bytes within
+/// `response_timeout_ms`" as a timeout. Each `read` call gets a fresh
+/// timeout — a slave that starts replying mid-window has the rest of
+/// its frame protected by the next read's full budget. Worst-case
+/// wall-clock is a small multiple of `response_timeout_ms` only if the
+/// slave dribbles bytes with timeout-length pauses between them, which
+/// no real Modbus device does.
+fn read_exact<U: BlockingRead>(
+    uart: &mut U,
+    buf: &mut [u8],
+    response_timeout_ms: u32,
+) -> Result<(), RtuError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match uart.read(&mut buf[filled..], response_timeout_ms) {
+            Ok(0) => return Err(RtuError::Timeout),
+            Ok(n) => filled += n,
+            Err(_) => return Err(RtuError::Io),
+        }
+    }
+    Ok(())
+}
+
+/// Read a response of expected length `full_len`, short-circuiting on a
+/// 5-byte Modbus exception frame.
+fn read_response<'b, U: BlockingRead>(
+    uart: &mut U,
+    buf: &'b mut [u8],
+    full_len: usize,
+    response_timeout_ms: u32,
+) -> Result<&'b [u8], RtuError> {
+    assert!(full_len >= 5 && full_len <= buf.len());
+    read_exact(uart, &mut buf[..3], response_timeout_ms)?;
+    if buf[1] & 0x80 != 0 {
+        read_exact(uart, &mut buf[3..5], response_timeout_ms)?;
+        return Ok(&buf[..5]);
+    }
+    if full_len > 3 {
+        read_exact(uart, &mut buf[3..full_len], response_timeout_ms)?;
+    }
+    Ok(&buf[..full_len])
 }
 
 // ─── ModbusTransport impl ────────────────────────────────────────────────────
@@ -155,10 +168,14 @@ where
         let expected_len = 5 + 2 * dst.len();
 
         self.pre_tx_silence();
-        self.write_all(&req)?;
+        write_all(&mut self.uart, &req)?;
 
-        let mut buf = [0u8; MAX_ADU];
-        let resp = self.read_response(&mut buf, expected_len)?;
+        let resp = read_response(
+            &mut self.uart,
+            &mut self.buf,
+            expected_len,
+            self.response_timeout_ms,
+        )?;
         parse_read_response(resp, slave, dst)?;
         Ok(())
     }
@@ -171,10 +188,9 @@ where
         let req = build_write_single_request(slave, addr, value);
 
         self.pre_tx_silence();
-        self.write_all(&req)?;
+        write_all(&mut self.uart, &req)?;
 
-        let mut buf = [0u8; 8];
-        let resp = self.read_response(&mut buf, 8)?;
+        let resp = read_response(&mut self.uart, &mut self.buf, 8, self.response_timeout_ms)?;
         parse_write_single_response(resp, &req)?;
         Ok(())
     }
@@ -190,15 +206,16 @@ where
             "multi-register write does not support broadcast"
         );
         assert!(!values.is_empty() && values.len() <= MAX_WRITE_REGS);
-        let mut req = [0u8; MAX_ADU];
-        let n = build_write_multiple_request(slave, addr, values, &mut req)
+
+        // Build request into self.buf, send it, then reuse the same
+        // buffer for the response — sequential, no aliasing.
+        let n = build_write_multiple_request(slave, addr, values, &mut self.buf)
             .expect("inputs validated above");
 
         self.pre_tx_silence();
-        self.write_all(&req[..n])?;
+        write_all(&mut self.uart, &self.buf[..n])?;
 
-        let mut buf = [0u8; 8];
-        let resp = self.read_response(&mut buf, 8)?;
+        let resp = read_response(&mut self.uart, &mut self.buf, 8, self.response_timeout_ms)?;
         parse_write_multiple_response(resp, slave, addr, values.len() as u16)?;
         Ok(())
     }
