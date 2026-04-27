@@ -2154,7 +2154,7 @@ dependencies = [
 [[package]]
 name = "xy-modbus"
 version = "0.1.0"
-source = "git+https://github.com/xorza/xy-modbus?branch=master#4a15f004ae502140abe5d2e13a73d664989bfd70"
+source = "git+https://github.com/xorza/xy-modbus?branch=master#7ab7838cf6d33e0c1b4c54dae86caf24121d141a"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-io 0.7.1",
