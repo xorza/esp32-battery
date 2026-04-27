@@ -113,7 +113,14 @@ fn tick_and_persist(
 
 fn main() {
     esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+    let logger = esp_idf_svc::log::init_from_esp_idf();
+    // Mute INFO chatter from the ESP-IDF C side (handshake-per-poll from
+    // esp_https_server, wifi state spam, etc.). "*" is the ESP-IDF default
+    // tag; our Rust log macros go through the `log` crate and are unaffected.
+    logger
+        .filter()
+        .set_target_level("*", log::LevelFilter::Warn)
+        .ok();
     log_ring::init();
     ota::init();
     task_wdt::init();
