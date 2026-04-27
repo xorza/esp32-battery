@@ -7,3 +7,4 @@ edition = "2024"
 heapless = "*"
 log = "*"
 strum = { version = "*", default-features = false, features = ["derive"] }
+xy-modbus = { path = "../xy-modbus", default-features = false }

@@ -731,6 +731,7 @@ dependencies = [
  "heapless 0.9.2",
  "log",
  "strum 0.28.0",
+ "xy-modbus",
 ]
 
 [[package]]
