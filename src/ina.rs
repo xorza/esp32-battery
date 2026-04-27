@@ -54,6 +54,8 @@ trait InaDevice {
 
 #[cfg(not(feature = "ina-fake"))]
 mod real {
+    use std::sync::OnceLock;
+
     use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::BusConfig, config::DeviceConfig};
 
     use esp32_battery_logic::data::Ina228Reading;
@@ -69,6 +71,8 @@ mod real {
 
     type I2cDev = I2cDriver<'static, &'static I2cBusDriver<'static>>;
 
+    static I2C_BUS: OnceLock<I2cBusDriver<'static>> = OnceLock::new();
+
     pub struct Ina {
         ina: ina228::Ina228<I2cDev>,
     }
@@ -78,11 +82,14 @@ mod real {
         /// INA228. Panics on any init failure — the INA is soldered on,
         /// so a failure here is a hardware fault, not a runtime condition.
         pub fn new(pins: I2cPins) -> Self {
-            // Bus is leaked for `'static` — it lives for the whole process lifetime.
-            let i2c_bus: &'static I2cBusDriver<'static> = Box::leak(Box::new(
-                I2cBusDriver::new(pins.i2c, pins.sda, pins.scl, &BusConfig::new())
-                    .expect("I2C bus init"),
-            ));
+            // Bus lives for the whole process lifetime; OnceLock gives the
+            // `'static` borrow without a leaked allocation. `set` rejects
+            // a second init so re-calling `Ina::new` panics rather than
+            // silently dropping new pins on the floor.
+            let bus = I2cBusDriver::new(pins.i2c, pins.sda, pins.scl, &BusConfig::new())
+                .expect("I2C bus init");
+            I2C_BUS.set(bus).ok().expect("I2C bus already initialized");
+            let i2c_bus: &'static I2cBusDriver<'static> = I2C_BUS.get().unwrap();
             let dev_config = DeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
             let dev =
                 I2cDriver::new(i2c_bus, BATTERY_INA_ADDR, &dev_config).expect("I2C device init");

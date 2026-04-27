@@ -72,6 +72,11 @@ pub struct TimedEvent {
 
 const CAPACITY: usize = 32;
 
+/// Shared via `Arc<Mutex<_>>` across producers (INA/XY threads via
+/// `EventRecorder`) and readers (HTTP, LCD). Same poison contract as
+/// `SensorData`: `.lock().unwrap()` is intentional — the panic hook in
+/// `src/main.rs` reboots on any thread panic, so a poisoned lock is
+/// unreachable.
 pub struct EventLog {
     recent: Deque<TimedEvent, CAPACITY>,
     ina_counts: [u32; <InaError as EnumCount>::COUNT],

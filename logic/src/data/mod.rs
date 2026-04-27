@@ -118,6 +118,14 @@ impl LiveReadings {
 
 /// Central data store with adaptive-resolution history. Producer threads
 /// publish via `update_*`; the supervisor's 1 Hz `tick` drives commits.
+///
+/// Wrapped in `Arc<Mutex<_>>` and shared across the INA/XY producers, the
+/// supervisor, HTTP handlers, and the LCD task. All sites use
+/// `.lock().unwrap()` deliberately — the panic hook in `src/main.rs`
+/// reboots the device on any thread panic, so a poisoned mutex is
+/// unreachable in practice. Don't switch these calls to `lock().ok()` or
+/// poison-handling: the reboot path is the recovery, and silently
+/// continuing past a poisoned lock would mask a real fault.
 pub struct SensorData {
     live: LiveReadings,
     history: History,
