@@ -91,13 +91,13 @@ where
         Ok(())
     }
 
+    // Bounded by buf.len() forward progress: each iteration either consumes
+    // RX bytes (capped by buf.len() total), or sleeps 1ms and increments
+    // idle_ms (capped by response_timeout_ms). No separate wall-clock budget
+    // needed — DelayNs gives no clock to measure one against anyway.
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), RtuError> {
         let mut filled = 0;
         let mut idle_ms = 0u32;
-        let mut total_ms = 0u32;
-        // Wall-clock budget: the response window plus enough char-time slack
-        // to receive a full max-ADU at typical XY baud (9600 ≈ 270 ms).
-        let total_budget = self.response_timeout_ms.saturating_add(500);
         while filled < buf.len() {
             match self.uart.read_ready() {
                 Ok(true) => match self.uart.read(&mut buf[filled..]) {
@@ -109,12 +109,11 @@ where
                     Err(_) => return Err(RtuError::Io),
                 },
                 Ok(false) => {
-                    if idle_ms >= self.response_timeout_ms || total_ms >= total_budget {
+                    if idle_ms >= self.response_timeout_ms {
                         return Err(RtuError::Timeout);
                     }
                     self.delay.delay_ms(1);
                     idle_ms += 1;
-                    total_ms += 1;
                 }
                 Err(_) => return Err(RtuError::Io),
             }
@@ -147,12 +146,7 @@ where
     U: Read + Write + ReadReady,
     D: DelayNs,
 {
-    fn read_holding(
-        &mut self,
-        slave: u8,
-        addr: u16,
-        dst: &mut [u16],
-    ) -> Result<(), RtuError> {
+    fn read_holding(&mut self, slave: u8, addr: u16, dst: &mut [u16]) -> Result<(), RtuError> {
         assert!(slave != 0, "read does not support broadcast");
         assert!(!dst.is_empty() && dst.len() <= MAX_READ_REGS);
         let count = dst.len() as u16;
@@ -168,13 +162,11 @@ where
         Ok(())
     }
 
-    fn write_single_holding(
-        &mut self,
-        slave: u8,
-        addr: u16,
-        value: u16,
-    ) -> Result<(), RtuError> {
-        assert!(slave != 0, "single-register write does not support broadcast");
+    fn write_single_holding(&mut self, slave: u8, addr: u16, value: u16) -> Result<(), RtuError> {
+        assert!(
+            slave != 0,
+            "single-register write does not support broadcast"
+        );
         let req = build_write_single_request(slave, addr, value);
 
         self.pre_tx_silence();
@@ -192,7 +184,10 @@ where
         addr: u16,
         values: &[u16],
     ) -> Result<(), RtuError> {
-        assert!(slave != 0, "multi-register write does not support broadcast");
+        assert!(
+            slave != 0,
+            "multi-register write does not support broadcast"
+        );
         assert!(!values.is_empty() && values.len() <= MAX_WRITE_REGS);
         let mut req = [0u8; MAX_ADU];
         let n = build_write_multiple_request(slave, addr, values, &mut req)
@@ -368,6 +363,170 @@ mod tests {
             t.read_holding(0x01, 0x0000, &mut out).unwrap_err(),
             RtuError::Timeout
         );
+    }
+
+    /// UART that records every `delay_ms` for assertions on timing.
+    struct CountingDelay {
+        total_ms: u32,
+    }
+    impl DelayNs for CountingDelay {
+        fn delay_ns(&mut self, ns: u32) {
+            self.total_ms += ns / 1_000_000;
+        }
+    }
+
+    /// UART that fails (read or write) on demand.
+    struct FailingUart {
+        fail_read: bool,
+        fail_write: bool,
+        write_returns_zero: bool,
+        response: Vec<u8>,
+        resp_pos: usize,
+        armed: bool,
+    }
+    impl ErrorType for FailingUart {
+        type Error = embedded_io::ErrorKind;
+    }
+    impl embedded_io::Read for FailingUart {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            if self.fail_read {
+                return Err(embedded_io::ErrorKind::Other);
+            }
+            let mut n = 0;
+            while n < buf.len() && self.resp_pos < self.response.len() {
+                buf[n] = self.response[self.resp_pos];
+                self.resp_pos += 1;
+                n += 1;
+            }
+            Ok(n)
+        }
+    }
+    impl embedded_io::ReadReady for FailingUart {
+        fn read_ready(&mut self) -> Result<bool, Self::Error> {
+            Ok(self.armed && self.resp_pos < self.response.len())
+        }
+    }
+    impl embedded_io::Write for FailingUart {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            if self.fail_write {
+                return Err(embedded_io::ErrorKind::Other);
+            }
+            self.armed = true;
+            if self.write_returns_zero {
+                return Ok(0);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bad_crc_propagates() {
+        // Build a real-looking 3-reg read response, then flip the CRC.
+        let mut frame = std::vec![0x01u8, 0x03, 0x06, 0, 10, 0, 20, 0, 30];
+        let crc = crc16_modbus(&frame);
+        frame.push((crc as u8) ^ 0xFF);
+        frame.push((crc >> 8) as u8);
+        let uart = MockUart::new(frame);
+        let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+        let mut out = [0u16; 3];
+        assert_eq!(
+            t.read_holding(0x01, 0x0000, &mut out).unwrap_err(),
+            RtuError::Modbus(ModbusError::BadCrc)
+        );
+    }
+
+    #[test]
+    fn wrong_slave_in_response_propagates() {
+        // Slave field = 0x02 but request was for 0x01.
+        let frame = frame_with_crc(std::vec![0x02, 0x03, 0x02, 0x00, 0x05]);
+        let uart = MockUart::new(frame);
+        let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+        let mut out = [0u16; 1];
+        assert_eq!(
+            t.read_holding(0x01, 0x0000, &mut out).unwrap_err(),
+            RtuError::Modbus(ModbusError::BadSlave(0x02))
+        );
+    }
+
+    #[test]
+    fn write_returning_zero_is_io_error() {
+        let uart = FailingUart {
+            fail_read: false,
+            fail_write: false,
+            write_returns_zero: true,
+            response: Vec::new(),
+            resp_pos: 0,
+            armed: false,
+        };
+        let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+        let mut out = [0u16; 1];
+        assert_eq!(
+            t.read_holding(0x01, 0x0000, &mut out).unwrap_err(),
+            RtuError::Io
+        );
+    }
+
+    #[test]
+    fn write_error_is_io_error() {
+        let uart = FailingUart {
+            fail_read: false,
+            fail_write: true,
+            write_returns_zero: false,
+            response: Vec::new(),
+            resp_pos: 0,
+            armed: false,
+        };
+        let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+        assert_eq!(
+            t.write_single_holding(0x01, 0x0012, 0x0001).unwrap_err(),
+            RtuError::Io
+        );
+    }
+
+    #[test]
+    fn read_error_mid_frame_is_io_error() {
+        // Arm the UART with one byte of "response" but make read() return Err.
+        let uart = FailingUart {
+            fail_read: true,
+            fail_write: false,
+            write_returns_zero: false,
+            response: std::vec![0xAA],
+            resp_pos: 0,
+            armed: false,
+        };
+        let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+        let mut out = [0u16; 1];
+        assert_eq!(
+            t.read_holding(0x01, 0x0000, &mut out).unwrap_err(),
+            RtuError::Io
+        );
+    }
+
+    #[test]
+    fn pre_tx_silence_applies_inter_frame_gap() {
+        // Even with stale RX present (which makes drain_rx do work), the
+        // inter_frame_ms gap must be observed before TX.
+        let response = frame_with_crc(std::vec![0x01, 0x03, 0x02, 0x00, 0x05]);
+        let uart = MockUart::new(response);
+        let mut t = UartTransport::new(uart, CountingDelay { total_ms: 0 }).with_timing(50, 7);
+        let mut out = [0u16; 1];
+        t.read_holding(0x01, 0x0000, &mut out).unwrap();
+        let (_, delay) = t.release();
+        // Exactly one pre-TX silence of 7 ms; no other delay_ms calls on the
+        // happy path (response is ready immediately, so read_exact never sleeps).
+        assert_eq!(delay.total_ms, 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "broadcast")]
+    fn slave_zero_panics() {
+        let uart = MockUart::new(Vec::new());
+        let mut t = UartTransport::new(uart, NoDelay).with_timing(50, 0);
+        let mut out = [0u16; 1];
+        let _ = t.read_holding(0x00, 0x0000, &mut out);
     }
 
     #[test]

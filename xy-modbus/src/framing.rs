@@ -31,10 +31,7 @@ pub enum FrameError {
     /// `values` was empty or exceeded [`MAX_WRITE_REGS`] (123).
     InvalidLength(usize),
     /// `out` was smaller than the assembled frame (header + payload + CRC).
-    BufferTooSmall {
-        needed: usize,
-        actual: usize,
-    },
+    BufferTooSmall { needed: usize, actual: usize },
 }
 
 impl core::fmt::Display for FrameError {
@@ -245,25 +242,54 @@ mod tests {
         // Wire-level example from README §6.3: write LVP=1000, OVP=1500,
         // OCP=1250 to 0x0052..=0x0054, slave 1.
         let mut buf = [0u8; 32];
-        let n =
-            build_write_multiple_request(0x01, 0x0052, &[1000, 1500, 1250], &mut buf).unwrap();
+        let n = build_write_multiple_request(0x01, 0x0052, &[1000, 1500, 1250], &mut buf).unwrap();
         // 7 (header) + 6 (payload) + 2 (CRC) = 15
         assert_eq!(n, 15);
         // Header: slave, FC, start addr, qty, byte count.
-        assert_eq!(
-            buf[..7],
-            [0x01, 0x10, 0x00, 0x52, 0x00, 0x03, 0x06]
-        );
+        assert_eq!(buf[..7], [0x01, 0x10, 0x00, 0x52, 0x00, 0x03, 0x06]);
         // Payload: 1000=0x03E8, 1500=0x05DC, 1250=0x04E2.
         assert_eq!(buf[7..13], [0x03, 0xE8, 0x05, 0xDC, 0x04, 0xE2]);
     }
 
     #[test]
+    fn build_write_multiple_rejects_empty() {
+        let mut buf = [0u8; 32];
+        assert!(matches!(
+            build_write_multiple_request(0x01, 0x0050, &[], &mut buf),
+            Err(FrameError::InvalidLength(0))
+        ));
+    }
+
+    #[test]
+    fn build_write_multiple_rejects_too_small_buffer() {
+        // Need 9 + 2*3 = 15 bytes, give 10.
+        let mut buf = [0u8; 10];
+        assert!(matches!(
+            build_write_multiple_request(0x01, 0x0050, &[1, 2, 3], &mut buf),
+            Err(FrameError::BufferTooSmall {
+                needed: 15,
+                actual: 10
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_write_multiple_rejects_qty_mismatch() {
+        let mut frame = [0x01u8, 0x10, 0x00, 0x52, 0x00, 0x03, 0, 0];
+        let crc = crc16_modbus(&frame[..6]);
+        frame[6] = crc as u8;
+        frame[7] = (crc >> 8) as u8;
+        // Frame says qty=3 but caller expects 4.
+        assert!(matches!(
+            parse_write_multiple_response(&frame, 0x01, 0x0052, 4),
+            Err(ModbusError::BadHeader)
+        ));
+    }
+
+    #[test]
     fn build_write_multiple_rejects_oversize() {
         let mut buf = [0u8; 16];
-        assert!(
-            build_write_multiple_request(0x01, 0x0050, &[0; 14], &mut buf).is_err()
-        );
+        assert!(build_write_multiple_request(0x01, 0x0050, &[0; 14], &mut buf).is_err());
     }
 
     fn read_resp(slave: u8, values: &[u16]) -> std::vec::Vec<u8> {

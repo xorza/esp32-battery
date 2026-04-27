@@ -355,4 +355,3 @@ mod tests {
         assert_eq!(g.max_energy_wh(), 123.45);
     }
 }
-

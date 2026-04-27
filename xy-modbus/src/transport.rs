@@ -89,19 +89,9 @@ impl core::error::Error for RtuError {
 /// (`0x03` for reads, `0x06` for single setpoint writes, `0x10` for
 /// bulk memory-group writes).
 pub trait ModbusTransport {
-    fn read_holding(
-        &mut self,
-        slave: u8,
-        addr: u16,
-        dst: &mut [u16],
-    ) -> Result<(), RtuError>;
+    fn read_holding(&mut self, slave: u8, addr: u16, dst: &mut [u16]) -> Result<(), RtuError>;
 
-    fn write_single_holding(
-        &mut self,
-        slave: u8,
-        addr: u16,
-        value: u16,
-    ) -> Result<(), RtuError>;
+    fn write_single_holding(&mut self, slave: u8, addr: u16, value: u16) -> Result<(), RtuError>;
 
     fn write_multiple_holdings(
         &mut self,
