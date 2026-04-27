@@ -225,48 +225,53 @@ impl Phase {
 
 /// Why the supervisor latched the buck off. Once latched, only a reboot
 /// clears it — auto-recovery on a battery charger means trying again
-/// under the same conditions.
-#[derive(Copy, Clone, PartialEq, Eq, IntoStaticStr)]
+/// under the same conditions. `OutputUnexpectedlyOff` carries the
+/// device-reported protection cause when we managed to read it (`None`
+/// means the PROTECT register read itself failed).
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub enum FaultReason {
     /// No fresh battery reading for `BATTERY_MISSING_TIMEOUT.as_secs()` consecutive ticks.
     /// Without current/voltage we cannot supervise charging — fail closed.
-    #[strum(serialize = "battery sensor stale")]
     BatterySensorStale,
     /// Modbus reads to the XY7025 have been failing for `MODBUS_UNHEALTHY_TIMEOUT`
     /// continuously. We've lost closed-loop control over the buck; disable
     /// while we still can.
-    #[strum(serialize = "modbus link unhealthy")]
     ModbusUnhealthy,
     /// Pack voltage exceeded `absorb_v + OV_MARGIN_V` for `OV_DURATION.as_secs()` ticks.
     /// Catches drift below the XY's hardware OVP trip but above the profile target.
-    #[strum(serialize = "pack overvoltage")]
     Overvoltage,
     /// Absorb ran for `MAX_ABSORB.as_secs()` ticks. Under a parasitic load
     /// pinning current above `exit_absorb_a` we'd otherwise sit at CV
     /// forever.
-    #[strum(serialize = "absorb time cap reached")]
     AbsorbTimeout,
     /// XY7025 setpoint readback (V_SET or I_SET) disagreed with what we
     /// commanded. The buck is sourcing under unknown setpoints — disable
     /// before it can do damage. Triggers immediately, no debounce: the
     /// caller already verified the read itself succeeded, so this isn't
     /// a transport glitch.
-    #[strum(serialize = "setpoint readback drift")]
     SettingsDrift,
     /// Buck's OUTPUT_EN register read 0 while the supervisor was Active.
     /// The buck self-disabled — its own hardware OVP / OCP / LVP /
-    /// over-temp tripped, or someone toggled the front panel. Latch and
-    /// require a reboot rather than re-enabling under unknown
-    /// conditions.
-    #[strum(serialize = "buck self-disabled")]
-    OutputUnexpectedlyOff,
+    /// over-temp tripped, or someone toggled the front panel. Payload is
+    /// the cause from PROTECT (0x0010); `None` if that read failed.
+    OutputUnexpectedlyOff(Option<XyProtectionStatus>),
+}
+
+impl std::fmt::Display for FaultReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BatterySensorStale => f.write_str("battery sensor stale"),
+            Self::ModbusUnhealthy => f.write_str("modbus link unhealthy"),
+            Self::Overvoltage => f.write_str("pack overvoltage"),
+            Self::AbsorbTimeout => f.write_str("absorb time cap reached"),
+            Self::SettingsDrift => f.write_str("setpoint readback drift"),
+            Self::OutputUnexpectedlyOff(Some(s)) => write!(f, "buck self-disabled ({s})"),
+            Self::OutputUnexpectedlyOff(None) => f.write_str("buck self-disabled (cause unread)"),
+        }
+    }
 }
 
 impl FaultReason {
-    pub fn label(self) -> &'static str {
-        self.into()
-    }
-
     /// How long the world must look healthy before the caller may restart
     /// the supervise loop. `None` means reboot-only recovery; only
     /// `OutputUnexpectedlyOff` is currently recoverable since its common
@@ -274,10 +279,7 @@ impl FaultReason {
     /// clear without operator intervention. Hard safety faults (OV, drift,
     /// absorb timeout) stay reboot-only.
     pub fn recovery_healthy_for(self) -> Option<Duration> {
-        match self {
-            Self::OutputUnexpectedlyOff => Some(OUTPUT_RECOVERY_HEALTHY),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -531,7 +533,7 @@ impl ChargeSupervisor {
         // (hardware OVP/OCP/LVP, over-temp, panel toggle). Latch.
         // Pending doesn't check: output is supposed to be off there.
         if !pending && matches!(p.output_on, Some(false)) {
-            return self.latch(FaultReason::OutputUnexpectedlyOff);
+            return self.latch(FaultReason::OutputUnexpectedlyOff(p.protection_status));
         }
 
         if self

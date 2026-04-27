@@ -616,19 +616,16 @@ fn apply_action<D: XyDevice>(
                 recorder.record(Event::Xy(XyError::SetVoltage));
             }
         }
-        Action::DisableOutput(reason) => {
-            let label = reason.label();
-            match xy.set_output(false) {
-                Ok(()) => {
-                    error!("CHARGE FAULT ({label}): PS output DISABLED");
-                    supervisor.ack_disable();
-                }
-                Err(e) => {
-                    error!("CHARGE FAULT ({label}): set_output(false) failed: {e} — will retry");
-                    recorder.record(Event::Xy(XyError::SetOutput));
-                }
+        Action::DisableOutput(reason) => match xy.set_output(false) {
+            Ok(()) => {
+                error!("CHARGE FAULT ({reason}): PS output DISABLED");
+                supervisor.ack_disable();
             }
-        }
+            Err(e) => {
+                error!("CHARGE FAULT ({reason}): set_output(false) failed: {e} — will retry");
+                recorder.record(Event::Xy(XyError::SetOutput));
+            }
+        },
     }
 }
 

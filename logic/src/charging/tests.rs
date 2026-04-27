@@ -1023,7 +1023,7 @@ fn buck_self_disable_in_active_latches() {
         protection_status: None,
     };
     let a = s.tick(p, TICK);
-    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff));
+    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(None)));
 }
 
 /// Drive `s` from Active into Tripped(OutputUnexpectedlyOff, acked:true).
@@ -1038,7 +1038,7 @@ fn latch_self_disable(s: &mut ChargeSupervisor) {
         },
         TICK,
     );
-    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff));
+    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(None)));
     s.ack_disable();
 }
 
@@ -1066,7 +1066,7 @@ fn should_restart_after_healthy_window() {
         assert!(!s.should_restart(&p, TICK));
         // tick during recovery returns None — phase machine is gated off.
         assert!(matches!(s.tick(p, TICK), Action::None));
-        assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff)));
+        assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff(_))));
     }
     // The Nth healthy call crosses the threshold.
     assert!(s.should_restart(&p, TICK));
