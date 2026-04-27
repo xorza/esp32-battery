@@ -87,8 +87,8 @@ testing of the XY7025 (`src/xy.rs`):
 
 | Constraint              | Value             | Notes                                             |
 |-------------------------|-------------------|---------------------------------------------------|
-| Min inter-frame gap     | ~50 ms            | Tighter and the device drops back-to-back frames  |
-| Response timeout        | ~500 ms           | Worst case observed; 200 ms is unreliable         |
+| Min inter-frame gap     | ~50 ms            | Tighter and the device drops back-to-back frames; confirmed by `jens3382-xy6020l.h:149` |
+| Response timeout        | ~500 ms           | Worst case observed on XY7025; 200 ms is unreliable. Jens's XY6020L lib runs tighter (~40 ms, `jens3382-xy6020l.cpp:34, 364`) — XY7025 firmware appears to be the slower of the two |
 | Post-write quiet gap    | ~10 ms            | Required before a follow-up read of the same reg  |
 | Cold-boot UART ready    | ~1–2 s after Vin  | Slower without USB-CDC enumeration delay to mask  |
 
@@ -102,6 +102,23 @@ we see on the XY7025.
 All registers are 16-bit, big-endian on the wire (Modbus standard). The
 "Scale" column is the divisor to apply to the raw integer to get the
 physical value (so `1440` with scale `100` = `14.40 V`).
+
+> **Model-specific scales — important.** The scale columns below are for
+> XY6020L and XY7025. The SK family uses **higher-resolution scales** for
+> current and power (and adds extra registers — see §3.6). Per the csvke
+> SK120 register PDF (`docs-archive/csvke-XY-SK120-Modbus_Address.pdf`):
+>
+> | Register        | XY6020L / XY7025 scale | SK120 / SK60 / SK120X scale |
+> |-----------------|------------------------|-----------------------------|
+> | I-SET (`0x0001`) | 100 (10 mA)           | **1000 (1 mA)**             |
+> | IOUT (`0x0003`)  | 100                   | **1000**                    |
+> | POWER (`0x0004`) | 10  (100 mW)          | **100 (10 mW)**             |
+> | S-OCP (`0x0054`) | 100                   | **1000**                    |
+> | S-OPP (`0x0055`) | 1  (W)                | **10 (0.1 W)**              |
+>
+> Cross-check `MODEL` (`0x0016`) before assuming a scale: `0x6100`-class
+> firmware is XY6020L/XY7025 (this crate's target); SK-series firmware
+> reports a different model code.
 
 ### 3.1 Status & runtime control (`0x0000 – 0x001E`)
 
@@ -132,14 +149,31 @@ physical value (so `1440` with scale `100` = `14.40 V`).
 | `0x0016` | MODEL       | Product number (e.g. `0x6100`)         | —     | —     | R   |
 | `0x0017` | VERSION     | Firmware version (e.g. `0x0071`)       | —     | —     | R   |
 | `0x0018` | SLAVE-ADD   | Modbus slave address; takes effect after device reset | — | — | R/W |
-| `0x0019` | BAUDRATE_L  | Baud-rate code (see §3.4)              | —     | —     | R/W |
+| `0x0019` | BAUDRATE_L  | Baud-rate code (see §3.6)              | —     | —     | R/W |
 | `0x001A` | T-IN-OFFSET | Internal-temp calibration offset       | 10    | °C/°F | R/W |
 | `0x001B` | T-EX-OFFSET | External-temp calibration offset       | 10    | °C/°F | R/W |
 | `0x001C` | BUZZER      | Buzzer enable (often unimplemented)    | —     | —     | R/W |
 | `0x001D` | EXTRACT-M   | Recall memory group (write 0–9)        | —     | —     | R/W |
 | `0x001E` | DEVICE      | Device status — unreliable on some FW  | —     | —     | R/W |
 
-### 3.2 WiFi pairing (`0x0030 – 0x0034`)
+### 3.2 SK-family extras (`0x001F – 0x0023`)
+
+Documented in `docs-archive/csvke-XY-SK120-Modbus_Address.pdf` p.1 and
+exercised by `csvke-README.md:116-156`. **Not present** on XY6020L per
+the tinkering4fun PDF (which ends at `0x001E`). The XY7025 marketing
+material advertises both MPPT and constant-power modes, so these
+registers are likely present on XY7025 too — but unverified at the
+register level. Use with caution on non-SK hardware.
+
+| Addr     | Name      | Description                                        | R/W |
+|----------|-----------|----------------------------------------------------|-----|
+| `0x001F` | MPPT-SW   | MPPT (solar maximum-power-point tracking) enable    | R/W |
+| `0x0020` | MPPT-K    | MPPT max-power-point coefficient                    | R/W |
+| `0x0021` | BatFul    | Battery-full cutoff current                         | R/W |
+| `0x0022` | CW-SW     | Constant-power mode enable                          | R/W |
+| `0x0023` | CW        | Constant-power setpoint                             | R/W |
+
+### 3.3 WiFi pairing (`0x0030 – 0x0034`)
 
 Only populated when a SiniLink XY-WFPOW (ESP8285) WiFi board is attached.
 
@@ -151,7 +185,7 @@ Only populated when a SiniLink XY-WFPOW (ESP8285) WiFi board is attached.
 | `0x0033` | IPV4-H      | High 16 bits of IPv4 (e.g. `0xC0A8` = 192.168)       |
 | `0x0034` | IPV4-L      | Low 16 bits of IPv4 (e.g. `0x0108` = .1.8)           |
 
-### 3.3 Active parameter set M0 (`0x0050 – 0x005D`)
+### 3.4 Active parameter set M0 (`0x0050 – 0x005D`)
 
 Memory group M0 is the **live operating set**. Writing here takes effect
 immediately. Registers `0x0050`/`0x0051` are aliases of `0x0000`/`0x0001`
@@ -173,12 +207,22 @@ and the power-on-output behavior.
 | `0x0059` | S-OAH_H | Max output charge, high 16 bits                   | —     | Ah   | R/W |
 | `0x005A` | S-OWH_L | Max output energy, low 16 bits (10 mWh units)     | 100   | Wh   | R/W |
 | `0x005B` | S-OWH_H | Max output energy, high 16 bits (10 mWh units)    | —     | Wh   | R/W |
-| `0x005C` | S-OTP   | Over-temperature protection                       | 10    | °C/°F | R/W |
+| `0x005C` | S-OTP   | Over-temperature protection (see scale note below) | 10    | °C/°F | R/W |
 | `0x005D` | S-INI   | Power-on output state (0=off, 1=on, persists in EEPROM) | — | — | R/W |
 
-### 3.4 Memory groups M0–M9 (`0x0050 + N × 0x0010`)
+> **S-OTP scale ambiguity.** The tinkering4fun PDF (p.5) lists S-OTP at
+> scale 10 (0.1 °C resolution). The csvke SK120 register PDF (p.2) lists
+> it at scale 1 (whole degrees), and Jens Gleissberg's example in
+> `jens3382-README.md:182` writes raw `110` for what reads like 110 °C —
+> consistent with scale 1. This may be a model divergence (XY6020L /10
+> vs SK family /1) or a documentation inconsistency. Verify on your
+> hardware before relying on the absolute threshold; round-trip
+> (read → write → read) survives either interpretation.
 
-The device stores 10 preset groups, each 14 registers wide:
+### 3.5 Memory groups M0–M9 (`0x0050 + N × 0x0010`)
+
+The device stores 10 preset groups, each 14 registers wide on
+XY6020L/XY7025:
 
 ```
 M_N base address = 0x0050 + (N × 0x0010)
@@ -197,9 +241,15 @@ M_N base address = 0x0050 + (N × 0x0010)
 | M8    | `0x00D0` | General preset                              |
 | M9    | `0x00E0` | General preset                              |
 
-Inside each group the layout matches §3.3 (V-SET, I-SET, S-LVP, S-OVP,
+Inside each group the layout matches §3.4 (V-SET, I-SET, S-LVP, S-OVP,
 S-OCP, S-OPP, S-OHP_H, S-OHP_M, S-OAH_L, S-OAH_H, S-OWH_L, S-OWH_H,
 S-OTP, S-INI — 14 registers).
+
+> **SK family is 15 registers wide.** The csvke SK120 register PDF (p.2)
+> adds an extra `S-ETP` (external over-temperature protection) at offset
+> `+14` (`0x005E` on M0). On SK120/SK60/SK120X, plan for 15-register
+> groups and a stride that still places M1 at `0x0060`. This crate
+> targets XY6020L/XY7025 and uses the 14-register layout.
 
 **Recall semantics.** Writing `1`–`9` to `EXTRACT-M` (`0x001D`) copies
 that group's contents into M0; the change takes effect immediately.
@@ -209,27 +259,31 @@ Writing `0` is a no-op — M0 is already current.
 **not** change the live operating parameters until that preset is
 recalled.
 
-### 3.5 Baud-rate codes (`0x0019` BAUDRATE_L)
+### 3.6 Baud-rate codes (`0x0019` BAUDRATE_L)
 
-The Arduino lib documents `6 == 115200`. The seller manual does not list
-the full mapping. Confirmed and inferred values:
+The seller manual documents `6 == 115200` only. No primary source in
+this archive maps the other codes — Jens Gleissberg's library
+(`jens3382-xy6020l.h:230-232`) explicitly notes "no read option …
+@todo: provide enum", and the csvke files contain no baud-code
+mapping either. The mapping below is **community speculation** and was
+removed from the rewritten upstream sources; included here only because
+some forks repeat it:
 
-| Code | Baud   |
-|------|--------|
+| Code | Claimed baud (unverified) |
+|------|---------------------------|
 | 0    | 9600   |
 | 1    | 14400  |
 | 2    | 19200  |
 | 3    | 38400  |
 | 4    | 56000  |
 | 5    | 57600  |
-| 6    | 115200 |
+| 6    | 115200 *(documented)* |
 | 7    | 2400   |
 | 8    | 4800   |
 
-Only `6 == 115200` is documented in the seller manual; codes 0–5 and 7–8
-come from the csvke XY-SK120 library and are community-derived. Treat the
-table as best-effort — verify against your unit before committing a write.
-Baud changes take effect after device reset.
+Treat anything other than `6` as unverified — read it back, observe the
+device after a reset, or stick to the factory default. Baud changes take
+effect after the device power-cycles.
 
 ---
 
@@ -260,6 +314,9 @@ blinks, and the LCD shows the trip code. Writing `0` to `PROTECT`
 **OVP-on-V-SET-write quirk.** If you write a `V-SET` higher than the
 current `S-OVP`, the device latches OVP immediately, even if the output
 is off. Always program `S-OVP` (`0x0053`) before raising `V-SET`.
+Documented in the original seller manual (`docs-archive/tinkering4fun-XY6020L-Modbus-Interface.pdf`
+p.6, Note 3): "OVP is triggered when a programming request for a
+higher voltage is made (e.g. write to register V-SET 0000H)".
 
 ---
 
