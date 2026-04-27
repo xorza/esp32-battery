@@ -55,7 +55,9 @@ fn check_crc(resp: &[u8], expected_len: usize) -> Result<(), ModbusError> {
     }
 }
 
-pub fn parse_read_response(resp: &[u8], slave: u8, count: u16) -> Result<Vec<u16>, ModbusError> {
+/// Parse a `Read Holding Registers` response into the caller-supplied
+/// register slice. `out.len()` is the expected register count.
+pub fn parse_read_response(resp: &[u8], slave: u8, out: &mut [u16]) -> Result<(), ModbusError> {
     if resp.len() < 5 {
         return Err(ModbusError::ShortResponse(resp.len()));
     }
@@ -67,17 +69,19 @@ pub fn parse_read_response(resp: &[u8], slave: u8, count: u16) -> Result<Vec<u16
         check_crc(resp, 5)?;
         return Err(ModbusError::Exception(resp[2]));
     }
-    let expected_len = 5 + 2 * count as usize;
-    if resp[1] != FN_READ_HOLDING || resp[2] as usize != 2 * count as usize {
+    let count = out.len();
+    let expected_len = 5 + 2 * count;
+    if resp[1] != FN_READ_HOLDING || resp[2] as usize != 2 * count {
         return Err(ModbusError::BadHeader);
     }
     if resp.len() < expected_len {
         return Err(ModbusError::ShortResponse(resp.len()));
     }
     check_crc(resp, expected_len)?;
-    Ok((0..count as usize)
-        .map(|i| u16::from_be_bytes([resp[3 + 2 * i], resp[4 + 2 * i]]))
-        .collect())
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u16::from_be_bytes([resp[3 + 2 * i], resp[4 + 2 * i]]);
+    }
+    Ok(())
 }
 
 pub fn parse_write_response(resp: &[u8], req: &[u8; 8]) -> Result<(), ModbusError> {
@@ -225,26 +229,25 @@ mod tests {
     #[test]
     fn parse_read_valid_single_reg() {
         let frame = read_resp(0x01, &[0x1234]);
-        let Ok(out) = parse_read_response(&frame, 0x01, 1) else {
-            panic!("expected Ok");
-        };
-        assert_eq!(out, vec![0x1234]);
+        let mut out = [0u16; 1];
+        assert!(parse_read_response(&frame, 0x01, &mut out).is_ok());
+        assert_eq!(out, [0x1234]);
     }
 
     #[test]
     fn parse_read_valid_six_regs() {
         let frame = read_resp(0x01, &[1360, 1000, 1350, 0, 0, 4800]);
-        let Ok(out) = parse_read_response(&frame, 0x01, 6) else {
-            panic!("expected Ok");
-        };
-        assert_eq!(out, vec![1360, 1000, 1350, 0, 0, 4800]);
+        let mut out = [0u16; 6];
+        assert!(parse_read_response(&frame, 0x01, &mut out).is_ok());
+        assert_eq!(out, [1360, 1000, 1350, 0, 0, 4800]);
     }
 
     #[test]
     fn parse_read_rejects_wrong_slave() {
         let frame = read_resp(0x02, &[0x1234]);
+        let mut out = [0u16; 1];
         assert!(matches!(
-            parse_read_response(&frame, 0x01, 1),
+            parse_read_response(&frame, 0x01, &mut out),
             Err(ModbusError::BadSlave(0x02))
         ));
     }
@@ -254,8 +257,9 @@ mod tests {
         let mut frame = read_resp(0x01, &[0x1234]);
         let last = frame.len() - 1;
         frame[last] ^= 0xFF;
+        let mut out = [0u16; 1];
         assert!(matches!(
-            parse_read_response(&frame, 0x01, 1),
+            parse_read_response(&frame, 0x01, &mut out),
             Err(ModbusError::BadCrc)
         ));
     }
@@ -263,8 +267,9 @@ mod tests {
     #[test]
     fn parse_read_rejects_short() {
         let frame = [0x01, 0x03, 0x02, 0x00];
+        let mut out = [0u16; 1];
         assert!(matches!(
-            parse_read_response(&frame, 0x01, 1),
+            parse_read_response(&frame, 0x01, &mut out),
             Err(ModbusError::ShortResponse(4))
         ));
     }
@@ -273,8 +278,9 @@ mod tests {
     fn parse_read_rejects_truncated_payload() {
         // Header claims 2 payload bytes; frame cut before CRC (5 bytes, need 7).
         let frame = [0x01, 0x03, 0x02, 0x12, 0x34];
+        let mut out = [0u16; 1];
         assert!(matches!(
-            parse_read_response(&frame, 0x01, 1),
+            parse_read_response(&frame, 0x01, &mut out),
             Err(ModbusError::ShortResponse(5))
         ));
     }
@@ -285,8 +291,9 @@ mod tests {
         let crc = crc16_modbus(&frame);
         frame.push(crc as u8);
         frame.push((crc >> 8) as u8);
+        let mut out = [0u16; 1];
         assert!(matches!(
-            parse_read_response(&frame, 0x01, 1),
+            parse_read_response(&frame, 0x01, &mut out),
             Err(ModbusError::BadHeader)
         ));
     }
@@ -295,8 +302,9 @@ mod tests {
     fn parse_read_rejects_wrong_byte_count() {
         // Frame reports 1 register but caller expects 2.
         let frame = read_resp(0x01, &[0x1234]);
+        let mut out = [0u16; 2];
         assert!(matches!(
-            parse_read_response(&frame, 0x01, 2),
+            parse_read_response(&frame, 0x01, &mut out),
             Err(ModbusError::BadHeader)
         ));
     }
@@ -307,8 +315,9 @@ mod tests {
         let crc = crc16_modbus(&frame);
         frame.push(crc as u8);
         frame.push((crc >> 8) as u8);
+        let mut out = [0u16; 1];
         assert!(matches!(
-            parse_read_response(&frame, 0x01, 1),
+            parse_read_response(&frame, 0x01, &mut out),
             Err(ModbusError::Exception(0x02))
         ));
     }
@@ -317,8 +326,9 @@ mod tests {
     fn parse_read_exception_with_bad_crc_is_bad_crc() {
         // Exception flag set, CRC is garbage — must NOT surface as Exception.
         let frame = [0x01u8, 0x83, 0x02, 0x00, 0x00];
+        let mut out = [0u16; 1];
         assert!(matches!(
-            parse_read_response(&frame, 0x01, 1),
+            parse_read_response(&frame, 0x01, &mut out),
             Err(ModbusError::BadCrc)
         ));
     }

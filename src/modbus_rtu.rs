@@ -33,11 +33,13 @@ impl<'d> ModbusRtu<'d> {
         Self { uart, config }
     }
 
-    pub fn read_holding(&self, slave: u8, addr: u16, count: u16) -> Result<Vec<u16>, RtuError> {
-        let req = build_read_request(slave, addr, count);
+    /// Read `out.len()` consecutive holding registers into `out`.
+    pub fn read_holding(&self, slave: u8, addr: u16, out: &mut [u16]) -> Result<(), RtuError> {
+        let req = build_read_request(slave, addr, out.len() as u16);
         let mut resp = [0u8; 256];
         let n = self.transact(&req, &mut resp)?;
-        Ok(parse_read_response(&resp[..n], slave, count)?)
+        parse_read_response(&resp[..n], slave, out)?;
+        Ok(())
     }
 
     pub fn write_holding(&self, slave: u8, addr: u16, value: u16) -> Result<(), RtuError> {

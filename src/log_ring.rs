@@ -48,17 +48,8 @@ pub fn init() {
     );
 }
 
-/// Copy the current ring contents into a fresh Vec (oldest byte first).
-pub fn snapshot() -> Vec<u8> {
-    RING.lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(Ring::snapshot))
-        .unwrap_or_default()
-}
-
 pub fn mount(server: &mut EspHttpServer<'static>) {
     crate::http::mount_get(server, "/api/log", |req| {
-        let body = snapshot();
         let mut resp = req
             .into_response(
                 200,
@@ -70,7 +61,16 @@ pub fn mount(server: &mut EspHttpServer<'static>) {
                 ],
             )
             .map_err(|e| e.0)?;
-        resp.write_all(&body).map_err(|e| e.0)?;
+        // Stream the ring directly to the response — no Vec materialization.
+        // Lock is held for the duration of the writes so the ring can't
+        // wrap mid-stream and reorder bytes; logging tasks meanwhile use
+        // `try_lock` and drop their line if they collide.
+        let guard = RING.lock().unwrap();
+        if let Some(ring) = guard.as_ref() {
+            let (older, newer) = ring.slices();
+            resp.write_all(older).map_err(|e| e.0)?;
+            resp.write_all(newer).map_err(|e| e.0)?;
+        }
         Ok::<(), EspError>(())
     });
 }

@@ -192,7 +192,8 @@ mod real {
 
     impl XyDevice for Xy<'_> {
         fn read_status(&self) -> Result<XyStatus, RtuError> {
-            let r = self.modbus.read_holding(SLAVE, 0x0000, 6)?;
+            let mut r = [0u16; 6];
+            self.modbus.read_holding(SLAVE, 0x0000, &mut r)?;
             Ok(XyStatus {
                 v_set: r[0] as f32 / 100.0,
                 i_set: r[1] as f32 / 100.0,
@@ -205,7 +206,8 @@ mod real {
 
         fn read_protection(&self) -> Result<SafetyLimits, RtuError> {
             // 0x0052 LVP, 0x0053 OVP, 0x0054 OCP — contiguous, one read.
-            let r = self.modbus.read_holding(SLAVE, REG_S_LVP, 3)?;
+            let mut r = [0u16; 3];
+            self.modbus.read_holding(SLAVE, REG_S_LVP, &mut r)?;
             Ok(SafetyLimits {
                 lvp_v: r[0] as f32 / 100.0,
                 ovp_v: r[1] as f32 / 100.0,
@@ -214,12 +216,14 @@ mod real {
         }
 
         fn read_protection_status(&self) -> Result<XyProtectionStatus, RtuError> {
-            let r = self.modbus.read_holding(SLAVE, REG_PROTECT, 1)?;
+            let mut r = [0u16; 1];
+            self.modbus.read_holding(SLAVE, REG_PROTECT, &mut r)?;
             Ok(XyProtectionStatus::from_register(r[0]))
         }
 
         fn read_output_on(&self) -> Result<bool, RtuError> {
-            let r = self.modbus.read_holding(SLAVE, REG_OUTPUT_EN, 1)?;
+            let mut r = [0u16; 1];
+            self.modbus.read_holding(SLAVE, REG_OUTPUT_EN, &mut r)?;
             Ok(r[0] != 0)
         }
 

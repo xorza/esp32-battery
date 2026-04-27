@@ -256,11 +256,8 @@ where
 /// scratch buffer. `build` runs inside the buffer-mutex critical section,
 /// so it can hold the data lock across `to_slice` without leaking it into
 /// the network write.
-pub(crate) fn mount_json_get<F, E>(
-    server: &mut EspHttpServer<'static>,
-    uri: &'static str,
-    build: F,
-) where
+pub(crate) fn mount_json_get<F, E>(server: &mut EspHttpServer<'static>, uri: &'static str, build: F)
+where
     F: Fn(&mut [u8]) -> Result<usize, E> + Send + 'static,
     E: core::fmt::Debug,
 {

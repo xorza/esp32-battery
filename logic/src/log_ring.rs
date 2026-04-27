@@ -52,14 +52,15 @@ impl Ring {
         }
     }
 
-    pub fn snapshot(&self) -> Vec<u8> {
+    /// Borrow the ring contents as up to two contiguous slices in
+    /// chronological order: the older half (post-head) followed by the
+    /// newer half (pre-head). Either slice may be empty. Avoids the
+    /// allocation a `Vec`-returning snapshot would do.
+    pub fn slices(&self) -> (&[u8], &[u8]) {
         if self.wrapped {
-            let mut out = Vec::with_capacity(self.data.len());
-            out.extend_from_slice(&self.data[self.head..]);
-            out.extend_from_slice(&self.data[..self.head]);
-            out
+            (&self.data[self.head..], &self.data[..self.head])
         } else {
-            self.data[..self.head].to_vec()
+            (&self.data[..self.head], &[])
         }
     }
 }
@@ -68,10 +69,15 @@ impl Ring {
 mod tests {
     use super::*;
 
+    fn collect(r: &Ring) -> Vec<u8> {
+        let (a, b) = r.slices();
+        [a, b].concat()
+    }
+
     #[test]
     fn fresh_ring_snapshot_is_empty() {
         let r = Ring::new(16);
-        assert_eq!(r.snapshot(), Vec::<u8>::new());
+        assert_eq!(collect(&r), Vec::<u8>::new());
     }
 
     #[test]
@@ -79,7 +85,7 @@ mod tests {
         let mut r = Ring::new(16);
         r.write(b"hello");
         r.write(b" world");
-        assert_eq!(r.snapshot(), b"hello world");
+        assert_eq!(collect(&r), b"hello world");
     }
 
     #[test]
@@ -87,10 +93,10 @@ mod tests {
         let mut r = Ring::new(8);
         r.write(b"abcdefgh");
         // After exact fill, head=0 and wrapped=true.
-        assert_eq!(r.snapshot(), b"abcdefgh");
+        assert_eq!(collect(&r), b"abcdefgh");
         // Next byte goes to position 0; snapshot becomes "bcdefghX"
         r.write(b"X");
-        assert_eq!(r.snapshot(), b"bcdefghX");
+        assert_eq!(collect(&r), b"bcdefghX");
     }
 
     #[test]
@@ -101,7 +107,7 @@ mod tests {
         r.write(b"ABCDEF");
         // 6 used + 6 written = 12, capacity 8 — wrap. Keeps last 8 bytes:
         // "56ABCDEF" expected (we lose "1234").
-        assert_eq!(r.snapshot(), b"56ABCDEF");
+        assert_eq!(collect(&r), b"56ABCDEF");
     }
 
     #[test]
@@ -110,7 +116,7 @@ mod tests {
         r.write(b"earlier");
         // 20-byte input into 8-byte ring: keep last 8.
         r.write(b"AAAAAAAAAAAAXXYYZZWQ");
-        assert_eq!(r.snapshot(), b"XXYYZZWQ");
+        assert_eq!(collect(&r), b"XXYYZZWQ");
     }
 
     #[test]
@@ -120,7 +126,7 @@ mod tests {
             r.write(&[b]);
         }
         // Last 4 bytes of input are "efgh"; chronological order preserved.
-        assert_eq!(r.snapshot(), b"efgh");
+        assert_eq!(collect(&r), b"efgh");
     }
 
     #[test]
@@ -129,9 +135,9 @@ mod tests {
         r.write(b"abcd");
         // tail=4, write exactly tail bytes — head wraps to 0, wrapped=true.
         r.write(b"efgh");
-        assert_eq!(r.snapshot(), b"abcdefgh");
+        assert_eq!(collect(&r), b"abcdefgh");
         r.write(b"i");
-        assert_eq!(r.snapshot(), b"bcdefghi");
+        assert_eq!(collect(&r), b"bcdefghi");
     }
 
     #[test]

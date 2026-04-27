@@ -67,17 +67,13 @@ struct ErrorsResponse<'a> {
 }
 
 pub fn mount(server: &mut EspHttpServer<'static>, event_log: Arc<Mutex<EventLog>>) {
-    mount_json_get(
-        server,
-        "/api/errors",
-        move |buf| {
-            let log = event_log.lock().unwrap();
-            let response = ErrorsResponse {
-                ina_counts: InaCountsView(&log),
-                xy_counts: XyCountsView(&log),
-                recent: RecentView(&log),
-            };
-            serde_json_core::to_slice(&response, buf)
-        },
-    );
+    mount_json_get(server, "/api/errors", move |buf| {
+        let log = event_log.lock().unwrap();
+        let response = ErrorsResponse {
+            ina_counts: InaCountsView(&log),
+            xy_counts: XyCountsView(&log),
+            recent: RecentView(&log),
+        };
+        serde_json_core::to_slice(&response, buf)
+    });
 }

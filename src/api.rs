@@ -85,41 +85,37 @@ pub struct ApiResponse<'a> {
 }
 
 pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorData>>) {
-    mount_json_get(
-        server,
-        "/api",
-        move |buf| {
-            // Sensor-data lock held only through serialization — history
-            // is borrowed, not cloned. Lock drops at closure end, before
-            // the network write.
-            let store = sensor_data.lock().unwrap();
-            let bat = store.battery_reading().unwrap_or_default();
-            let ps = store.ps_reading().unwrap_or_default();
-            let response = ApiResponse {
-                uptime: uptime().as_secs() as u32,
-                rssi: sta_rssi(),
-                voltage: bat.voltage,
-                power_online: store.power_online(),
-                heap: HeapInfo::new(),
-                battery: BatteryReading {
-                    soc: battery::ocv_soc(bat.voltage),
-                    current: bat.current,
-                    power: bat.power,
-                },
-                ps: PsReading {
-                    voltage: ps.voltage,
-                    current: ps.current,
-                    power: ps.power,
-                },
-                history: HistoryView(store.history()),
-            };
-            let history_len = response.history.0.len();
-            let cap = buf.len();
-            let result = serde_json_core::to_slice(&response, buf);
-            if let Ok(len) = result {
-                debug!("API: history={} json={}/{}", history_len, len, cap);
-            }
-            result
-        },
-    );
+    mount_json_get(server, "/api", move |buf| {
+        // Sensor-data lock held only through serialization — history
+        // is borrowed, not cloned. Lock drops at closure end, before
+        // the network write.
+        let store = sensor_data.lock().unwrap();
+        let bat = store.battery_reading().unwrap_or_default();
+        let ps = store.ps_reading().unwrap_or_default();
+        let response = ApiResponse {
+            uptime: uptime().as_secs() as u32,
+            rssi: sta_rssi(),
+            voltage: bat.voltage,
+            power_online: store.power_online(),
+            heap: HeapInfo::new(),
+            battery: BatteryReading {
+                soc: battery::ocv_soc(bat.voltage),
+                current: bat.current,
+                power: bat.power,
+            },
+            ps: PsReading {
+                voltage: ps.voltage,
+                current: ps.current,
+                power: ps.power,
+            },
+            history: HistoryView(store.history()),
+        };
+        let history_len = response.history.0.len();
+        let cap = buf.len();
+        let result = serde_json_core::to_slice(&response, buf);
+        if let Ok(len) = result {
+            debug!("API: history={} json={}/{}", history_len, len, cap);
+        }
+        result
+    });
 }
