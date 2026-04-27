@@ -46,17 +46,17 @@ const SAFETY: LogicSafetyLimits = PACK_PROFILE.safety_limits();
 /// get an in-memory canned device. The thread loop is identical.
 #[allow(dead_code)] // protection-status methods wired in once the supervisor gates recovery on them
 trait XyDevice {
-    fn read_status(&self) -> Result<Status, RtuError>;
-    fn read_protection(&self) -> Result<LogicSafetyLimits, RtuError>;
-    fn read_protection_status(&self) -> Result<XyProtectionStatus, RtuError>;
-    fn read_output_on(&self) -> Result<bool, RtuError>;
-    fn set_voltage(&self, volts: f32) -> Result<(), RtuError>;
-    fn set_current_limit(&self, amps: f32) -> Result<(), RtuError>;
-    fn set_protection(&self, limits: LogicSafetyLimits) -> Result<(), RtuError>;
+    fn read_status(&mut self) -> Result<Status, RtuError>;
+    fn read_protection(&mut self) -> Result<LogicSafetyLimits, RtuError>;
+    fn read_protection_status(&mut self) -> Result<XyProtectionStatus, RtuError>;
+    fn read_output_on(&mut self) -> Result<bool, RtuError>;
+    fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError>;
+    fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError>;
+    fn set_protection(&mut self, limits: LogicSafetyLimits) -> Result<(), RtuError>;
     /// Write 0 to PROTECT (0x0010) to clear a latched protection cause.
-    fn clear_protection_status(&self) -> Result<(), RtuError>;
-    fn set_output(&self, on: bool) -> Result<(), RtuError>;
-    fn set_power_on_default_off(&self) -> Result<(), RtuError>;
+    fn clear_protection_status(&mut self) -> Result<(), RtuError>;
+    fn set_output(&mut self, on: bool) -> Result<(), RtuError>;
+    fn set_power_on_default_off(&mut self) -> Result<(), RtuError>;
 }
 
 /// Boot-time failure: either the Modbus transport gave up, or a register
@@ -105,8 +105,6 @@ impl std::fmt::Display for BootError {
 
 #[cfg(not(feature = "xy-fake"))]
 mod real {
-    use std::cell::RefCell;
-
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
@@ -151,12 +149,7 @@ mod real {
 
     const BAUD: u32 = 115200;
 
-    pub struct Xy<'d> {
-        // RefCell because xy_modbus::Xy needs &mut on every call but the
-        // supervisor loop hands the device around as &self. Single-threaded
-        // FreeRTOS task — no contention.
-        inner: RefCell<xy_modbus::Xy<EspIdfTransport<'d>>>,
-    }
+    pub struct Xy<'d>(xy_modbus::Xy<EspIdfTransport<'d>>);
 
     impl Xy<'_> {
         pub fn new(pins: XyPins) -> Self {
@@ -172,60 +165,49 @@ mod real {
             .expect("UART1 init");
             // Default XY-series timing baked in by `from_esp_uart`:
             // 500 ms response window, 50 ms inter-frame gap.
-            let inner = xy_modbus::Xy::from_esp_uart(uart, Model::Xy7025);
-            Self {
-                inner: RefCell::new(inner),
-            }
+            Self(xy_modbus::Xy::from_esp_uart(uart, Model::Xy7025))
         }
     }
 
     impl XyDevice for Xy<'_> {
-        fn read_status(&self) -> Result<Status, RtuError> {
-            self.inner.borrow_mut().read_status()
+        fn read_status(&mut self) -> Result<Status, RtuError> {
+            self.0.read_status()
         }
 
-        fn read_protection(&self) -> Result<LogicSafetyLimits, RtuError> {
-            self.inner
-                .borrow_mut()
-                .read_protection()
-                .map(to_logic_safety)
+        fn read_protection(&mut self) -> Result<LogicSafetyLimits, RtuError> {
+            self.0.read_protection().map(to_logic_safety)
         }
 
-        fn read_protection_status(&self) -> Result<XyProtectionStatus, RtuError> {
-            self.inner
-                .borrow_mut()
-                .read_protection_status()
-                .map(to_logic_protection)
+        fn read_protection_status(&mut self) -> Result<XyProtectionStatus, RtuError> {
+            self.0.read_protection_status().map(to_logic_protection)
         }
 
-        fn read_output_on(&self) -> Result<bool, RtuError> {
-            self.inner.borrow_mut().read_output()
+        fn read_output_on(&mut self) -> Result<bool, RtuError> {
+            self.0.read_output()
         }
 
-        fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
-            self.inner.borrow_mut().set_voltage(volts)
+        fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
+            self.0.set_voltage(volts)
         }
 
-        fn set_current_limit(&self, amps: f32) -> Result<(), RtuError> {
-            self.inner.borrow_mut().set_current_limit(amps)
+        fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError> {
+            self.0.set_current_limit(amps)
         }
 
-        fn set_protection(&self, limits: LogicSafetyLimits) -> Result<(), RtuError> {
-            self.inner
-                .borrow_mut()
-                .set_protection(from_logic_safety(limits))
+        fn set_protection(&mut self, limits: LogicSafetyLimits) -> Result<(), RtuError> {
+            self.0.set_protection(from_logic_safety(limits))
         }
 
-        fn clear_protection_status(&self) -> Result<(), RtuError> {
-            self.inner.borrow_mut().clear_protection_status()
+        fn clear_protection_status(&mut self) -> Result<(), RtuError> {
+            self.0.clear_protection_status()
         }
 
-        fn set_output(&self, on: bool) -> Result<(), RtuError> {
-            self.inner.borrow_mut().set_output(on)
+        fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
+            self.0.set_output(on)
         }
 
-        fn set_power_on_default_off(&self) -> Result<(), RtuError> {
-            self.inner.borrow_mut().set_power_on_output(false)
+        fn set_power_on_default_off(&mut self) -> Result<(), RtuError> {
+            self.0.set_power_on_output(false)
         }
     }
 }
@@ -234,8 +216,6 @@ mod real {
 
 #[cfg(feature = "xy-fake")]
 mod fake {
-    use std::cell::Cell;
-
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
@@ -250,11 +230,11 @@ mod fake {
     /// state set by the supervisor so reads reflect what the supervisor
     /// last commanded — exercises the same control flow as the real path.
     pub struct Xy<'d> {
-        v_set: Cell<f32>,
-        i_set: Cell<f32>,
-        protection: Cell<LogicSafetyLimits>,
-        protection_status: Cell<XyProtectionStatus>,
-        output_on: Cell<bool>,
+        v_set: f32,
+        i_set: f32,
+        protection: LogicSafetyLimits,
+        protection_status: XyProtectionStatus,
+        output_on: bool,
         // Real UART driver, constructed but never written to. Held so the
         // peripheral and its GPIOs are genuinely configured and claimed
         // for the program lifetime — pin/mux/baud conflicts surface on
@@ -275,66 +255,62 @@ mod fake {
             )
             .expect("UART1 init");
             Self {
-                v_set: Cell::new(13.5),
-                i_set: Cell::new(0.0),
-                protection: Cell::new(LogicSafetyLimits {
+                v_set: 13.5,
+                i_set: 0.0,
+                protection: LogicSafetyLimits {
                     ovp_v: 0.0,
                     ocp_a: 0.0,
                     lvp_v: 0.0,
-                }),
-                protection_status: Cell::new(XyProtectionStatus::Normal),
-                output_on: Cell::new(false),
+                },
+                protection_status: XyProtectionStatus::Normal,
+                output_on: false,
                 _uart: uart,
             }
         }
     }
 
     impl XyDevice for Xy<'_> {
-        fn read_status(&self) -> Result<Status, RtuError> {
-            let v = if self.output_on.get() {
-                self.v_set.get()
-            } else {
-                0.0
-            };
+        fn read_status(&mut self) -> Result<Status, RtuError> {
+            let v = if self.output_on { self.v_set } else { 0.0 };
             Ok(Status {
-                v_set: self.v_set.get(),
-                i_set: self.i_set.get(),
+                v_set: self.v_set,
+                i_set: self.i_set,
                 v_out: v,
                 i_out: 0.0,
                 p_out: 0.0,
                 v_in: 24.0,
             })
         }
-        fn read_protection(&self) -> Result<LogicSafetyLimits, RtuError> {
-            Ok(self.protection.get())
+        fn read_protection(&mut self) -> Result<LogicSafetyLimits, RtuError> {
+            Ok(self.protection)
         }
-        fn read_protection_status(&self) -> Result<XyProtectionStatus, RtuError> {
-            Ok(self.protection_status.get())
+        fn read_protection_status(&mut self) -> Result<XyProtectionStatus, RtuError> {
+            Ok(self.protection_status)
         }
-        fn read_output_on(&self) -> Result<bool, RtuError> {
-            Ok(self.output_on.get())
+        fn read_output_on(&mut self) -> Result<bool, RtuError> {
+            Ok(self.output_on)
         }
-        fn set_voltage(&self, volts: f32) -> Result<(), RtuError> {
-            self.v_set.set(volts);
+        fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
+            self.v_set = volts;
             Ok(())
         }
-        fn set_current_limit(&self, amps: f32) -> Result<(), RtuError> {
-            self.i_set.set(amps);
+        fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError> {
+            self.i_set = amps;
             Ok(())
         }
-        fn set_protection(&self, limits: LogicSafetyLimits) -> Result<(), RtuError> {
-            self.protection.set(limits);
+        fn set_protection(&mut self, limits: LogicSafetyLimits) -> Result<(), RtuError> {
+            self.protection = limits;
             Ok(())
         }
-        fn clear_protection_status(&self) -> Result<(), RtuError> {
-            self.protection_status.set(XyProtectionStatus::Normal);
+        fn clear_protection_status(&mut self) -> Result<(), RtuError> {
+            self.protection_status = XyProtectionStatus::Normal;
             Ok(())
         }
-        fn set_output(&self, on: bool) -> Result<(), RtuError> {
-            self.output_on.set(on);
+        fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
+            self.output_on = on;
             Ok(())
         }
-        fn set_power_on_default_off(&self) -> Result<(), RtuError> {
+        fn set_power_on_default_off(&mut self) -> Result<(), RtuError> {
             Ok(())
         }
     }
@@ -347,7 +323,7 @@ mod fake {
 /// is the supervisor's job, conditional on a fresh, drift-free, in-range
 /// first tick. Readback catches dropped writes, scale mismatches, and
 /// wrong-slave wiring before the supervisor can ask for output enable.
-fn boot_sequence<D: XyDevice>(xy: &D) -> Result<(), BootError> {
+fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<(), BootError> {
     xy.set_output(false)?;
     // Wipe any latched protection cause from a prior session — power
     // outages and unrelated crashes leave 0x0010 set, and we don't want
@@ -412,7 +388,7 @@ const _: () = assert!(task_wdt::WDT_TIMEOUT.as_secs() > POLL_INTERVAL.as_secs() 
 /// transient causes (XY7025 still powering up, UART state, ESP IDF
 /// driver wedged), and S_INI=OFF means the buck comes back disabled
 /// even if our set_output call below failed.
-fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
+fn boot_with_retries<D: XyDevice>(xy: &mut D, recorder: &EventRecorder) {
     for attempt in 0..BOOT_RETRY_COUNT {
         if attempt > 0 {
             thread::sleep(BOOT_RETRY_DELAY);
@@ -431,7 +407,7 @@ fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
 /// `RestartSupervisor` (caller tears down + re-runs `boot_sequence`).
 /// Panics propagate.
 fn supervise_loop<D: XyDevice>(
-    xy: &D,
+    xy: &mut D,
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
     supervisor: &mut ChargeSupervisor,
@@ -449,7 +425,7 @@ fn supervise_loop<D: XyDevice>(
     }
 }
 
-fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
+fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     // Subscribe once for the lifetime of this thread. Restarts of the
     // supervise loop (below) keep feeding the same WDT subscription.
     // The token is `!Send`, so it stays bound to this FreeRTOS task.
@@ -466,7 +442,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
                 charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
             );
         }
-        boot_with_retries(&xy, &recorder);
+        boot_with_retries(&mut xy, &recorder);
         let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
         // catch_unwind shields the recovery loop from panics in tick /
@@ -476,7 +452,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         // a graceful `set_output(false)` attempt before the hook reboots
         // — INA is a read-only sensor with no such obligation.
         let result = catch_unwind(AssertUnwindSafe(|| {
-            supervise_loop(&xy, &sensor_data, &recorder, &mut supervisor, &wdt)
+            supervise_loop(&mut xy, &sensor_data, &recorder, &mut supervisor, &wdt)
         }));
 
         if let Err(panic) = result {
@@ -491,7 +467,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
             // forever, which would otherwise hold the subscription
             // through the 2 s reboot grace and trip the deadman.
             drop(wdt);
-            shutdown_or_reboot(&xy, "post-panic", false, &recorder);
+            shutdown_or_reboot(&mut xy, "post-panic", false, &recorder);
             return;
         }
     }
@@ -501,7 +477,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
     );
     drop(wdt);
-    shutdown_or_reboot(&xy, "recovery-exhausted", false, &recorder);
+    shutdown_or_reboot(&mut xy, "recovery-exhausted", false, &recorder);
 }
 
 /// Best-effort `set_output(false)` then either exit (buck is OFF) or
@@ -510,7 +486,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
 /// sourcing with no supervisor and no WDT is the one thing we never want.
 /// S_INI=0 ensures the buck comes back OFF after the reboot.
 fn shutdown_or_reboot<D: XyDevice>(
-    xy: &D,
+    xy: &mut D,
     ctx: &'static str,
     force_reboot: bool,
     recorder: &EventRecorder,
@@ -543,7 +519,7 @@ fn shutdown_or_reboot<D: XyDevice>(
 /// want HTTP / LCD / INA blocked on that. The mutex is only acquired in
 /// short scopes around the actual writes/reads.
 fn poll<D: XyDevice>(
-    xy: &D,
+    xy: &mut D,
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
 ) -> PollResult {
@@ -565,7 +541,7 @@ fn poll<D: XyDevice>(
 }
 
 fn read_setpoints<D: XyDevice>(
-    xy: &D,
+    xy: &mut D,
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
 ) -> Option<LogicSetpoints> {
@@ -594,7 +570,7 @@ fn read_setpoints<D: XyDevice>(
 /// why — that was wiped during `boot_sequence`, so any non-Normal value
 /// here is from this session. While output is on PROTECT is necessarily
 /// Normal so we skip the round-trip.
-fn read_output<D: XyDevice>(xy: &D, recorder: &EventRecorder) -> Option<BuckOutput> {
+fn read_output<D: XyDevice>(xy: &mut D, recorder: &EventRecorder) -> Option<BuckOutput> {
     match xy.read_output_on() {
         Ok(true) => Some(BuckOutput::On),
         Ok(false) => {
@@ -621,7 +597,7 @@ fn read_output<D: XyDevice>(xy: &D, recorder: &EventRecorder) -> Option<BuckOutp
 }
 
 fn apply_action<D: XyDevice>(
-    xy: &D,
+    xy: &mut D,
     supervisor: &mut ChargeSupervisor,
     action: Action,
     recorder: &EventRecorder,
