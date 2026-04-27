@@ -474,18 +474,18 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         boot_with_retries(&xy, &recorder);
         let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
-        // Inner loop = supervise. Returns Ok(()) when tick_recovery
-        // signals ready (caller's cue to tear down + redo boot_sequence);
-        // panics propagate out as Err.
+        // Inner loop = supervise. Returns Ok(()) when tick emits
+        // RestartSupervisor (caller's cue to tear down + redo
+        // boot_sequence); panics propagate out as Err.
         let result = catch_unwind(AssertUnwindSafe(|| {
             loop {
                 task_wdt::reset();
                 let p = poll(&xy, &sensor_data, &recorder);
                 let action = supervisor.tick(p, POLL_INTERVAL);
-                apply_action(&xy, &mut supervisor, action, &recorder);
-                if supervisor.tick_recovery(&p, POLL_INTERVAL) {
+                if matches!(action, Action::RestartSupervisor) {
                     return;
                 }
+                apply_action(&xy, &mut supervisor, action, &recorder);
                 thread::sleep(POLL_INTERVAL);
             }
         }));
@@ -615,7 +615,8 @@ fn apply_action<D: XyDevice>(
     recorder: &EventRecorder,
 ) {
     match action {
-        Action::None => {}
+        // Filtered out by `run`'s inner loop before this is called.
+        Action::None | Action::RestartSupervisor => {}
         Action::EnableOutput => {
             info!("supervisor enabling output");
             match xy.set_output(true) {

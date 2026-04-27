@@ -345,7 +345,8 @@ impl FaultReason {
 /// `EnableOutput` and stays Pending until the caller `ack_enable`s. After
 /// that it transitions to active operation: phase machine + drift +
 /// fault paths. After a fault latches, only `DisableOutput` is ever
-/// emitted until the disable is ACKed.
+/// emitted until the disable is ACKed. Once acked, recoverable faults
+/// accumulate a healthy window and eventually emit `RestartSupervisor`.
 pub enum Action {
     None,
     /// Caller should write `set_output(true)`. V_SET is untouched —
@@ -360,6 +361,14 @@ pub enum Action {
     /// `SettingsDrift`.
     UpdateVoltage { target_v: f32 },
     DisableOutput(FaultReason),
+    /// Latched fault is recoverable, the world has looked healthy
+    /// (Modbus up, output off, finite battery below OV) for the
+    /// fault's `recovery_healthy_for` window. Caller should tear this
+    /// supervisor down, re-run `boot_sequence`, and construct a fresh
+    /// `ChargeSupervisor`. Re-emits each tick while the conditions
+    /// hold; the caller's per-boot restart budget is what stops a flap
+    /// loop, not the supervisor.
+    RestartSupervisor,
 }
 
 /// Latest fresh battery reading fed to the supervisor. Voltage is used for
@@ -377,10 +386,10 @@ pub struct BatterySample {
 ///   `EnableOutput` instead of running the phase machine.
 /// - `Active`: output is on, phase machine + drift + fault paths run.
 /// - `Tripped { acked: false }`: a fault latched; emit `DisableOutput`.
-/// - `Tripped { acked: true }`: caller successfully disabled; emit None.
-///   For recoverable faults the caller polls `tick_recovery` and, when
-///   it returns true, throws this supervisor away and restarts the
-///   supervise loop with a fresh `boot_sequence`.
+/// - `Tripped { acked: true }`: caller successfully disabled. For
+///   recoverable faults the supervisor accumulates a healthy-window
+///   timer and, once met, returns `Action::RestartSupervisor` from
+///   `tick`. Non-recoverable faults stay parked in `Action::None`.
 enum LatchState {
     Pending,
     Active,
@@ -610,7 +619,10 @@ impl ChargeSupervisor {
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
         let pending = match self.latch {
-            LatchState::Tripped { acked: true, .. } => return Action::None,
+            LatchState::Tripped {
+                reason,
+                acked: true,
+            } => return self.tick_recovery(reason, &p, elapsed),
             LatchState::Tripped {
                 reason,
                 acked: false,
@@ -733,28 +745,16 @@ impl ChargeSupervisor {
         Action::DisableOutput(reason)
     }
 
-    /// Returns `true` once the supervisor has observed a continuous
-    /// healthy window long enough to justify restarting the supervise
-    /// loop. The caller (which owns the buck driver and the per-boot
-    /// restart budget) is responsible for tearing this supervisor down,
-    /// re-running `boot_sequence`, and constructing a fresh supervisor.
-    /// Returns `false` for non-recoverable faults and for any state
-    /// other than `Tripped { acked: true }`.
-    ///
-    /// "Healthy" here: Modbus up, battery present and finite, pack below
-    /// the OV threshold, and the buck still reporting output OFF (any
-    /// spontaneous re-enable is unmodeled — reset the clock until we see
-    /// a clean stable state).
-    pub fn tick_recovery(&mut self, p: &PollResult, elapsed: Duration) -> bool {
-        let LatchState::Tripped {
-            reason,
-            acked: true,
-        } = self.latch
-        else {
-            return false;
-        };
+    /// Recovery path for `Tripped { acked: true }` — accumulates a
+    /// healthy window and emits `RestartSupervisor` once the fault's
+    /// `recovery_healthy_for` budget is met. Non-recoverable faults
+    /// stay parked in `Action::None`. "Healthy" here: Modbus up, battery
+    /// present and finite, pack below the OV threshold, and the buck
+    /// still reporting output OFF (any spontaneous re-enable is
+    /// unmodeled — reset the clock until we see a clean stable state).
+    fn tick_recovery(&mut self, reason: FaultReason, p: &PollResult, elapsed: Duration) -> Action {
         let Some(healthy_for) = reason.recovery_healthy_for() else {
-            return false;
+            return Action::None;
         };
         let battery_ok = p
             .battery
@@ -769,10 +769,14 @@ impl ChargeSupervisor {
             && battery_ok;
         if !healthy {
             self.recovery_elapsed = Duration::ZERO;
-            return false;
+            return Action::None;
         }
         self.recovery_elapsed = self.recovery_elapsed.saturating_add(elapsed);
-        self.recovery_elapsed >= healthy_for
+        if self.recovery_elapsed >= healthy_for {
+            Action::RestartSupervisor
+        } else {
+            Action::None
+        }
     }
 }
 
