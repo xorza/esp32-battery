@@ -83,6 +83,13 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 # HTTPS server support
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
 
+# mbedTLS memory tuning. We control response sizes, so the 16KB default TX
+# buffer is wasteful. IN must stay 16KB (TLS spec — no way to negotiate down,
+# and esp-idf #14444 leaks below 16KB). Server-side, we don't need to retain
+# the peer cert (we don't do client-cert auth).
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
+
 # Route esp_log output to the built-in USB-Serial/JTAG peripheral so logs
 # are visible on /dev/ttyACM0 without a separate UART-to-USB cable.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
