@@ -27,11 +27,13 @@ xy-fake = []
 
 [dependencies]
 esp32-battery-logic = { path = "logic" }
+xy-modbus = { path = "xy-modbus" }
 log = "*"
 esp-idf-svc = "*"
 esp-idf-hal = "*"
 ina228 = "*"
 embedded-hal = "*"
+embedded-io = "0.7"
 heapless = "*"
 hmac = "*"
 sha2 = { version = "*", default-features = false }

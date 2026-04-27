@@ -707,6 +707,7 @@ version = "0.1.0"
 dependencies = [
  "embedded-graphics",
  "embedded-hal 1.0.0",
+ "embedded-io 0.7.1",
  "embuild",
  "esp-idf-hal",
  "esp-idf-svc",
@@ -721,6 +722,7 @@ dependencies = [
  "serde-json-core",
  "sha2",
  "strum 0.28.0",
+ "xy-modbus",
 ]
 
 [[package]]
@@ -2147,6 +2149,14 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "xy-modbus"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-io 0.7.1",
 ]
 
 [[package]]
