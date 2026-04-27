@@ -21,8 +21,8 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    self, Action, BatterySample, ChargeSupervisor, Chemistry, PollResult, Profile, SafetyLimits,
-    Setpoints, XyProtectionStatus,
+    self, Action, BatterySample, BuckOutput, ChargeSupervisor, Chemistry, PollResult, Profile,
+    SafetyLimits, Setpoints, XyProtectionStatus,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
@@ -545,35 +545,33 @@ fn poll<D: XyDevice>(
     };
     // Read OUTPUT_EN separately — it's at 0x0012, not contiguous with the
     // main readback block. Lets the supervisor catch buck self-disable
-    // (hardware OVP/OCP/LVP, panel toggle) within one tick.
-    let output_on = match xy.read_output_on() {
-        Ok(on) => Some(on),
+    // (hardware OVP/OCP/LVP, panel toggle) within one tick. When the
+    // buck reports OFF, ask PROTECT (0x0010) why — that was wiped during
+    // boot_sequence, so any non-Normal value here is from this session.
+    // While output is on PROTECT is necessarily Normal so we skip the
+    // round-trip.
+    let output = match xy.read_output_on() {
+        Ok(true) => Some(BuckOutput::On),
+        Ok(false) => {
+            let cause = match xy.read_protection_status() {
+                Ok(status) => {
+                    if status != XyProtectionStatus::Normal {
+                        warn!("XY PROTECT latched: {status}");
+                    }
+                    Some(status)
+                }
+                Err(e) => {
+                    warn!("XY read_protection_status: {e}");
+                    None
+                }
+            };
+            Some(BuckOutput::Off { cause })
+        }
         Err(e) => {
             warn!("XY read_output_on: {e}");
             recorder.record(Event::Xy(XyError::ReadStatus));
             None
         }
-    };
-    // When the buck reports output OFF, ask why. PROTECT (0x0010) was
-    // wiped during boot_sequence, so any non-Normal value here is a
-    // protection trip from the current session — surfaced to the
-    // supervisor so it can gate `should_restart`. While output is on
-    // PROTECT is necessarily Normal so we save the round-trip.
-    let protection_status = if output_on == Some(false) {
-        match xy.read_protection_status() {
-            Ok(status) => {
-                if status != XyProtectionStatus::Normal {
-                    warn!("XY PROTECT latched: {status}");
-                }
-                Some(status)
-            }
-            Err(e) => {
-                warn!("XY read_protection_status: {e}");
-                None
-            }
-        }
-    } else {
-        None
     };
     let battery = sd.battery_reading().map(|b| BatterySample {
         voltage: b.voltage,
@@ -581,9 +579,8 @@ fn poll<D: XyDevice>(
     });
     PollResult {
         setpoints,
-        output_on,
+        output,
         battery,
-        protection_status,
     }
 }
 

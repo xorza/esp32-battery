@@ -30,11 +30,15 @@ fn matches_disable(a: &Action, expected: FaultReason) -> bool {
 /// common case. Phase transitions don't fire spurious `SettingsDrift`,
 /// and Active ticks don't fire spurious `OutputUnexpectedlyOff`.
 fn ok_tick(s: &mut ChargeSupervisor, battery: Option<BatterySample>, elapsed: Duration) -> Action {
+    let output = if s.expected_output_on() {
+        BuckOutput::On
+    } else {
+        BuckOutput::Off { cause: None }
+    };
     let p = PollResult {
         setpoints: Some(s.expected_setpoints()),
-        output_on: Some(s.expected_output_on()),
+        output: Some(output),
         battery,
-        protection_status: None,
     };
     s.tick(p, elapsed)
 }
@@ -49,9 +53,8 @@ fn fail_tick(
     s.tick(
         PollResult {
             setpoints: None,
-            output_on: None,
+            output: None,
             battery,
-            protection_status: None,
         },
         elapsed,
     )
@@ -866,9 +869,8 @@ fn setpoint_drift_v_set_latches_immediately() {
     let a = s.tick(
         PollResult {
             setpoints: bad,
-            output_on: Some(true),
+            output: Some(BuckOutput::On),
             battery: b(13.5, -0.1),
-            protection_status: None,
         },
         TICK,
     );
@@ -886,9 +888,8 @@ fn setpoint_drift_i_set_latches_immediately() {
     let a = s.tick(
         PollResult {
             setpoints: bad,
-            output_on: Some(true),
+            output: Some(BuckOutput::On),
             battery: b(13.5, -0.1),
-            protection_status: None,
         },
         TICK,
     );
@@ -906,9 +907,8 @@ fn setpoint_within_tolerance_no_drift_fault() {
     let a = s.tick(
         PollResult {
             setpoints: close,
-            output_on: Some(true),
+            output: Some(BuckOutput::On),
             battery: b(13.5, -0.1),
-            protection_status: None,
         },
         TICK,
     );
@@ -932,9 +932,8 @@ fn setpoint_drift_does_not_overwrite_existing_latch() {
     let a = s.tick(
         PollResult {
             setpoints: bad,
-            output_on: Some(true),
+            output: Some(BuckOutput::On),
             battery: b(13.5, -0.1),
-            protection_status: None,
         },
         TICK,
     );
@@ -982,9 +981,8 @@ fn pending_drift_latches_without_enabling() {
     let a = s.tick(
         PollResult {
             setpoints: bad,
-            output_on: Some(false),
+            output: Some(BuckOutput::Off { cause: None }),
             battery: b(OK_V, -0.1),
-            protection_status: None,
         },
         TICK,
     );
@@ -1018,9 +1016,8 @@ fn buck_self_disable_in_active_latches() {
     let mut s = active(lfp_4s());
     let p = PollResult {
         setpoints: Some(s.expected_setpoints()),
-        output_on: Some(false),
+        output: Some(BuckOutput::Off { cause: None }),
         battery: b(OK_V, -0.1),
-        protection_status: None,
     };
     let a = s.tick(p, TICK);
     assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(None)));
@@ -1032,9 +1029,8 @@ fn latch_self_disable(s: &mut ChargeSupervisor) {
     let a = s.tick(
         PollResult {
             setpoints: Some(s.expected_setpoints()),
-            output_on: Some(false),
+            output: Some(BuckOutput::Off { cause: None }),
             battery: b(OK_V, -0.1),
-            protection_status: None,
         },
         TICK,
     );
@@ -1047,13 +1043,13 @@ fn latch_self_disable(s: &mut ChargeSupervisor) {
 fn healthy_recovery_poll(s: &ChargeSupervisor) -> PollResult {
     PollResult {
         setpoints: Some(s.expected_setpoints()),
-        output_on: Some(false),
+        output: Some(BuckOutput::Off { cause: None }),
         battery: b(OK_V, -0.1),
-        protection_status: None,
     }
 }
 
 #[test]
+#[ignore = "auto-recovery temporarily disabled — recovery_healthy_for returns None"]
 fn should_restart_after_healthy_window() {
     // Active → buck self-disables → latch → ack. After
     // OUTPUT_RECOVERY_HEALTHY of continuously-healthy ticks, should_restart
@@ -1101,7 +1097,7 @@ fn should_restart_resets_on_modbus_down() {
     }
     let p_modbus_down = PollResult {
         setpoints: None,
-        output_on: None,
+        output: None,
         ..p
     };
     assert!(!s.should_restart(&p_modbus_down, TICK));
@@ -1132,7 +1128,7 @@ fn should_restart_resets_on_unexpected_output_on() {
         assert!(!s.should_restart(&p, TICK));
     }
     let p_on = PollResult {
-        output_on: Some(true),
+        output: Some(BuckOutput::On),
         ..p
     };
     assert!(!s.should_restart(&p_on, TICK));
@@ -1140,6 +1136,7 @@ fn should_restart_resets_on_unexpected_output_on() {
 }
 
 #[test]
+#[ignore = "auto-recovery temporarily disabled — recovery_healthy_for returns None"]
 fn should_restart_repeats_across_cycles() {
     // The supervisor itself doesn't cap recovery attempts — that lives in
     // the caller, which is what gets thrown away on each restart. A single
@@ -1193,9 +1190,8 @@ fn buck_output_off_in_pending_does_not_fault() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     let p = PollResult {
         setpoints: Some(s.expected_setpoints()),
-        output_on: Some(false),
+        output: Some(BuckOutput::Off { cause: None }),
         battery: b(OK_V, -0.1),
-        protection_status: None,
     };
     let a = s.tick(p, TICK);
     assert!(matches!(a, Action::EnableOutput));

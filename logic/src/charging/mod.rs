@@ -84,6 +84,7 @@ const SETPOINT_DRIFT_TOL: f32 = 0.02;
 /// transient causes (input LVP from AC sag, over-temp cooldown) to
 /// genuinely clear; short enough that operationally a brief input glitch
 /// doesn't require a manual reboot.
+#[allow(dead_code)] // re-wired once `recovery_healthy_for` returns a real value again
 const OUTPUT_RECOVERY_HEALTHY: Duration = Duration::from_secs(60);
 /// Total recoveries from `OutputUnexpectedlyOff` allowed since boot. After
 /// this many flap cycles, the caller stops restarting and leaves the buck
@@ -137,21 +138,30 @@ pub struct Setpoints {
 }
 
 /// One poll cycle's view of the world for the supervisor.
-/// `setpoints` and `output_on` come from the same Modbus read and fail
-/// together; `setpoints.is_some()` doubles as the modbus-healthy signal.
-/// `battery` is independent — it's the latest fresh INA228 reading.
-/// `protection_status` is read **only** when the buck reports output OFF
-/// (it's necessarily Normal while output is on); `None` means either
-/// output was on or the read itself failed.
+/// `setpoints` is from the V_SET/I_SET readback; `setpoints.is_some()`
+/// doubles as the modbus-healthy signal. `battery` is independent —
+/// it's the latest fresh INA228 reading.
 #[derive(Copy, Clone, Default)]
 pub struct PollResult {
     pub battery: Option<BatterySample>,
     pub setpoints: Option<Setpoints>,
-    /// Whether the buck's OUTPUT_EN register currently reads 1. `None`
-    /// only when the Modbus read failed (same condition as
-    /// `setpoints.is_none()`).
-    pub output_on: Option<bool>,
-    pub protection_status: Option<XyProtectionStatus>,
+    /// `None` means the OUTPUT_EN read itself failed.
+    pub output: Option<BuckOutput>,
+}
+
+/// What the buck's OUTPUT_EN register reported this poll, plus the
+/// PROTECT (0x0010) cause when output is off. The two were separate
+/// fields once but they covary: PROTECT is necessarily Normal while
+/// output is on, and is read only when output is off — so the relation
+/// belongs in the type.
+#[derive(Copy, Clone)]
+pub enum BuckOutput {
+    /// OUTPUT_EN reads 1.
+    On,
+    /// OUTPUT_EN reads 0. `cause` carries the PROTECT register value if
+    /// we managed to read it; `None` means the PROTECT read itself
+    /// failed.
+    Off { cause: Option<XyProtectionStatus> },
 }
 
 /// Latched protection cause read from XY register 0x0010 (PROTECT). Per
@@ -279,6 +289,11 @@ impl FaultReason {
     /// clear without operator intervention. Hard safety faults (OV, drift,
     /// absorb timeout) stay reboot-only.
     pub fn recovery_healthy_for(self) -> Option<Duration> {
+        // Auto-recovery temporarily disabled while we wire `should_restart`
+        // to gate on `OutputUnexpectedlyOff(Some(Normal))` — without that
+        // gate, restarting after an OCP/OTP trip would re-energize into a
+        // possibly-still-tripped condition. Re-enable per-fault here once
+        // the gate lands.
         None
     }
 }
@@ -532,8 +547,8 @@ impl ChargeSupervisor {
         // Active and the buck reports output OFF — it self-disabled
         // (hardware OVP/OCP/LVP, over-temp, panel toggle). Latch.
         // Pending doesn't check: output is supposed to be off there.
-        if !pending && matches!(p.output_on, Some(false)) {
-            return self.latch(FaultReason::OutputUnexpectedlyOff(p.protection_status));
+        if !pending && let Some(BuckOutput::Off { cause }) = p.output {
+            return self.latch(FaultReason::OutputUnexpectedlyOff(cause));
         }
 
         if self
@@ -644,7 +659,9 @@ impl ChargeSupervisor {
                     && b.voltage <= self.profile.absorb_v + OV_MARGIN_V
             })
             .unwrap_or(false);
-        let healthy = p.setpoints.is_some() && p.output_on == Some(false) && battery_ok;
+        let healthy = p.setpoints.is_some()
+            && matches!(p.output, Some(BuckOutput::Off { .. }))
+            && battery_ok;
         if !healthy {
             self.recovery_elapsed = Duration::ZERO;
             return false;
