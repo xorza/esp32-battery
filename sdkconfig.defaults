@@ -1,7 +1,11 @@
 # Rust often needs a bit of an extra main task stack size compared to C (the default is 3K).
 # AppState::new takes SensorData by value (~4KB inline heapless::Vec for history) + Mutex + Arc
 # construction all transit the stack before the Arc escapes to heap.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16000
+# Captive scan path also pushes wide: scan_n::<10> collects 10× AccessPointInfo
+# (~80 B each, with String<32> SSID) + per-iter try_from frame on top of the
+# FSM step. 16000 overflowed by ~100 bytes during a scan-coincident tick;
+# 20000 leaves comfortable headroom.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=20000
 
 # Use this to set FreeRTOS kernel tick frequency to 1000 Hz (100 Hz by default).
 # This allows to use 1 ms granularity for thread sleeps (10 ms by default).
