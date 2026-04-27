@@ -22,7 +22,7 @@ Off-grid battery monitor and charger controller built on the ESP32-C6 (ESP32-C3 
 - **Adaptive history** — single-tier ring with on-the-fly compaction; sized so the serialized blob fits in 4 KiB of NVS (~58 hours of coverage)
 - **Persistent history** — periodically snapshotted to NVS, restored on boot
 - **Event log** — ring buffer of structured events (sensor errors, Modbus faults, charging-state transitions) exposed at `/api/errors`
-- **mDNS** — discoverable as `battery-esp32.local`
+- **mDNS** — discoverable as `battery.local`
 - **Fakes** — `ina-fake` and `xy-fake` features substitute in-memory devices for bench testing without hardware
 
 ## Net FSM

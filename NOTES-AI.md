@@ -23,7 +23,7 @@ Per-MCU lockfiles: `components_esp32c6.lock`, `components_esp32c3.lock` (managed
 
 - `main.rs` — entry point. Owns the `NetState` supervisor loop (1 Hz ticks). Each tick: `tick_and_persist`, drain reset signal, `step(state)`, publish LCD status.
 - `net.rs` — `NetState` enum, `LinkState`, `CaptiveBundle`, `NetStatusHandle`, `ResetSignal`, `SubmissionStatus`. Spec in `src/net_fsm.md`.
-- `wifi.rs` — `WifiDriver` → `StaWifi` / `MixedWifi`. Scan cache, mDNS setup (`battery-esp32.local`), AP creds (`Battery-Setup` / `01010101`).
+- `wifi.rs` — `WifiDriver` → `StaWifi` / `MixedWifi`. Scan cache, mDNS setup (`battery.local`), AP creds (`Battery-Setup` / `01010101`).
 - `dns.rs` — captive DNS responder (spoofs every A query to 192.168.71.1).
 - `http/` — `mod.rs` shared helpers (`create_server`, `serve_static`, `mount_*`), `main_server.rs` HTTPS dashboard, `captive.rs` plaintext captive HTTP.
 - `api.rs` — `GET /api`. Serializes `ApiResponse { uptime, rssi, voltage, power_online, heap, battery, ps, history }` via serde-json-core into a 16 KiB buffer. History is borrowed during serialization (no clone) under the `SensorData` lock.
