@@ -75,9 +75,13 @@ const UPTIME_X: i32 = 240;
 const VALUE_W: u32 = 150;
 const VALUE_H: u32 = 22;
 
-const GRAPH_Y: i32 = 68;
-const GRAPH_W: u32 = 320;
-const GRAPH_H: u32 = 104;
+const LOWER_Y: i32 = 68;
+const LOWER_W: u32 = 320;
+// The lower region is 104 px tall but rendered through a half-height
+// scratch buffer in two passes (top half then bottom half) to halve BSS
+// cost; pixels outside the buffer are clipped by `Framebuf::set_pixel`
+// and `fill_solid`.
+const LOWER_H: u32 = 52;
 
 /// Backlight brightness 0–100%.
 const BACKLIGHT_PERCENT: u32 = 50;
@@ -85,14 +89,14 @@ const BACKLIGHT_PERCENT: u32 = 50;
 // --- Framebuffer ---
 
 struct Framebuf<const W: u32, const H: u32> {
-    pixels: Box<[Rgb565]>,
+    pixels: &'static mut [Rgb565],
 }
 
 impl<const W: u32, const H: u32> Framebuf<W, H> {
-    fn new() -> Self {
-        Self {
-            pixels: vec![COLOR_BG; (W * H) as usize].into_boxed_slice(),
-        }
+    fn from_buf(pixels: &'static mut [Rgb565]) -> Self {
+        assert_eq!(pixels.len(), (W * H) as usize);
+        pixels.fill(COLOR_BG);
+        Self { pixels }
     }
 
     fn clear(&mut self) {
@@ -162,7 +166,7 @@ impl<const W: u32, const H: u32> DrawTarget for Framebuf<W, H> {
 }
 
 type FieldBuf = Framebuf<VALUE_W, VALUE_H>;
-type GraphBuf = Framebuf<GRAPH_W, GRAPH_H>;
+type LowerBuf = Framebuf<LOWER_W, LOWER_H>;
 
 // --- Drawing helpers ---
 
@@ -198,8 +202,14 @@ fn draw_value<D: DrawTarget<Color = Rgb565>>(
 
 // --- Host-mode rendering ---
 
+// Lower-region draw helpers below take a `y_off` and render in
+// lower-region-absolute coordinates minus that offset, so the same
+// function renders either the top half (y_off=0) or the bottom half
+// (y_off=LOWER_H). Out-of-buffer pixels are clipped by Framebuf.
+
 fn draw_host(
-    gb: &mut GraphBuf,
+    lb: &mut LowerBuf,
+    y_off: i32,
     ip: Option<std::net::Ipv4Addr>,
     has_errors: bool,
     buf: &mut heapless::String<32>,
@@ -207,7 +217,9 @@ fn draw_host(
     let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
     let value = MonoTextStyle::new(&FONT_10X20, COLOR_IP);
 
-    Text::new("IP", Point::new(20, 24), label).draw(gb).unwrap();
+    Text::new("IP", Point::new(20, 24 - y_off), label)
+        .draw(lb)
+        .unwrap();
     buf.clear();
     match ip {
         Some(addr) => {
@@ -217,27 +229,31 @@ fn draw_host(
             let _ = write!(buf, "--");
         }
     }
-    Text::new(buf, Point::new(20, 44), value).draw(gb).unwrap();
+    Text::new(buf, Point::new(20, 44 - y_off), value)
+        .draw(lb)
+        .unwrap();
 
-    Text::new("URL", Point::new(20, 60), label)
-        .draw(gb)
+    Text::new("URL", Point::new(20, 60 - y_off), label)
+        .draw(lb)
         .unwrap();
     buf.clear();
     let _ = write!(buf, "https://{}.local", crate::wifi::HOSTNAME);
-    Text::new(buf, Point::new(20, 80), value).draw(gb).unwrap();
+    Text::new(buf, Point::new(20, 80 - y_off), value)
+        .draw(lb)
+        .unwrap();
 
     if has_errors {
-        draw_warning_triangle(gb);
+        draw_warning_triangle(lb, y_off);
     }
 }
 
 /// Filled red warning triangle with a black "!" inside, anchored to the
 /// right side of the lower region. Drawn only when the event log holds
 /// at least one entry — a hint that the user should check `/api/errors`.
-fn draw_warning_triangle(gb: &mut GraphBuf) {
-    let cx = GRAPH_W as i32 - 50;
-    let cy_top = 20;
-    let cy_bot = 84;
+fn draw_warning_triangle(lb: &mut LowerBuf, y_off: i32) {
+    let cx = LOWER_W as i32 - 50;
+    let cy_top = 20 - y_off;
+    let cy_bot = 84 - y_off;
     let half = 32;
     Triangle::new(
         Point::new(cx, cy_top),
@@ -245,63 +261,71 @@ fn draw_warning_triangle(gb: &mut GraphBuf) {
         Point::new(cx + half, cy_bot),
     )
     .into_styled(PrimitiveStyle::with_fill(COLOR_WARNING))
-    .draw(gb)
+    .draw(lb)
     .unwrap();
     Text::new(
         "!",
         Point::new(cx - 5, cy_bot - 14),
         MonoTextStyle::new(&FONT_10X20, Rgb565::BLACK),
     )
-    .draw(gb)
+    .draw(lb)
     .unwrap();
 }
 
 // --- Captive portal overlay ---
 
-fn draw_captive_portal(gb: &mut GraphBuf, trying: bool) {
+fn draw_captive_portal(
+    lb: &mut LowerBuf,
+    y_off: i32,
+    trying: bool,
+    buf: &mut heapless::String<32>,
+) {
     let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
     let value = MonoTextStyle::new(&FONT_10X20, COLOR_VOLTAGE);
     let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
 
-    Text::new("WiFi Setup", Point::new(20, 14), title)
-        .draw(gb)
+    Text::new("WiFi Setup", Point::new(20, 14 - y_off), title)
+        .draw(lb)
         .unwrap();
-    Text::new("SSID", Point::new(20, 26), label)
-        .draw(gb)
+    Text::new("SSID", Point::new(20, 26 - y_off), label)
+        .draw(lb)
         .unwrap();
-    Text::new(crate::wifi::AP_SSID, Point::new(20, 42), value)
-        .draw(gb)
+    Text::new(crate::wifi::AP_SSID, Point::new(20, 42 - y_off), value)
+        .draw(lb)
         .unwrap();
-    Text::new("PASSWORD", Point::new(20, 54), label)
-        .draw(gb)
+    Text::new("PASSWORD", Point::new(20, 54 - y_off), label)
+        .draw(lb)
         .unwrap();
-    Text::new(crate::wifi::AP_PASS, Point::new(20, 70), value)
-        .draw(gb)
+    Text::new(crate::wifi::AP_PASS, Point::new(20, 70 - y_off), value)
+        .draw(lb)
         .unwrap();
-    Text::new("OPEN", Point::new(20, 82), label)
-        .draw(gb)
+    Text::new("OPEN", Point::new(20, 82 - y_off), label)
+        .draw(lb)
         .unwrap();
     let [a, b, c, d] = crate::wifi::AP_GATEWAY;
-    let url = format!("http://{a}.{b}.{c}.{d}/");
-    Text::new(&url, Point::new(20, 98), value).draw(gb).unwrap();
+    buf.clear();
+    let _ = write!(buf, "http://{a}.{b}.{c}.{d}/");
+    Text::new(buf, Point::new(20, 98 - y_off), value)
+        .draw(lb)
+        .unwrap();
 
     if trying {
         // Top-right indicator so the AP creds remain readable while STA
         // is mid-association on the user's submitted creds.
         Text::new(
             "Connecting...",
-            Point::new(190, 14),
+            Point::new(190, 14 - y_off),
             MonoTextStyle::new(&FONT_6X10, COLOR_DISCHARGING),
         )
-        .draw(gb)
+        .draw(lb)
         .unwrap();
     }
 }
 
-fn draw_connecting(gb: &mut GraphBuf) {
+fn draw_connecting(lb: &mut LowerBuf, y_off: i32) {
     let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    Text::new("Connecting...", Point::new(20, 60), title)
-        .draw(gb)
+    Text::new("Connecting...", Point::new(20, 60 - y_off), title)
+        .draw(lb)
         .unwrap();
 }
 
@@ -326,6 +350,15 @@ pub fn start(
             let max_duty = blk.get_max_duty();
             blk.set_duty(max_duty * BACKLIGHT_PERCENT / 100).unwrap();
 
+            // Backing storage for SPI interface scratch buffer and the two
+            // framebuffers lives in BSS — sums to ~105 KB and was previously
+            // heap-allocated (and leaked) at boot.
+            static mut SPI_BUF: [u8; SPI_BUF_SIZE] = [0; SPI_BUF_SIZE];
+            static mut FIELD_PIXELS: [Rgb565; (VALUE_W * VALUE_H) as usize] =
+                [COLOR_BG; (VALUE_W * VALUE_H) as usize];
+            static mut LOWER_PIXELS: [Rgb565; (LOWER_W * LOWER_H) as usize] =
+                [COLOR_BG; (LOWER_W * LOWER_H) as usize];
+
             let spi_driver = SpiDriver::new(
                 pins.spi,
                 pins.sclk,
@@ -343,9 +376,15 @@ pub fn start(
             let dc = PinDriver::output(pins.dc).unwrap();
             let rst = PinDriver::output(pins.rst).unwrap();
 
-            // Leaked for 'static lifetime required by SpiInterface (thread runs forever)
-            let spi_buf = Box::leak(Box::new([0u8; SPI_BUF_SIZE]));
-            let spi_iface = SpiInterface::new(spi_device, dc, &mut *spi_buf);
+            // SAFETY: this thread is spawned exactly once and these statics
+            // are not referenced anywhere else.
+            let spi_ptr = &raw mut SPI_BUF;
+            let field_ptr = &raw mut FIELD_PIXELS;
+            let lower_ptr = &raw mut LOWER_PIXELS;
+            let spi_buf: &'static mut [u8] = unsafe { &mut *spi_ptr };
+            let field_pixels: &'static mut [Rgb565] = unsafe { &mut *field_ptr };
+            let lower_pixels: &'static mut [Rgb565] = unsafe { &mut *lower_ptr };
+            let spi_iface = SpiInterface::new(spi_device, dc, spi_buf);
 
             let mut display = Builder::new(ST7789, spi_iface)
                 .reset_pin(rst)
@@ -371,8 +410,8 @@ pub fn start(
                     .unwrap();
             }
 
-            let mut fb = FieldBuf::new();
-            let mut gb = GraphBuf::new();
+            let mut fb = FieldBuf::from_buf(field_pixels);
+            let mut lb = LowerBuf::from_buf(lower_pixels);
             let mut prev_status = NetStatus::Connecting;
             let mut prev_ip: Option<std::net::Ipv4Addr> = None;
             let mut prev_has_errors = false;
@@ -392,9 +431,6 @@ pub fn start(
                         && (ip != prev_ip || has_errors != prev_has_errors));
                 let mut buf = heapless::String::<32>::new();
 
-                // Lock for live readings only — the lower region no longer
-                // borrows history, so the lock window is just the two
-                // `*_reading()` calls.
                 let (r1, r2) = {
                     let sd = sensor_data.lock().unwrap();
                     (
@@ -465,14 +501,21 @@ pub fn start(
                     prev_status = net_status;
                     prev_ip = ip;
                     prev_has_errors = has_errors;
-                    gb.clear();
-                    match net_status {
-                        NetStatus::Captive => draw_captive_portal(&mut gb, false),
-                        NetStatus::CaptiveTrying => draw_captive_portal(&mut gb, true),
-                        NetStatus::Connecting => draw_connecting(&mut gb),
-                        NetStatus::Host => draw_host(&mut gb, ip, has_errors, &mut buf),
+                    let half_h = LOWER_H as i32;
+                    for y_off in [0, half_h] {
+                        lb.clear();
+                        match net_status {
+                            NetStatus::Captive => {
+                                draw_captive_portal(&mut lb, y_off, false, &mut buf)
+                            }
+                            NetStatus::CaptiveTrying => {
+                                draw_captive_portal(&mut lb, y_off, true, &mut buf)
+                            }
+                            NetStatus::Connecting => draw_connecting(&mut lb, y_off),
+                            NetStatus::Host => draw_host(&mut lb, y_off, ip, has_errors, &mut buf),
+                        }
+                        lb.blit(&mut display, Point::new(0, LOWER_Y + y_off));
                     }
-                    gb.blit(&mut display, Point::new(0, GRAPH_Y));
                 }
             }
         })
