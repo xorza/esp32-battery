@@ -186,21 +186,32 @@ impl BufReader<'_> {
     }
 }
 
-/// Serialize history + metadata into a fresh `Vec` for NVS storage.
-pub fn serialize(history: &History) -> Vec<u8> {
+/// Serialize history + metadata into the caller-provided buffer; returns
+/// the number of bytes written. `out` must hold at least
+/// `HEADER_SIZE + samples.len() * SAMPLE_SIZE` bytes — passing a
+/// `[u8; SERIALIZED_MAX_BYTES]` always satisfies that.
+pub fn serialize_into(history: &History, out: &mut [u8]) -> usize {
     let samples = history.samples();
-    let mut out = Vec::with_capacity(HEADER_SIZE + samples.len() * SAMPLE_SIZE);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    out.extend_from_slice(&history.interval().to_le_bytes());
-    out.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    let total = HEADER_SIZE + samples.len() * SAMPLE_SIZE;
+    assert!(
+        out.len() >= total,
+        "serialize_into: buffer too small ({} < {})",
+        out.len(),
+        total
+    );
+    out[0..4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out[4..8].copy_from_slice(&history.interval().to_le_bytes());
+    out[8..12].copy_from_slice(&(samples.len() as u32).to_le_bytes());
+    let mut o = HEADER_SIZE;
     for s in samples {
-        out.extend_from_slice(&s.time_s.to_le_bytes());
-        out.extend_from_slice(&s.voltage.to_le_bytes());
-        out.extend_from_slice(&s.battery_current.to_le_bytes());
-        out.extend_from_slice(&s.ps_current.to_le_bytes());
-        out.extend_from_slice(&s.power_online.to_le_bytes());
+        out[o..o + 4].copy_from_slice(&s.time_s.to_le_bytes());
+        out[o + 4..o + 8].copy_from_slice(&s.voltage.to_le_bytes());
+        out[o + 8..o + 12].copy_from_slice(&s.battery_current.to_le_bytes());
+        out[o + 12..o + 16].copy_from_slice(&s.ps_current.to_le_bytes());
+        out[o + 16..o + 20].copy_from_slice(&s.power_online.to_le_bytes());
+        o += SAMPLE_SIZE;
     }
-    out
+    total
 }
 
 /// Restore a `History` from a byte slice into the caller's slot.
@@ -436,6 +447,13 @@ mod tests {
 
     // --- Codec ---
 
+    fn serialize_to_vec(history: &History) -> Vec<u8> {
+        let mut buf = vec![0u8; SERIALIZED_MAX_BYTES];
+        let n = serialize_into(history, &mut buf);
+        buf.truncate(n);
+        buf
+    }
+
     fn header_blob(version: u32, interval: u32, count: u32, total_len: usize) -> Vec<u8> {
         let mut out = vec![0u8; total_len];
         out[0..4].copy_from_slice(&version.to_le_bytes());
@@ -465,7 +483,7 @@ mod tests {
     #[test]
     fn write_read_roundtrip_empty() {
         let h = History::new();
-        let blob = serialize(&h);
+        let blob = serialize_to_vec(&h);
         assert_eq!(blob.len(), HEADER_SIZE);
         // Empty blob (count=0) is rejected — no useful state to restore.
         let mut out = fresh();
@@ -475,7 +493,7 @@ mod tests {
     #[test]
     fn write_read_roundtrip() {
         let h = filled_history(10, 1000);
-        let blob = serialize(&h);
+        let blob = serialize_to_vec(&h);
         assert_eq!(blob.len(), HEADER_SIZE + 10 * SAMPLE_SIZE);
 
         let mut h2 = fresh();
@@ -558,7 +576,7 @@ mod tests {
             });
         }
         assert_eq!(h.interval(), 2);
-        let blob = serialize(&h);
+        let blob = serialize_to_vec(&h);
 
         let mut sd = SensorData::new();
         assert!(sd.load_from_bytes(&blob));

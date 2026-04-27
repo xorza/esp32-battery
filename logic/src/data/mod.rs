@@ -186,9 +186,11 @@ impl SensorData {
         }
     }
 
-    /// Serialize history + metadata into a fresh `Vec` for NVS storage.
-    pub fn serialize(&self) -> Vec<u8> {
-        history::serialize(&self.history)
+    /// Serialize history + metadata into the caller-provided buffer for
+    /// NVS storage; returns the number of bytes written. `out` must hold
+    /// at least `SERIALIZED_MAX_BYTES` to fit any valid history.
+    pub fn serialize_into(&self, out: &mut [u8]) -> usize {
+        history::serialize_into(&self.history, out)
     }
 
     /// Drive the history pipeline forward by one tick. `now_epoch` is the
@@ -276,9 +278,10 @@ mod tests {
     }
 
     fn sd_with_blob(sd: &SensorData) -> SensorData {
-        let blob = sd.serialize();
+        let mut buf = vec![0u8; super::SERIALIZED_MAX_BYTES];
+        let n = sd.serialize_into(&mut buf);
         let mut fresh = SensorData::new();
-        assert!(fresh.load_from_bytes(&blob));
+        assert!(fresh.load_from_bytes(&buf[..n]));
         fresh
     }
 
@@ -405,10 +408,11 @@ mod tests {
         let mut sd = SensorData::new();
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 0);
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(0.0, 0.0), 1);
-        let blob = sd.serialize();
+        let mut buf = vec![0u8; super::SERIALIZED_MAX_BYTES];
+        let n = sd.serialize_into(&mut buf);
 
         let mut sd2 = SensorData::new();
-        assert!(sd2.load_from_bytes(&blob));
+        assert!(sd2.load_from_bytes(&buf[..n]));
         assert!((sd2.history()[0].power_online - 1.0).abs() < 0.001);
         assert!(sd2.history()[1].power_online.abs() < 0.001);
     }

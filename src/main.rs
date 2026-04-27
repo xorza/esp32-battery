@@ -85,24 +85,31 @@ fn tick_and_persist(
     last_save_s: &mut Option<u32>,
     epoch: Option<u32>,
 ) {
-    let payload = {
+    let should_save = {
         let mut sd = sensor_data.lock().unwrap();
         sd.tick(epoch);
         match (epoch, *last_save_s) {
             (Some(t), Some(last)) if t.saturating_sub(last) >= SAVE_INTERVAL_S => {
                 *last_save_s = Some(t);
-                Some(sd.serialize())
+                true
             }
             (Some(t), None) => {
                 *last_save_s = Some(t);
-                None
+                false
             }
-            _ => None,
+            _ => false,
         }
     };
-    if let Some(bytes) = payload {
-        log::info!("Emitting save payload: {} bytes", bytes.len());
-        store.save(&bytes);
+    if should_save {
+        // SensorData lock is reacquired briefly inside `save_with` to fill
+        // the store's scratch buffer; it's released before the slow NVS
+        // erase/write so producer threads don't stall on flash I/O.
+        store.save_with(|buf| {
+            let sd = sensor_data.lock().unwrap();
+            let n = sd.serialize_into(buf);
+            log::info!("Emitting save payload: {} bytes", n);
+            n
+        });
     }
 }
 
@@ -136,12 +143,11 @@ fn main() {
     // Load persisted history at boot so the first commit doesn't dump a stale
     // blob and the dashboard has data before the first live commit lands.
     let mut sd = esp32_battery_logic::data::SensorData::new();
-    let mut load_buf = vec![0u8; esp32_battery_logic::data::SERIALIZED_MAX_BYTES];
-    if let Some(len) = history_store.load(&mut load_buf)
-        && !sd.load_from_bytes(&load_buf[..len])
-    {
-        warn!("history blob in NVS is corrupt or from an older version — discarding");
-    }
+    history_store.load_with(|bytes| {
+        if !sd.load_from_bytes(bytes) {
+            warn!("history blob in NVS is corrupt or from an older version — discarding");
+        }
+    });
 
     let sensor_data: Arc<Mutex<SensorData>> = Arc::new(Mutex::new(sd));
     let event_log: Arc<Mutex<EventLog>> =
