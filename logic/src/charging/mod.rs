@@ -345,9 +345,13 @@ pub enum Action {
     /// `boot_sequence` already programmed it to `float_v`, which is
     /// always the supervisor's target voltage in Pending.
     EnableOutput,
-    /// Caller should write V_SET to `supervisor.target_voltage()`.
-    /// Emitted after the phase machine transitions Float ↔ Absorb.
-    UpdateVoltage,
+    /// Caller should write V_SET to `target_v` then call
+    /// `ack_voltage_update`. Emitted while the phase machine wants to
+    /// transition Float ↔ Absorb but the new voltage hasn't been
+    /// successfully written yet — re-emits each tick until acked, so a
+    /// transient Modbus glitch on the write retries instead of latching
+    /// `SettingsDrift`.
+    UpdateVoltage { target_v: f32 },
     DisableOutput(FaultReason),
 }
 
@@ -412,6 +416,15 @@ pub struct ChargeSupervisor {
     /// new latch. Only meaningful when the latched fault has a recovery
     /// policy.
     recovery_elapsed: Duration,
+    /// Phase the supervisor wants to transition into. Set when the phase
+    /// machine fires Float↔Absorb; cleared (and committed) by
+    /// `ack_voltage_update` once the caller's `set_voltage` write
+    /// succeeds. While set, `tick` re-emits `UpdateVoltage` instead of
+    /// running the phase machine, and `target_voltage` keeps reporting
+    /// the **old** phase's voltage so the drift check still matches the
+    /// buck's readback. This is the same retry pattern as
+    /// EnableOutput / `ack_enable`.
+    pending_phase: Option<Phase>,
 }
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
@@ -480,6 +493,7 @@ impl ChargeSupervisor {
             modbus_err: Debounce::default(),
             latch: LatchState::Pending,
             recovery_elapsed: Duration::ZERO,
+            pending_phase: None,
         }
     }
 
@@ -488,7 +502,11 @@ impl ChargeSupervisor {
     }
 
     pub fn target_voltage(&self) -> f32 {
-        match self.phase {
+        self.voltage_for_phase(self.phase)
+    }
+
+    fn voltage_for_phase(&self, phase: Phase) -> f32 {
+        match phase {
             Phase::Float => self.profile.float_v,
             Phase::Absorb => self.profile.absorb_v,
         }
@@ -540,6 +558,26 @@ impl ChargeSupervisor {
             LatchState::Pending => self.latch = LatchState::Active,
             _ => panic!("ack_enable from non-Pending state"),
         }
+    }
+
+    /// Caller invokes this after a successful `set_voltage(target)` Modbus
+    /// write that resulted from `Action::UpdateVoltage`. Commits the
+    /// pending phase transition: the new phase becomes the supervisor's
+    /// `target_voltage()` (drift check switches to the new value on the
+    /// next tick) and the absorb/exit debouncers reset. If the write
+    /// fails, the caller does NOT call this — the supervisor stays at
+    /// the old phase, drift check keeps matching old V_SET, and the next
+    /// tick re-emits `UpdateVoltage` for retry.
+    pub fn ack_voltage_update(&mut self) {
+        let Some(next) = self.pending_phase.take() else {
+            panic!("ack_voltage_update without pending phase");
+        };
+        self.phase = next;
+        // Reset both timers explicitly: a Float→Absorb transition can
+        // immediately follow an Absorb→Float, with no intervening Float
+        // dwell to clear stale counts.
+        self.absorb.elapsed = Duration::ZERO;
+        self.exit.elapsed = Duration::ZERO;
     }
 
     /// Drive one poll cycle. `p` carries the buck readback and latest fresh
@@ -624,6 +662,17 @@ impl ChargeSupervisor {
             return Action::EnableOutput;
         }
 
+        // Re-emit UpdateVoltage until the caller acks the previous one.
+        // The phase machine and absorb-cap don't run while a write is in
+        // flight — drift check keeps matching the old V_SET (since
+        // `target_voltage` reflects the still-current phase), and the
+        // caller retries on every tick by writing again.
+        if let Some(next) = self.pending_phase {
+            return Action::UpdateVoltage {
+                target_v: self.voltage_for_phase(next),
+            };
+        }
+
         // Charging current as a positive number.
         let charging_a = -b.current;
         let below_exit = self.phase == Phase::Absorb && charging_a < self.profile.exit_absorb_a;
@@ -635,13 +684,14 @@ impl ChargeSupervisor {
             p => p,
         };
         if next != self.phase {
-            self.phase = next;
-            // Reset both timers explicitly: a Float→Absorb transition can
-            // immediately follow an Absorb→Float, with no intervening Float
-            // dwell to clear stale counts.
-            self.absorb.elapsed = Duration::ZERO;
-            self.exit.elapsed = Duration::ZERO;
-            return Action::UpdateVoltage;
+            // Defer the phase commit until the caller acks — keeps
+            // `target_voltage` matching the buck's actual V_SET so a
+            // failed write doesn't trigger SettingsDrift on the next
+            // tick. Caller invokes `ack_voltage_update` on success.
+            self.pending_phase = Some(next);
+            return Action::UpdateVoltage {
+                target_v: self.voltage_for_phase(next),
+            };
         }
 
         if self.phase == Phase::Absorb && self.absorb.step(true, elapsed, MAX_ABSORB) {

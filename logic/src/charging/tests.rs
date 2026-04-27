@@ -40,7 +40,16 @@ fn ok_tick(s: &mut ChargeSupervisor, battery: Option<BatterySample>, elapsed: Du
         output: Some(output),
         battery,
     };
-    s.tick(p, elapsed)
+    let a = s.tick(p, elapsed);
+    // Auto-ack voltage updates: this helper simulates the happy path
+    // (every Modbus write succeeds), and a successful set_voltage write
+    // is part of that. Tests of the retry-on-failure path use
+    // `s.tick(...)` directly so they can skip the ack and verify the
+    // re-emit on the next tick.
+    if matches!(a, Action::UpdateVoltage { .. }) {
+        s.ack_voltage_update();
+    }
+    a
 }
 
 /// Tick where the Modbus read failed — both `setpoints` and
@@ -256,7 +265,7 @@ fn enters_absorb_when_charging_current_exceeds_threshold() {
     // Charging at 4 A → -4 A on the bus; threshold is 3 A.
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -4.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
     assert!(approx(s.target_voltage(), 14.4));
@@ -270,7 +279,7 @@ fn does_not_enter_absorb_at_exact_threshold() {
     assert!(matches!(s.phase(), Phase::Float));
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -3.001), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
 }
 
@@ -305,7 +314,7 @@ fn exits_absorb_when_taper_drops_below_threshold() {
     }
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -2.4), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(matches!(s.phase(), Phase::Float));
     assert!(approx(s.target_voltage(), 13.5));
@@ -323,7 +332,7 @@ fn exits_absorb_when_load_pulls_current() {
     }
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, 3.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(approx(s.target_voltage(), 13.5));
 }
@@ -360,7 +369,7 @@ fn exit_debounce_does_not_accumulate_in_float() {
     // tick is not enough to transition out.
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -4.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     assert!(matches!(s.phase(), Phase::Absorb));
@@ -374,7 +383,7 @@ fn exit_debounce_honors_elapsed() {
     ok_tick(&mut s, b(OK_V, -4.0), TICK);
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -2.4), EXIT_DEBOUNCE),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(matches!(s.phase(), Phase::Float));
     assert!(approx(s.target_voltage(), 13.5));
@@ -412,7 +421,7 @@ fn transition_only_emits_setpoint_once() {
     // First crossing → write.
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -4.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     // Already absorb → silent.
     assert!(matches!(ok_tick(&mut s, b(OK_V, -4.0), TICK), Action::None));
@@ -486,11 +495,11 @@ fn different_chemistries_yield_different_setpoints() {
     let mut liion = active(Profile::for_pack(Chemistry::LiIon, 3, 50.0));
     assert!(matches!(
         ok_tick(&mut lfp, b(OK_V, -4.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(matches!(
         ok_tick(&mut liion, b(12.0, -4.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(approx(lfp.target_voltage(), 14.4));
     assert!(approx(liion.target_voltage(), 12.3));
@@ -504,7 +513,7 @@ fn single_cell_lfp_works() {
     assert!(approx(s.target_voltage(), 3.375));
     assert!(matches!(
         ok_tick(&mut s, b(3.4, -4.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(approx(s.target_voltage(), 3.60));
 }
@@ -515,7 +524,7 @@ fn full_charge_cycle() {
     // Bulk → absorb on heavy current.
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -8.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(approx(s.target_voltage(), 14.4));
     // Hold absorb across a realistic taper — all values stay above 2.5 A.
@@ -528,7 +537,7 @@ fn full_charge_cycle() {
     }
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -2.4), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(approx(s.target_voltage(), 13.5));
     // Sit at float without retriggering absorb (all below 3 A enter).
@@ -619,7 +628,7 @@ fn modbus_unhealthy_honors_elapsed() {
 fn enter_absorb(s: &mut ChargeSupervisor) {
     assert!(matches!(
         ok_tick(s, b(OK_V, -4.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
 }
@@ -662,7 +671,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     }
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -0.1), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(matches!(s.phase(), Phase::Float));
 
@@ -682,7 +691,7 @@ fn supervisor_passes_setpoint_through_on_phase_transition() {
     let mut s = active(lfp_4s());
     assert!(matches!(
         ok_tick(&mut s, b(13.5, -4.0), TICK),
-        Action::UpdateVoltage
+        Action::UpdateVoltage { .. }
     ));
     assert!(matches!(s.phase(), Phase::Absorb));
     assert!(approx(s.target_voltage(), 14.4));
@@ -1204,6 +1213,51 @@ fn should_restart_false_for_non_recoverable_protection_cause() {
             assert!(!s.should_restart(&p, TICK));
         }
     }
+}
+
+#[test]
+fn update_voltage_retries_until_acked() {
+    // Phase machine wants Float→Absorb (heavy charging current). The
+    // first tick emits UpdateVoltage. If the caller doesn't ack (write
+    // failed), the next tick must re-emit UpdateVoltage with the same
+    // target — and the drift check must NOT latch SettingsDrift, since
+    // V_SET on the buck is still the old (Float) value matching the
+    // supervisor's still-Float `target_voltage`.
+    let profile = lfp_4s();
+    let mut s = active(profile);
+    let p_in_phase_transition = PollResult {
+        // Buck readback is still at the old (Float) voltage — caller's
+        // write failed so V_SET on the device didn't change.
+        setpoints: Some(Setpoints {
+            v_set: profile.float_v,
+            i_set: profile.regulation_a,
+        }),
+        output: Some(BuckOutput::On),
+        battery: b(OK_V, -4.0),
+    };
+    let a = s.tick(p_in_phase_transition, TICK);
+    let Action::UpdateVoltage { target_v: t1 } = a else {
+        panic!("expected UpdateVoltage, got something else");
+    };
+    assert!(approx(t1, profile.absorb_v));
+    // Phase NOT yet committed.
+    assert!(matches!(s.phase(), Phase::Float));
+    assert!(s.fault().is_none());
+
+    // No ack — second tick re-emits UpdateVoltage, same target. No
+    // SettingsDrift even though setpoints (Float) lag the pending phase
+    // (Absorb), because expected_setpoints still uses the old phase.
+    let a = s.tick(p_in_phase_transition, TICK);
+    let Action::UpdateVoltage { target_v: t2 } = a else {
+        panic!("expected UpdateVoltage retry, got something else");
+    };
+    assert!(approx(t2, profile.absorb_v));
+    assert!(matches!(s.phase(), Phase::Float));
+    assert!(s.fault().is_none());
+
+    // Now ack — phase commits, debouncers reset, normal operation.
+    s.ack_voltage_update();
+    assert!(matches!(s.phase(), Phase::Absorb));
 }
 
 #[test]

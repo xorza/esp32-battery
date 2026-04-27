@@ -602,17 +602,19 @@ fn apply_action<D: XyDevice>(
                 }
             }
         }
-        Action::UpdateVoltage => {
-            let v = supervisor.target_voltage();
-            info!(
-                "charge phase → {}: setting V_set = {v:.2} V",
-                supervisor.phase().label()
-            );
-            if let Err(e) = xy.set_voltage(v) {
-                warn!("XY set_voltage({v}): {e}");
+        Action::UpdateVoltage { target_v } => match xy.set_voltage(target_v) {
+            Ok(()) => {
+                supervisor.ack_voltage_update();
+                info!(
+                    "charge phase → {}: V_set = {target_v:.2} V",
+                    supervisor.phase().label()
+                );
+            }
+            Err(e) => {
+                warn!("XY set_voltage({target_v}): {e} — supervisor will retry next tick");
                 recorder.record(Event::Xy(XyError::SetVoltage));
             }
-        }
+        },
         Action::DisableOutput(reason) => match xy.set_output(false) {
             Ok(()) => {
                 error!("CHARGE FAULT ({reason}): PS output DISABLED");
