@@ -295,11 +295,13 @@ where
             .draw(s)
             .unwrap();
             if let Some((b, c)) = badge {
-                let w = (b.len() as i32) * 6;
+                // FONT_10X20 advances 10 px/char; pad the right margin generously so
+                // the panel's column-offset quirk doesn't clip the last glyph.
+                let w = (b.len() as i32) * 10;
                 Text::new(
                     b,
-                    Point::new(SCRATCH_W as i32 - w - 6, BAND_BASELINE),
-                    MonoTextStyle::new(&FONT_6X10, c),
+                    Point::new(SCRATCH_W as i32 - w - 14, BAND_BASELINE),
+                    MonoTextStyle::new(&FONT_10X20, c),
                 )
                 .draw(s)
                 .unwrap();

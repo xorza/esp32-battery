@@ -354,11 +354,6 @@ button:disabled {
     display: flex;
     gap: 0.6em;
     padding: 0.25em 0;
-    border-bottom: 1px solid var(--bg-inset);
-}
-
-.errors-list li:last-child {
-    border-bottom: none;
 }
 
 .err-time {
