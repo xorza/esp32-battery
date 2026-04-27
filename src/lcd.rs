@@ -27,16 +27,33 @@ use mipidsi::options::{Orientation, Rotation};
 use crate::board::LcdPins;
 use crate::net::{NetStatus, NetStatusHandle};
 
-// --- SPI ---
+// --- SPI / display hardware ---
 const SPI_BUF_SIZE: usize = 32768;
 const DMA_BUF_SIZE: usize = 32768;
-
-// --- Display ---
 const DISPLAY_W: u32 = 320;
 const DISPLAY_H: u32 = 172;
-const LOWER_Y: i32 = 68;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const BACKLIGHT_PERCENT: u32 = 50;
+
+// --- Layout ---
+//
+// Upper region (y < LOWER_Y): 2×2 grid of 150×22 value cells with FONT_5X8
+// labels above each, plus an uptime corner. Lower region: stacked 22-tall
+// text bands repainted only on net-state change.
+const LOWER_Y: i32 = 68;
+const COL_LEFT: i32 = 5;
+const COL_RIGHT: i32 = 165;
+const LABEL_OFFSET_X: i32 = 8;
+const ROW1_LABEL_Y: i32 = 10;
+const ROW2_LABEL_Y: i32 = 44;
+const ROW1_TOP: i32 = 14;
+const ROW2_TOP: i32 = 46;
+const VALUE_W: u32 = 150;
+const VALUE_H: u32 = 22;
+const UPTIME_X: i32 = 240;
+const UPTIME_W: u32 = 80;
+const UPTIME_H: u32 = 12;
+const LOWER_LEFT_X: i32 = 20;
 
 // --- Colors ---
 const COLOR_BG: Rgb565 = Rgb565::BLACK;
@@ -63,39 +80,16 @@ fn battery_current_color(current: f32) -> Rgb565 {
     }
 }
 
-// --- Layout (display-absolute pixels) ---
+// --- Scratch framebuffer ---
 //
-// Upper region (y < LOWER_Y): four 150×22 value cells in a 2×2 grid plus a
-// small uptime corner. Static labels above each cell are painted once at boot
-// directly to the display.
-const COL_LEFT: i32 = 5;
-const COL_RIGHT: i32 = 165;
-const LABEL_OFFSET_X: i32 = 8;
-const ROW1_LABEL_Y: i32 = 10;
-const ROW2_LABEL_Y: i32 = 44;
-const VALUE_W: u32 = 150;
-const VALUE_H: u32 = 22;
-const ROW1_TOP: i32 = 14;
-const ROW2_TOP: i32 = 46;
-const UPTIME_X: i32 = 240;
-const UPTIME_W: u32 = 80;
-const UPTIME_H: u32 = 12;
-
-// --- Scratch buffer ---
-//
-// Single 320×22 framebuffer (≈14 KB BSS) used for everything that needs
-// flicker-free composition: the upper value cells, the uptime corner, and
-// each lower-region text row. Lower-region overlays are painted only on
-// net-state change, so the per-row-blit cost is irrelevant.
+// Single 320×22 buffer (≈14 KB BSS) used for flicker-free composition of one
+// row at a time. Baselines are picked so a FONT_10X20 line sits flush with
+// the band's bottom and a FONT_6X10 line sits near the top, leaving visible
+// spacing when a label band is stacked above its value band.
 const SCRATCH_W: u32 = DISPLAY_W;
 const SCRATCH_H: u32 = 22;
 const SCRATCH_PX: usize = (SCRATCH_W * SCRATCH_H) as usize;
-
-// FONT_10X20 baseline within a 22-tall band — text drawn at this y lands
-// flush against the band's bottom with 2 px of headroom above.
 const BAND_BASELINE_LARGE: i32 = 16;
-// FONT_6X10 baseline within the same band — keeps labels near the top so a
-// label row blitted above its value row leaves visible spacing.
 const BAND_BASELINE_SMALL: i32 = 10;
 
 struct Scratch {
@@ -167,7 +161,7 @@ impl DrawTarget for Scratch {
     }
 }
 
-// --- Drawing helpers ---
+// --- Render helpers ---
 
 fn format_uptime(uptime: Duration, out: &mut heapless::String<16>) {
     out.clear();
@@ -178,14 +172,39 @@ fn format_uptime(uptime: Duration, out: &mut heapless::String<16>) {
     let _ = write!(out, "{}h {:02}m {:02}s", h, m, s);
 }
 
-fn draw_value<D>(scratch: &mut Scratch, display: &mut D, text: &str, cell_top: Point, color: Rgb565)
-where
+/// Compose into scratch via `f`, then blit a full-width band at `screen_top`.
+fn render_band<D>(
+    scratch: &mut Scratch,
+    display: &mut D,
+    screen_top: i32,
+    f: impl FnOnce(&mut Scratch),
+) where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
     scratch.clear();
+    f(scratch);
+    scratch.blit(display, Point::new(0, screen_top), SCRATCH_W, SCRATCH_H);
+}
+
+/// Upper-region value cell: format into `buf`, then composite into a 150×22
+/// cell at `cell_top`.
+fn cell<D>(
+    scratch: &mut Scratch,
+    display: &mut D,
+    cell_top: Point,
+    color: Rgb565,
+    buf: &mut heapless::String<32>,
+    args: core::fmt::Arguments<'_>,
+) where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    buf.clear();
+    let _ = buf.write_fmt(args);
+    scratch.clear();
     Text::new(
-        text,
+        buf,
         Point::new(0, BAND_BASELINE_LARGE),
         MonoTextStyle::new(&FONT_10X20, color),
     )
@@ -194,22 +213,43 @@ where
     scratch.blit(display, cell_top, VALUE_W, VALUE_H);
 }
 
-/// Render one text-row band: clear scratch, run `f` to paint, then blit
-/// `(SCRATCH_W × h)` at `screen_top`. Bands may overlap vertically without
-/// flicker because the overlapping rows are background-on-background.
-fn render_band<D>(
+/// Lower-region label band (FONT_6X10, COLOR_LABEL, indented to LOWER_LEFT_X).
+fn lower_label<D>(scratch: &mut Scratch, display: &mut D, baseline_y: i32, text: &str)
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    render_band(scratch, display, baseline_y - BAND_BASELINE_SMALL, |s| {
+        Text::new(
+            text,
+            Point::new(LOWER_LEFT_X, BAND_BASELINE_SMALL),
+            MonoTextStyle::new(&FONT_6X10, COLOR_LABEL),
+        )
+        .draw(s)
+        .unwrap();
+    });
+}
+
+/// Lower-region value band (FONT_10X20, indented to LOWER_LEFT_X).
+fn lower_value<D>(
     scratch: &mut Scratch,
     display: &mut D,
-    screen_top: i32,
-    h: u32,
-    f: impl FnOnce(&mut Scratch),
+    baseline_y: i32,
+    text: &str,
+    color: Rgb565,
 ) where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    scratch.clear();
-    f(scratch);
-    scratch.blit(display, Point::new(0, screen_top), SCRATCH_W, h);
+    render_band(scratch, display, baseline_y - BAND_BASELINE_LARGE, |s| {
+        Text::new(
+            text,
+            Point::new(LOWER_LEFT_X, BAND_BASELINE_LARGE),
+            MonoTextStyle::new(&FONT_10X20, color),
+        )
+        .draw(s)
+        .unwrap();
+    });
 }
 
 fn clear_lower<D>(display: &mut D)
@@ -225,9 +265,6 @@ where
 }
 
 // --- Lower-region states ---
-//
-// Each line is a 22-tall band whose screen top is `baseline_y - baseline_in_band`.
-// FONT_6X10 baselines use BAND_BASELINE_SMALL, FONT_10X20 uses BAND_BASELINE_LARGE.
 
 fn draw_host<D>(
     scratch: &mut Scratch,
@@ -239,19 +276,9 @@ fn draw_host<D>(
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
-    let value = MonoTextStyle::new(&FONT_10X20, COLOR_IP);
-    let warn = MonoTextStyle::new(&FONT_10X20, COLOR_WARNING);
+    lower_label(scratch, display, 92, "IP");
 
-    // "IP" label (FONT_6X10, baseline at screen y = LOWER_Y + 24 = 92)
-    render_band(scratch, display, 92 - BAND_BASELINE_SMALL, SCRATCH_H, |s| {
-        Text::new("IP", Point::new(20, BAND_BASELINE_SMALL), label)
-            .draw(s)
-            .unwrap();
-    });
-
-    // IP value (FONT_10X20, baseline at screen y = LOWER_Y + 44 = 112) plus
-    // an inline "ERR!" indicator at the right when the event log has entries.
+    // IP value with optional inline "ERR!" indicator at the right.
     buf.clear();
     match ip {
         Some(addr) => {
@@ -261,54 +288,29 @@ fn draw_host<D>(
             let _ = write!(buf, "--");
         }
     }
-    render_band(
-        scratch,
-        display,
-        112 - BAND_BASELINE_LARGE,
-        SCRATCH_H,
-        |s| {
-            Text::new(buf, Point::new(20, BAND_BASELINE_LARGE), value)
-                .draw(s)
-                .unwrap();
-            if has_errors {
-                Text::new(
-                    "ERR!",
-                    Point::new(SCRATCH_W as i32 - 50, BAND_BASELINE_LARGE),
-                    warn,
-                )
-                .draw(s)
-                .unwrap();
-            }
-        },
-    );
+    render_band(scratch, display, 112 - BAND_BASELINE_LARGE, |s| {
+        Text::new(
+            buf,
+            Point::new(LOWER_LEFT_X, BAND_BASELINE_LARGE),
+            MonoTextStyle::new(&FONT_10X20, COLOR_IP),
+        )
+        .draw(s)
+        .unwrap();
+        if has_errors {
+            Text::new(
+                "ERR!",
+                Point::new(SCRATCH_W as i32 - 50, BAND_BASELINE_LARGE),
+                MonoTextStyle::new(&FONT_10X20, COLOR_WARNING),
+            )
+            .draw(s)
+            .unwrap();
+        }
+    });
 
-    // "URL" label (baseline at screen y = LOWER_Y + 60 = 128)
-    render_band(
-        scratch,
-        display,
-        128 - BAND_BASELINE_SMALL,
-        SCRATCH_H,
-        |s| {
-            Text::new("URL", Point::new(20, BAND_BASELINE_SMALL), label)
-                .draw(s)
-                .unwrap();
-        },
-    );
-
-    // URL value (baseline at screen y = LOWER_Y + 80 = 148)
+    lower_label(scratch, display, 128, "URL");
     buf.clear();
     let _ = write!(buf, "https://{}.local", crate::wifi::HOSTNAME);
-    render_band(
-        scratch,
-        display,
-        148 - BAND_BASELINE_LARGE,
-        SCRATCH_H,
-        |s| {
-            Text::new(buf, Point::new(20, BAND_BASELINE_LARGE), value)
-                .draw(s)
-                .unwrap();
-        },
-    );
+    lower_value(scratch, display, 148, buf, COLOR_IP);
 }
 
 fn draw_captive_portal<D>(
@@ -320,83 +322,38 @@ fn draw_captive_portal<D>(
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    let value = MonoTextStyle::new(&FONT_10X20, COLOR_VOLTAGE);
-    let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
-    let trying_style = MonoTextStyle::new(&FONT_6X10, COLOR_DISCHARGING);
-
     // Title row + optional "Connecting..." badge at the right.
-    // Baseline at screen y = LOWER_Y + 18 = 86 (was 14 in legacy; nudged down
-    // 4 px so the glyph sits cleanly inside the band rather than clipping).
-    render_band(scratch, display, 86 - BAND_BASELINE_LARGE, SCRATCH_H, |s| {
-        Text::new("WiFi Setup", Point::new(20, BAND_BASELINE_LARGE), title)
-            .draw(s)
-            .unwrap();
+    render_band(scratch, display, 86 - BAND_BASELINE_LARGE, |s| {
+        Text::new(
+            "WiFi Setup",
+            Point::new(LOWER_LEFT_X, BAND_BASELINE_LARGE),
+            MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE),
+        )
+        .draw(s)
+        .unwrap();
         if trying {
             Text::new(
                 "Connecting...",
                 Point::new(190, BAND_BASELINE_LARGE),
-                trying_style,
+                MonoTextStyle::new(&FONT_6X10, COLOR_DISCHARGING),
             )
             .draw(s)
             .unwrap();
         }
     });
 
-    for (label_text, label_baseline, value_text, value_baseline) in [
-        ("SSID", 94, crate::wifi::AP_SSID, 110),
-        ("PASSWORD", 122, crate::wifi::AP_PASS, 138),
-    ] {
-        render_band(
-            scratch,
-            display,
-            label_baseline - BAND_BASELINE_SMALL,
-            SCRATCH_H,
-            |s| {
-                Text::new(label_text, Point::new(20, BAND_BASELINE_SMALL), label)
-                    .draw(s)
-                    .unwrap();
-            },
-        );
-        render_band(
-            scratch,
-            display,
-            value_baseline - BAND_BASELINE_LARGE,
-            SCRATCH_H,
-            |s| {
-                Text::new(value_text, Point::new(20, BAND_BASELINE_LARGE), value)
-                    .draw(s)
-                    .unwrap();
-            },
-        );
-    }
-
-    // "OPEN" label + gateway URL.
-    render_band(
-        scratch,
-        display,
-        150 - BAND_BASELINE_SMALL,
-        SCRATCH_H,
-        |s| {
-            Text::new("OPEN", Point::new(20, BAND_BASELINE_SMALL), label)
-                .draw(s)
-                .unwrap();
-        },
-    );
     let [a, b, c, d] = crate::wifi::AP_GATEWAY;
     buf.clear();
     let _ = write!(buf, "http://{a}.{b}.{c}.{d}/");
-    render_band(
-        scratch,
-        display,
-        166 - BAND_BASELINE_LARGE,
-        SCRATCH_H,
-        |s| {
-            Text::new(buf, Point::new(20, BAND_BASELINE_LARGE), value)
-                .draw(s)
-                .unwrap();
-        },
-    );
+
+    for &(label_y, label, value_y, value) in &[
+        (94, "SSID", 110, crate::wifi::AP_SSID),
+        (122, "PASSWORD", 138, crate::wifi::AP_PASS),
+        (150, "OPEN", 166, buf.as_str()),
+    ] {
+        lower_label(scratch, display, label_y, label);
+        lower_value(scratch, display, value_y, value, COLOR_VOLTAGE);
+    }
 }
 
 fn draw_connecting<D>(scratch: &mut Scratch, display: &mut D)
@@ -404,18 +361,15 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    render_band(
-        scratch,
-        display,
-        128 - BAND_BASELINE_LARGE,
-        SCRATCH_H,
-        |s| {
-            Text::new("Connecting...", Point::new(20, BAND_BASELINE_LARGE), title)
-                .draw(s)
-                .unwrap();
-        },
-    );
+    render_band(scratch, display, 128 - BAND_BASELINE_LARGE, |s| {
+        Text::new(
+            "Connecting...",
+            Point::new(LOWER_LEFT_X, BAND_BASELINE_LARGE),
+            MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE),
+        )
+        .draw(s)
+        .unwrap();
+    });
 }
 
 // --- Main thread ---
@@ -530,45 +484,38 @@ pub fn start(
                 };
 
                 // Upper region — four value cells + uptime, every tick.
-                text_buf.clear();
-                let _ = write!(text_buf, "{:.2} V", r1.voltage);
-                draw_value(
+                cell(
                     &mut scratch,
                     &mut display,
-                    &text_buf,
                     Point::new(COL_LEFT, ROW1_TOP),
                     COLOR_VOLTAGE,
+                    &mut text_buf,
+                    format_args!("{:.2} V", r1.voltage),
                 );
-
-                text_buf.clear();
-                let _ = write!(text_buf, "{:.2} W", r1.power);
-                draw_value(
+                cell(
                     &mut scratch,
                     &mut display,
-                    &text_buf,
                     Point::new(COL_RIGHT, ROW1_TOP),
                     COLOR_POWER,
+                    &mut text_buf,
+                    format_args!("{:.2} W", r1.power),
                 );
-
-                text_buf.clear();
-                // Sign is conveyed by color — show magnitude only.
-                let _ = write!(text_buf, "{:.3} A", r1.current.abs());
-                draw_value(
+                // Battery: sign conveyed by color, show magnitude only.
+                cell(
                     &mut scratch,
                     &mut display,
-                    &text_buf,
                     Point::new(COL_LEFT, ROW2_TOP),
                     battery_current_color(r1.current),
+                    &mut text_buf,
+                    format_args!("{:.3} A", r1.current.abs()),
                 );
-
-                text_buf.clear();
-                let _ = write!(text_buf, "{:.3} A", r2.current);
-                draw_value(
+                cell(
                     &mut scratch,
                     &mut display,
-                    &text_buf,
                     Point::new(COL_RIGHT, ROW2_TOP),
                     COLOR_PSU_CURRENT,
+                    &mut text_buf,
+                    format_args!("{:.3} A", r2.current),
                 );
 
                 format_uptime(crate::clock::uptime(), &mut up_buf);
