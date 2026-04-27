@@ -69,7 +69,10 @@ const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
 /// brief sags from switching noise or transient loads that would otherwise
 /// finish absorb prematurely.
 const EXIT_DEBOUNCE: Duration = Duration::from_secs(60);
-/// How long battery readings can stay absent before we fail closed.
+/// How long `battery.is_none()` must persist before we fail closed.
+/// Counts *after* the data layer has already flipped to `None` per its
+/// own `STALE_TICKS` debounce — total time from last INA reading to a
+/// latched buck-off is `data::STALE_TICKS + BATTERY_MISSING_TIMEOUT`.
 const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long Modbus reads to the XY can keep failing before we fail closed.
 const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
