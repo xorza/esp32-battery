@@ -2,10 +2,13 @@
 //!
 //! Pure data structure — no I/O, no logging hook. The vprintf hook in `src/`
 //! owns the global instance and feeds bytes into it; HTTP `/api/log` calls
-//! `snapshot()` to read out the contents in chronological order.
+//! `slices()` to read out the contents in chronological order.
+//!
+//! Storage is a caller-provided `&'static mut [u8]`, so firmware can place
+//! it in BSS instead of the heap. Tests use `Box::leak` for the same shape.
 
 pub struct Ring {
-    data: Box<[u8]>,
+    data: &'static mut [u8],
     /// Next write index.
     head: usize,
     /// True once the ring has wrapped; before that, valid data is `[0..head]`.
@@ -13,10 +16,11 @@ pub struct Ring {
 }
 
 impl Ring {
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "Ring capacity must be > 0");
+    pub fn from_buf(data: &'static mut [u8]) -> Self {
+        assert!(!data.is_empty(), "Ring capacity must be > 0");
+        data.fill(0);
         Self {
-            data: vec![0u8; capacity].into_boxed_slice(),
+            data,
             head: 0,
             wrapped: false,
         }
@@ -69,6 +73,10 @@ impl Ring {
 mod tests {
     use super::*;
 
+    fn ring(cap: usize) -> Ring {
+        Ring::from_buf(Box::leak(vec![0u8; cap].into_boxed_slice()))
+    }
+
     fn collect(r: &Ring) -> Vec<u8> {
         let (a, b) = r.slices();
         [a, b].concat()
@@ -76,13 +84,13 @@ mod tests {
 
     #[test]
     fn fresh_ring_snapshot_is_empty() {
-        let r = Ring::new(16);
+        let r = ring(16);
         assert_eq!(collect(&r), Vec::<u8>::new());
     }
 
     #[test]
     fn write_below_capacity_preserves_order() {
-        let mut r = Ring::new(16);
+        let mut r = ring(16);
         r.write(b"hello");
         r.write(b" world");
         assert_eq!(collect(&r), b"hello world");
@@ -90,7 +98,7 @@ mod tests {
 
     #[test]
     fn fill_exactly_to_capacity_marks_wrapped() {
-        let mut r = Ring::new(8);
+        let mut r = ring(8);
         r.write(b"abcdefgh");
         // After exact fill, head=0 and wrapped=true.
         assert_eq!(collect(&r), b"abcdefgh");
@@ -101,7 +109,7 @@ mod tests {
 
     #[test]
     fn wrap_around_mid_write_orders_oldest_first() {
-        let mut r = Ring::new(8);
+        let mut r = ring(8);
         r.write(b"123456");
         // head=6, not wrapped
         r.write(b"ABCDEF");
@@ -112,7 +120,7 @@ mod tests {
 
     #[test]
     fn oversized_write_keeps_only_last_capacity_bytes() {
-        let mut r = Ring::new(8);
+        let mut r = ring(8);
         r.write(b"earlier");
         // 20-byte input into 8-byte ring: keep last 8.
         r.write(b"AAAAAAAAAAAAXXYYZZWQ");
@@ -121,7 +129,7 @@ mod tests {
 
     #[test]
     fn snapshot_after_full_wrap_is_in_chronological_order() {
-        let mut r = Ring::new(4);
+        let mut r = ring(4);
         for &b in b"abcdefgh" {
             r.write(&[b]);
         }
@@ -131,7 +139,7 @@ mod tests {
 
     #[test]
     fn write_split_exactly_at_boundary() {
-        let mut r = Ring::new(8);
+        let mut r = ring(8);
         r.write(b"abcd");
         // tail=4, write exactly tail bytes — head wraps to 0, wrapped=true.
         r.write(b"efgh");
@@ -143,6 +151,6 @@ mod tests {
     #[test]
     #[should_panic]
     fn zero_capacity_panics() {
-        Ring::new(0);
+        ring(0);
     }
 }

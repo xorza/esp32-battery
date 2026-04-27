@@ -40,7 +40,13 @@ static PREV_VPRINTF: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Call once at startup. Installs the vprintf hook.
 pub fn init() {
-    *RING.lock().unwrap() = Some(Ring::new(BUF_SIZE));
+    // Backing storage in BSS — Ring borrows it for the program's life.
+    static mut RING_BUF: [u8; BUF_SIZE] = [0u8; BUF_SIZE];
+    // SAFETY: init() runs once at boot; the static is referenced only
+    // through the resulting Ring inside RING (mutex-guarded).
+    let ptr = &raw mut RING_BUF;
+    let buf: &'static mut [u8] = unsafe { &mut *ptr };
+    *RING.lock().unwrap() = Some(Ring::from_buf(buf));
     let prev = unsafe { sys::esp_log_set_vprintf(Some(vprintf_hook)) };
     PREV_VPRINTF.store(
         prev.map_or(std::ptr::null_mut(), |f| f as *mut ()),
