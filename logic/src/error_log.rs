@@ -101,8 +101,10 @@ impl EventLog {
         if self.recent.is_full() {
             self.recent.pop_front();
         }
-        // push_back can't fail here — we just freed a slot if needed.
-        let _ = self.recent.push_back(TimedEvent { ts, event });
+        self.recent
+            .push_back(TimedEvent { ts, event })
+            .ok()
+            .expect("ring has a free slot after pop_front");
         match event {
             Event::Ina(k) => {
                 let i = k.index();

@@ -241,7 +241,7 @@ pub(crate) fn mount_uri<E, F>(
 {
     server
         .fn_handler(uri, method, f)
-        .unwrap_or_else(|e| panic!("failed to mount {} {:?}: {:?}", uri, method, e));
+        .unwrap_or_else(|e| panic!("failed to mount handler for {method:?} {uri}: {e:?}"));
 }
 
 pub(crate) fn mount_get<E, F>(server: &mut EspHttpServer<'static>, uri: &'static str, f: F)
