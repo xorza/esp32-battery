@@ -145,12 +145,12 @@ pub struct Setpoints {
 /// output was on or the read itself failed.
 #[derive(Copy, Clone, Default)]
 pub struct PollResult {
+    pub battery: Option<BatterySample>,
     pub setpoints: Option<Setpoints>,
     /// Whether the buck's OUTPUT_EN register currently reads 1. `None`
     /// only when the Modbus read failed (same condition as
     /// `setpoints.is_none()`).
     pub output_on: Option<bool>,
-    pub battery: Option<BatterySample>,
     pub protection_status: Option<XyProtectionStatus>,
 }
 
