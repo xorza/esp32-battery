@@ -452,7 +452,7 @@ fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
     }
     error!("XY boot failed after {BOOT_RETRY_COUNT} attempts — rebooting MCU");
     recorder.record(Event::Xy(XyError::BootSequence));
-    shutdown_or_reboot(xy, "pre-reboot", true);
+    shutdown_or_reboot(xy, "pre-reboot", true, recorder);
 }
 
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
@@ -500,7 +500,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
                     .unwrap_or("<non-string panic>");
                 error!("XY supervisor thread PANICKED: {msg} — forcing output OFF");
                 recorder.record(Event::Xy(XyError::SupervisorPanic));
-                shutdown_or_reboot(&xy, "post-panic", false);
+                shutdown_or_reboot(&xy, "post-panic", false, &recorder);
                 return;
             }
         }
@@ -510,7 +510,7 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         "XY recovery budget exhausted ({} attempts) — forcing output OFF",
         charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
     );
-    shutdown_or_reboot(&xy, "recovery-exhausted", false);
+    shutdown_or_reboot(&xy, "recovery-exhausted", false, &recorder);
 }
 
 /// Best-effort `set_output(false)` then either exit (buck is OFF) or
@@ -518,7 +518,12 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
 /// (boot failure), or triggered by a failed disable — leaving the buck
 /// sourcing with no supervisor and no WDT is the one thing we never want.
 /// S_INI=0 ensures the buck comes back OFF after the reboot.
-fn shutdown_or_reboot<D: XyDevice>(xy: &D, ctx: &'static str, force_reboot: bool) {
+fn shutdown_or_reboot<D: XyDevice>(
+    xy: &D,
+    ctx: &'static str,
+    force_reboot: bool,
+    recorder: &EventRecorder,
+) {
     let disable_ok = match xy.set_output(false) {
         Ok(()) => {
             error!("XY {ctx} set_output(false) succeeded — buck is OFF");
@@ -526,6 +531,7 @@ fn shutdown_or_reboot<D: XyDevice>(xy: &D, ctx: &'static str, force_reboot: bool
         }
         Err(e) => {
             error!("XY {ctx} set_output(false) FAILED: {e}");
+            recorder.record(Event::Xy(XyError::SetOutput));
             false
         }
     };
@@ -669,7 +675,7 @@ fn make_device(pins: XyPins) -> fake::Xy<'static> {
 pub fn start(pins: XyPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     thread::Builder::new()
         .name("xy".into())
-        .stack_size(4096)
+        .stack_size(8192)
         .spawn(move || run(make_device(pins), sensor_data, recorder))
         .unwrap();
 }

@@ -212,9 +212,13 @@ impl XyProtectionStatus {
             // Input-side and over-temp issues that genuinely clear with
             // time (AC sag returns, fan cools the case).
             Self::Lvp | Self::Otp => true,
-            // Output went off but the device reports no protection —
-            // front-panel toggle or external write. Safe to bring back.
-            Self::Normal => true,
+            // Output went off but the device reports no protection.
+            // Means a front-panel toggle, external Modbus write, or
+            // EMI on the panel button GPIO — all human/environmental
+            // causes that warrant someone looking. Auto-recovering
+            // would just burn the restart budget on something that
+            // didn't fix itself.
+            Self::Normal => false,
             // Output / pack / load problems that need someone to look.
             Self::Ovp
             | Self::Ocp
@@ -325,9 +329,11 @@ impl FaultReason {
     pub fn recovery_healthy_for(self) -> Option<Duration> {
         match self {
             // Only recover when the device-reported cause is one we
-            // believe is transient (LVP/OTP/Normal). For OCP/OVP/etc.
-            // we'd be re-energizing into a possibly-still-tripped
-            // condition — require a reboot. Cause=None (PROTECT read
+            // believe is transient (LVP/OTP). OCP/OVP/etc. would be
+            // re-energizing into a possibly-still-tripped condition.
+            // Normal means human/environmental cause (panel toggle,
+            // external write, EMI on the button GPIO) — not transient
+            // in the sense that matters. Cause=None (PROTECT read
             // failed): conservative, treat as non-recoverable.
             Self::OutputUnexpectedlyOff(Some(cause)) if cause.is_recoverable() => {
                 Some(OUTPUT_RECOVERY_HEALTHY)
@@ -359,7 +365,9 @@ pub enum Action {
     /// successfully written yet — re-emits each tick until acked, so a
     /// transient Modbus glitch on the write retries instead of latching
     /// `SettingsDrift`.
-    UpdateVoltage { target_v: f32 },
+    UpdateVoltage {
+        target_v: f32,
+    },
     DisableOutput(FaultReason),
     /// Latched fault is recoverable, the world has looked healthy
     /// (Modbus up, output off, finite battery below OV) for the
@@ -693,8 +701,20 @@ impl ChargeSupervisor {
         // — emit EnableOutput and stay Pending until the caller acks.
         // Phase machine doesn't run yet (output is OFF, no current
         // measurement is meaningful).
+        //
+        // Require at least one successful setpoint readback before
+        // energizing — `boot_sequence` already verified the writes, but
+        // demanding fresh closed-loop confirmation here means we never
+        // ask for output-on until the Modbus link is demonstrably alive.
+        // The modbus_err debounce above eventually fails closed on
+        // sustained read failures, but takes 5 s; this gate avoids
+        // emitting EnableOutput in the meantime.
         if pending {
-            return Action::EnableOutput;
+            return if p.setpoints.is_some() {
+                Action::EnableOutput
+            } else {
+                Action::None
+            };
         }
 
         // Re-emit UpdateVoltage until the caller acks the previous one.
@@ -764,9 +784,8 @@ impl ChargeSupervisor {
                     && b.voltage <= self.profile.absorb_v + OV_MARGIN_V
             })
             .unwrap_or(false);
-        let healthy = p.setpoints.is_some()
-            && matches!(p.output, Some(BuckOutput::Off { .. }))
-            && battery_ok;
+        let healthy =
+            p.setpoints.is_some() && matches!(p.output, Some(BuckOutput::Off { .. })) && battery_ok;
         if !healthy {
             self.recovery_elapsed = Duration::ZERO;
             return Action::None;

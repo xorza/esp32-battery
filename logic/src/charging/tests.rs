@@ -117,7 +117,10 @@ fn latch_self_disable(s: &mut ChargeSupervisor, cause: Option<XyProtectionStatus
         ..expected_poll(s, b(OK_V, -0.1))
     };
     let a = s.tick(p, TICK);
-    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(cause)));
+    assert!(matches_disable(
+        &a,
+        FaultReason::OutputUnexpectedlyOff(cause)
+    ));
     s.ack_disable();
 }
 
@@ -888,10 +891,16 @@ fn setpoint_drift_v_set_latches_immediately() {
     // the 0.02 V tolerance.
     let mut s = active(lfp_4s());
     let p = PollResult {
-        setpoints: Some(Setpoints { v_set: 12.0, i_set: 10.0 }),
+        setpoints: Some(Setpoints {
+            v_set: 12.0,
+            i_set: 10.0,
+        }),
         ..expected_poll(&s, b(13.5, -0.1))
     };
-    assert!(matches_disable(&s.tick(p, TICK), FaultReason::SettingsDrift));
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::SettingsDrift
+    ));
 }
 
 #[test]
@@ -899,10 +908,16 @@ fn setpoint_drift_i_set_latches_immediately() {
     // Float target is 13.5 V (matches), but I_SET disagrees with the 10 A regulation.
     let mut s = active(lfp_4s());
     let p = PollResult {
-        setpoints: Some(Setpoints { v_set: 13.5, i_set: 5.0 }),
+        setpoints: Some(Setpoints {
+            v_set: 13.5,
+            i_set: 5.0,
+        }),
         ..expected_poll(&s, b(13.5, -0.1))
     };
-    assert!(matches_disable(&s.tick(p, TICK), FaultReason::SettingsDrift));
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::SettingsDrift
+    ));
 }
 
 #[test]
@@ -910,7 +925,10 @@ fn setpoint_within_tolerance_no_drift_fault() {
     // 0.01 V off — one register quantum, under the 0.02 tolerance.
     let mut s = active(lfp_4s());
     let p = PollResult {
-        setpoints: Some(Setpoints { v_set: 13.51, i_set: 10.0 }),
+        setpoints: Some(Setpoints {
+            v_set: 13.51,
+            i_set: 10.0,
+        }),
         ..expected_poll(&s, b(13.5, -0.1))
     };
     assert!(matches!(s.tick(p, TICK), Action::None));
@@ -927,10 +945,16 @@ fn setpoint_drift_does_not_overwrite_existing_latch() {
     }
     assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
     let p = PollResult {
-        setpoints: Some(Setpoints { v_set: 12.0, i_set: 10.0 }),
+        setpoints: Some(Setpoints {
+            v_set: 12.0,
+            i_set: 10.0,
+        }),
         ..expected_poll(&s, b(13.5, -0.1))
     };
-    assert!(matches_disable(&s.tick(p, TICK), FaultReason::ModbusUnhealthy));
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::ModbusUnhealthy
+    ));
 }
 
 // --- Pending → Active bring-up ---
@@ -968,10 +992,16 @@ fn pending_overvolt_latches_without_debounce() {
 fn pending_drift_latches_without_enabling() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     let p = PollResult {
-        setpoints: Some(Setpoints { v_set: 12.0, i_set: 10.0 }),
+        setpoints: Some(Setpoints {
+            v_set: 12.0,
+            i_set: 10.0,
+        }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
-    assert!(matches_disable(&s.tick(p, TICK), FaultReason::SettingsDrift));
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::SettingsDrift
+    ));
 }
 
 #[test]
@@ -1003,7 +1033,10 @@ fn buck_self_disable_in_active_latches() {
         output: Some(BuckOutput::Off { cause: None }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
-    assert!(matches_disable(&s.tick(p, TICK), FaultReason::OutputUnexpectedlyOff(None)));
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::OutputUnexpectedlyOff(None)
+    ));
 }
 
 #[test]
@@ -1018,7 +1051,10 @@ fn should_restart_after_healthy_window() {
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         // Recovery accumulates via tick; pre-threshold ticks return None.
         assert!(matches!(s.tick(p, TICK), Action::None));
-        assert!(matches!(s.fault(), Some(FaultReason::OutputUnexpectedlyOff(_))));
+        assert!(matches!(
+            s.fault(),
+            Some(FaultReason::OutputUnexpectedlyOff(_))
+        ));
     }
     // The Nth healthy tick crosses the threshold.
     assert!(restart_ready(&mut s, p, TICK));
@@ -1150,6 +1186,9 @@ fn should_restart_false_for_non_recoverable_protection_cause() {
         Some(XyProtectionStatus::Opp),
         Some(XyProtectionStatus::Icp),
         Some(XyProtectionStatus::Unknown(99)),
+        // PROTECT=Normal: panel toggle / external write / EMI on the
+        // button GPIO. Warrants a human, not an auto-restart.
+        Some(XyProtectionStatus::Normal),
         None, // PROTECT read failed
     ] {
         let mut s = active(lfp_4s());
@@ -1199,6 +1238,28 @@ fn update_voltage_retries_until_acked() {
 }
 
 #[test]
+fn pending_does_not_enable_without_setpoint_readback() {
+    // boot_sequence verified setpoints, but the supervisor still requires
+    // a fresh successful readback before energizing — otherwise we'd ask
+    // for output-on with no closed-loop confirmation the buck is even
+    // reachable. Modbus-down ticks emit None until the modbus_err
+    // debounce eventually latches ModbusUnhealthy.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p = PollResult {
+        setpoints: None,
+        output: None,
+        battery: b(OK_V, -0.1),
+    };
+    // Below the modbus_err debounce window: no fault, no enable.
+    for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {
+        assert!(matches!(s.tick(p, TICK), Action::None));
+    }
+    // Recovery via a successful readback emits EnableOutput on that tick.
+    let p_ok = expected_poll(&s, b(OK_V, -0.1));
+    assert!(matches!(s.tick(p_ok, TICK), Action::EnableOutput));
+}
+
+#[test]
 fn buck_output_off_in_pending_does_not_fault() {
     // In Pending the buck IS supposed to be off — output_on=Some(false)
     // is normal, must not latch. expected_poll for Pending returns Off.
@@ -1218,7 +1279,10 @@ fn buck_output_on_in_pending_latches() {
         output: Some(BuckOutput::On),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
-    assert!(matches_disable(&s.tick(p, TICK), FaultReason::OutputOnInPending));
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::OutputOnInPending
+    ));
     // Non-recoverable: caller must reboot, not retry.
     assert_eq!(FaultReason::OutputOnInPending.recovery_healthy_for(), None);
 }
