@@ -502,6 +502,10 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
 
         // catch_unwind shields the recovery loop from panics in tick /
         // apply_action. Ok(()) = tick asked for restart; Err = panic.
+        // Asymmetric with `ina.rs`, which lets panics propagate to the
+        // panic hook: the XY drives the buck output, so on panic we want
+        // a graceful `set_output(false)` attempt before the hook reboots
+        // — INA is a read-only sensor with no such obligation.
         let result = catch_unwind(AssertUnwindSafe(|| {
             supervise_loop(&xy, &sensor_data, &recorder, &mut supervisor, &wdt)
         }));
