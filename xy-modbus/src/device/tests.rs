@@ -48,12 +48,7 @@ impl ModbusTransport for MockTransport {
             _ => panic!("expected read"),
         }
     }
-    fn write_single_holding(
-        &mut self,
-        _slave: u8,
-        addr: u16,
-        value: u16,
-    ) -> Result<(), RtuError> {
+    fn write_single_holding(&mut self, _slave: u8, addr: u16, value: u16) -> Result<(), RtuError> {
         let op = self.script.remove(0);
         match op {
             Op::WriteOne { addr: a, value: v } => {
@@ -393,9 +388,12 @@ fn one_shot_setters_use_correct_addr_and_value() {
     check!(REG_SLAVE_ADDR, 7, |x: &mut Xy<_>| x.set_slave_address(7));
     check!(REG_S_INI, 1, |x: &mut Xy<_>| x.set_power_on_output(true));
     check!(REG_EXTRACT_M, 3, |x: &mut Xy<_>| x.recall_group(3));
-    check!(REG_BAUD_CODE, 6, |x: &mut Xy<_>| x.set_baud_rate(BaudRate::B115200));
-    check!(REG_BAUD_CODE, 99, |x: &mut Xy<_>| x.set_baud_rate(BaudRate::Unknown(99)));
-    check!(REG_TEMP_UNIT, 1, |x: &mut Xy<_>| x.set_temp_unit(TempUnit::Fahrenheit));
+    check!(REG_BAUD_CODE, 6, |x: &mut Xy<_>| x
+        .set_baud_rate(BaudRate::B115200));
+    check!(REG_BAUD_CODE, 99, |x: &mut Xy<_>| x
+        .set_baud_rate(BaudRate::Unknown(99)));
+    check!(REG_TEMP_UNIT, 1, |x: &mut Xy<_>| x
+        .set_temp_unit(TempUnit::Fahrenheit));
 }
 
 /// Pins (register address, returned raw, expected decoded value) for each
@@ -421,15 +419,45 @@ fn one_shot_getters_use_correct_addr_and_scale() {
     check!(REG_BACKLIGHT, 4, |x: &mut Xy<_>| x.read_backlight(), 4u8);
     check!(REG_SLEEP, 15, |x: &mut Xy<_>| x.read_sleep_minutes(), 15u16);
     check!(REG_BUZZER, 0, |x: &mut Xy<_>| x.read_buzzer(), false);
-    check!(REG_SLAVE_ADDR, 7, |x: &mut Xy<_>| x.read_slave_address(), 7u8);
+    check!(
+        REG_SLAVE_ADDR,
+        7,
+        |x: &mut Xy<_>| x.read_slave_address(),
+        7u8
+    );
     check!(REG_S_INI, 1, |x: &mut Xy<_>| x.read_power_on_output(), true);
     check!(REG_MODEL, 0x6100, |x: &mut Xy<_>| x.read_model(), 0x6100u16);
     check!(REG_VERSION, 0x71, |x: &mut Xy<_>| x.read_version(), 0x71u16);
-    check!(REG_T_IN_OFFSET, 15, |x: &mut Xy<_>| x.read_temp_offset_internal(), 1.5);
-    check!(REG_T_EX_OFFSET, 20, |x: &mut Xy<_>| x.read_temp_offset_external(), 2.0);
-    check!(REG_CVCC, 0, |x: &mut Xy<_>| x.read_reg_mode(), RegMode::ConstantVoltage);
-    check!(REG_CVCC, 1, |x: &mut Xy<_>| x.read_reg_mode(), RegMode::ConstantCurrent);
-    check!(REG_BAUD_CODE, 6, |x: &mut Xy<_>| x.read_baud_rate(), BaudRate::B115200);
+    check!(
+        REG_T_IN_OFFSET,
+        15,
+        |x: &mut Xy<_>| x.read_temp_offset_internal(),
+        1.5
+    );
+    check!(
+        REG_T_EX_OFFSET,
+        20,
+        |x: &mut Xy<_>| x.read_temp_offset_external(),
+        2.0
+    );
+    check!(
+        REG_CVCC,
+        0,
+        |x: &mut Xy<_>| x.read_reg_mode(),
+        RegMode::ConstantVoltage
+    );
+    check!(
+        REG_CVCC,
+        1,
+        |x: &mut Xy<_>| x.read_reg_mode(),
+        RegMode::ConstantCurrent
+    );
+    check!(
+        REG_BAUD_CODE,
+        6,
+        |x: &mut Xy<_>| x.read_baud_rate(),
+        BaudRate::B115200
+    );
 
     // 2-reg bulk reads.
     let mut xy = Xy::new(
@@ -539,12 +567,7 @@ fn rtu_error_propagates() {
         fn write_single_holding(&mut self, _: u8, _: u16, _: u16) -> Result<(), RtuError> {
             unreachable!()
         }
-        fn write_multiple_holdings(
-            &mut self,
-            _: u8,
-            _: u16,
-            _: &[u16],
-        ) -> Result<(), RtuError> {
+        fn write_multiple_holdings(&mut self, _: u8, _: u16, _: &[u16]) -> Result<(), RtuError> {
             unreachable!()
         }
     }

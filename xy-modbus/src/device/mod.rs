@@ -356,8 +356,22 @@ impl<T: ModbusTransport> Xy<T> {
 
 fn decode_group(r: &[u16; GROUP_LEN as usize], model: Model) -> GroupParams {
     let i_scale = model.current_scale();
-    let [v_set, i_set, s_lvp, s_ovp, s_ocp, s_opp, s_ohp_h, s_ohp_m, s_oah_low, s_oah_high, s_owh_low, s_owh_high, s_otp, s_ini] =
-        *r;
+    let [
+        v_set,
+        i_set,
+        s_lvp,
+        s_ovp,
+        s_ocp,
+        s_opp,
+        s_ohp_h,
+        s_ohp_m,
+        s_oah_low,
+        s_oah_high,
+        s_owh_low,
+        s_owh_high,
+        s_otp,
+        s_ini,
+    ] = *r;
     GroupParams {
         v_set: from_reg(v_set, 100.0),
         i_set: from_reg(i_set, i_scale),
