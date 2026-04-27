@@ -16,6 +16,10 @@ pub const FN_WRITE_MULTIPLE: u8 = 0x10;
 /// Maximum Modbus-RTU ADU size (slave + PDU + CRC).
 pub const MAX_ADU: usize = 256;
 
+/// Maximum registers in a single `Read Holding Registers` request
+/// (Modbus standard limit).
+pub const MAX_READ_REGS: usize = 125;
+
 /// Maximum registers in a single `Write Multiple Holdings` request
 /// (Modbus standard limit).
 pub const MAX_WRITE_REGS: usize = 123;

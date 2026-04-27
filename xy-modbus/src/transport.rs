@@ -43,10 +43,10 @@ impl fmt::Display for ModbusError {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RtuError {
-    /// UART read failed or timed out before any bytes arrived.
-    UartRead,
-    /// UART write failed.
-    UartWrite,
+    /// No (or insufficient) bytes received within the response window.
+    Timeout,
+    /// Underlying UART returned an I/O error on read or write.
+    Io,
     /// Decoded response was invalid or the slave reported a Modbus
     /// exception.
     Modbus(ModbusError),
@@ -55,8 +55,8 @@ pub enum RtuError {
 impl fmt::Display for RtuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UartRead => f.write_str("UART read failed"),
-            Self::UartWrite => f.write_str("UART write failed"),
+            Self::Timeout => f.write_str("UART response timed out"),
+            Self::Io => f.write_str("UART I/O error"),
             Self::Modbus(e) => fmt::Display::fmt(e, f),
         }
     }

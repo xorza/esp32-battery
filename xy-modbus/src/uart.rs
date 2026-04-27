@@ -20,8 +20,9 @@ use embedded_hal::delay::DelayNs;
 use embedded_io::{Read, ReadReady, Write};
 
 use crate::framing::{
-    MAX_ADU, build_read_request, build_write_multiple_request, build_write_single_request,
-    parse_read_response, parse_write_multiple_response, parse_write_single_response,
+    MAX_ADU, MAX_READ_REGS, MAX_WRITE_REGS, build_read_request, build_write_multiple_request,
+    build_write_single_request, parse_read_response, parse_write_multiple_response,
+    parse_write_single_response,
 };
 use crate::transport::{ModbusTransport, RtuError};
 
@@ -71,39 +72,51 @@ where
         }
     }
 
+    /// Enforce ≥t3.5 bus silence before the next master frame, then
+    /// flush any noise that arrived during the gap.
+    fn pre_tx_silence(&mut self) {
+        self.delay.delay_ms(self.inter_frame_ms);
+        self.drain_rx();
+    }
+
     fn write_all(&mut self, mut buf: &[u8]) -> Result<(), RtuError> {
         while !buf.is_empty() {
             match self.uart.write(buf) {
-                Ok(0) => return Err(RtuError::UartWrite),
+                Ok(0) => return Err(RtuError::Io),
                 Ok(n) => buf = &buf[n..],
-                Err(_) => return Err(RtuError::UartWrite),
+                Err(_) => return Err(RtuError::Io),
             }
         }
-        self.uart.flush().map_err(|_| RtuError::UartWrite)?;
+        self.uart.flush().map_err(|_| RtuError::Io)?;
         Ok(())
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), RtuError> {
         let mut filled = 0;
         let mut idle_ms = 0u32;
+        let mut total_ms = 0u32;
+        // Wall-clock budget: the response window plus enough char-time slack
+        // to receive a full max-ADU at typical XY baud (9600 ≈ 270 ms).
+        let total_budget = self.response_timeout_ms.saturating_add(500);
         while filled < buf.len() {
             match self.uart.read_ready() {
                 Ok(true) => match self.uart.read(&mut buf[filled..]) {
-                    Ok(0) => return Err(RtuError::UartRead),
+                    Ok(0) => return Err(RtuError::Io),
                     Ok(n) => {
                         filled += n;
                         idle_ms = 0;
                     }
-                    Err(_) => return Err(RtuError::UartRead),
+                    Err(_) => return Err(RtuError::Io),
                 },
                 Ok(false) => {
-                    if idle_ms >= self.response_timeout_ms {
-                        return Err(RtuError::UartRead);
+                    if idle_ms >= self.response_timeout_ms || total_ms >= total_budget {
+                        return Err(RtuError::Timeout);
                     }
                     self.delay.delay_ms(1);
                     idle_ms += 1;
+                    total_ms += 1;
                 }
-                Err(_) => return Err(RtuError::UartRead),
+                Err(_) => return Err(RtuError::Io),
             }
         }
         Ok(())
@@ -116,7 +129,7 @@ where
         buf: &'b mut [u8],
         full_len: usize,
     ) -> Result<&'b [u8], RtuError> {
-        debug_assert!(full_len >= 5 && full_len <= buf.len());
+        assert!(full_len >= 5 && full_len <= buf.len());
         self.read_exact(&mut buf[..3])?;
         if buf[1] & 0x80 != 0 {
             self.read_exact(&mut buf[3..5])?;
@@ -140,18 +153,18 @@ where
         addr: u16,
         dst: &mut [u16],
     ) -> Result<(), RtuError> {
-        assert!(!dst.is_empty() && dst.len() <= 125);
+        assert!(slave != 0, "read does not support broadcast");
+        assert!(!dst.is_empty() && dst.len() <= MAX_READ_REGS);
         let count = dst.len() as u16;
         let req = build_read_request(slave, addr, count);
         let expected_len = 5 + 2 * dst.len();
 
-        self.drain_rx();
+        self.pre_tx_silence();
         self.write_all(&req)?;
 
         let mut buf = [0u8; MAX_ADU];
         let resp = self.read_response(&mut buf, expected_len)?;
         parse_read_response(resp, slave, dst)?;
-        self.delay.delay_ms(self.inter_frame_ms);
         Ok(())
     }
 
@@ -161,15 +174,15 @@ where
         addr: u16,
         value: u16,
     ) -> Result<(), RtuError> {
+        assert!(slave != 0, "single-register write does not support broadcast");
         let req = build_write_single_request(slave, addr, value);
 
-        self.drain_rx();
+        self.pre_tx_silence();
         self.write_all(&req)?;
 
         let mut buf = [0u8; 8];
         let resp = self.read_response(&mut buf, 8)?;
         parse_write_single_response(resp, &req)?;
-        self.delay.delay_ms(self.inter_frame_ms);
         Ok(())
     }
 
@@ -179,17 +192,18 @@ where
         addr: u16,
         values: &[u16],
     ) -> Result<(), RtuError> {
+        assert!(slave != 0, "multi-register write does not support broadcast");
+        assert!(!values.is_empty() && values.len() <= MAX_WRITE_REGS);
         let mut req = [0u8; MAX_ADU];
         let n = build_write_multiple_request(slave, addr, values, &mut req)
-            .expect("values length validated by caller");
+            .expect("inputs validated above");
 
-        self.drain_rx();
+        self.pre_tx_silence();
         self.write_all(&req[..n])?;
 
         let mut buf = [0u8; 8];
         let resp = self.read_response(&mut buf, 8)?;
         parse_write_multiple_response(resp, slave, addr, values.len() as u16)?;
-        self.delay.delay_ms(self.inter_frame_ms);
         Ok(())
     }
 }
@@ -352,7 +366,7 @@ mod tests {
         let mut out = [0u16; 1];
         assert_eq!(
             t.read_holding(0x01, 0x0000, &mut out).unwrap_err(),
-            RtuError::UartRead
+            RtuError::Timeout
         );
     }
 
