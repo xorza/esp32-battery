@@ -34,6 +34,7 @@ fn ok_tick(s: &mut ChargeSupervisor, battery: Option<BatterySample>, elapsed: Du
         setpoints: Some(s.expected_setpoints()),
         output_on: Some(s.expected_output_on()),
         battery,
+        protection_status: None,
     };
     s.tick(p, elapsed)
 }
@@ -50,6 +51,7 @@ fn fail_tick(
             setpoints: None,
             output_on: None,
             battery,
+            protection_status: None,
         },
         elapsed,
     )
@@ -866,6 +868,7 @@ fn setpoint_drift_v_set_latches_immediately() {
             setpoints: bad,
             output_on: Some(true),
             battery: b(13.5, -0.1),
+            protection_status: None,
         },
         TICK,
     );
@@ -885,6 +888,7 @@ fn setpoint_drift_i_set_latches_immediately() {
             setpoints: bad,
             output_on: Some(true),
             battery: b(13.5, -0.1),
+            protection_status: None,
         },
         TICK,
     );
@@ -904,6 +908,7 @@ fn setpoint_within_tolerance_no_drift_fault() {
             setpoints: close,
             output_on: Some(true),
             battery: b(13.5, -0.1),
+            protection_status: None,
         },
         TICK,
     );
@@ -929,6 +934,7 @@ fn setpoint_drift_does_not_overwrite_existing_latch() {
             setpoints: bad,
             output_on: Some(true),
             battery: b(13.5, -0.1),
+            protection_status: None,
         },
         TICK,
     );
@@ -978,6 +984,7 @@ fn pending_drift_latches_without_enabling() {
             setpoints: bad,
             output_on: Some(false),
             battery: b(OK_V, -0.1),
+            protection_status: None,
         },
         TICK,
     );
@@ -1013,6 +1020,7 @@ fn buck_self_disable_in_active_latches() {
         setpoints: Some(s.expected_setpoints()),
         output_on: Some(false),
         battery: b(OK_V, -0.1),
+        protection_status: None,
     };
     let a = s.tick(p, TICK);
     assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff));
@@ -1026,6 +1034,7 @@ fn latch_self_disable(s: &mut ChargeSupervisor) {
             setpoints: Some(s.expected_setpoints()),
             output_on: Some(false),
             battery: b(OK_V, -0.1),
+            protection_status: None,
         },
         TICK,
     );
@@ -1040,6 +1049,7 @@ fn healthy_recovery_poll(s: &ChargeSupervisor) -> PollResult {
         setpoints: Some(s.expected_setpoints()),
         output_on: Some(false),
         battery: b(OK_V, -0.1),
+        protection_status: None,
     }
 }
 
@@ -1185,6 +1195,7 @@ fn buck_output_off_in_pending_does_not_fault() {
         setpoints: Some(s.expected_setpoints()),
         output_on: Some(false),
         battery: b(OK_V, -0.1),
+        protection_status: None,
     };
     let a = s.tick(p, TICK);
     assert!(matches!(a, Action::EnableOutput));

@@ -140,6 +140,9 @@ pub struct Setpoints {
 /// `setpoints` and `output_on` come from the same Modbus read and fail
 /// together; `setpoints.is_some()` doubles as the modbus-healthy signal.
 /// `battery` is independent — it's the latest fresh INA228 reading.
+/// `protection_status` is read **only** when the buck reports output OFF
+/// (it's necessarily Normal while output is on); `None` means either
+/// output was on or the read itself failed.
 #[derive(Copy, Clone, Default)]
 pub struct PollResult {
     pub setpoints: Option<Setpoints>,
@@ -148,6 +151,63 @@ pub struct PollResult {
     /// `setpoints.is_none()`).
     pub output_on: Option<bool>,
     pub battery: Option<BatterySample>,
+    pub protection_status: Option<XyProtectionStatus>,
+}
+
+/// Latched protection cause read from XY register 0x0010 (PROTECT). Per
+/// the XY6020L Modbus interface doc (Note 3 — same module family as the
+/// XY7025), 0 means normal operation; non-zero values name which
+/// hardware protection most recently tripped. The register stays latched
+/// until the caller writes 0 to 0x0010.
+#[derive(Copy, Clone, PartialEq, Eq, strum::Display)]
+#[strum(serialize_all = "lowercase")]
+pub enum XyProtectionStatus {
+    Normal,
+    /// Output overvoltage. Also fires transiently when V_SET is raised
+    /// above current V_OUT.
+    Ovp,
+    /// Output overcurrent.
+    Ocp,
+    /// Output overpower.
+    Opp,
+    /// Input undervoltage (LVP setpoint, not pack-side).
+    Lvp,
+    /// Over amp-hour.
+    Oah,
+    /// Output high-power time exceeded.
+    Ohp,
+    /// Over temperature.
+    Otp,
+    /// Over energy.
+    Oep,
+    /// Over watt-hour.
+    Owh,
+    /// Input overcurrent.
+    Icp,
+    /// Register read back a value not in the documented 0–10 range. We
+    /// don't trust the device in this state — recovery treats Unknown as
+    /// not-Normal so it stays gated.
+    #[strum(to_string = "unknown({0})")]
+    Unknown(u16),
+}
+
+impl XyProtectionStatus {
+    pub fn from_register(raw: u16) -> Self {
+        match raw {
+            0 => Self::Normal,
+            1 => Self::Ovp,
+            2 => Self::Ocp,
+            3 => Self::Opp,
+            4 => Self::Lvp,
+            5 => Self::Oah,
+            6 => Self::Ohp,
+            7 => Self::Otp,
+            8 => Self::Oep,
+            9 => Self::Owh,
+            10 => Self::Icp,
+            other => Self::Unknown(other),
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, IntoStaticStr)]

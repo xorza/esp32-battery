@@ -22,7 +22,7 @@ use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
     self, Action, BatterySample, ChargeSupervisor, Chemistry, PollResult, Profile, SafetyLimits,
-    Setpoints,
+    Setpoints, XyProtectionStatus,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
@@ -52,64 +52,6 @@ struct XyStatus {
     i_out: f32,
     p_out: f32,
     v_in: f32,
-}
-
-/// Latched protection cause read from XY register 0x0010 (PROTECT). Per
-/// the XY6020L Modbus interface doc (Note 3 — same module family as the
-/// XY7025), 0 means normal operation; non-zero values name which
-/// hardware protection most recently tripped. The register stays latched
-/// until cleared via `clear_protection_status` (write 0 to 0x0010).
-#[allow(dead_code)] // variants surfaced once the supervisor consumes them
-#[derive(Copy, Clone, PartialEq, Eq, strum::Display)]
-#[strum(serialize_all = "lowercase")]
-enum XyProtectionStatus {
-    Normal,
-    /// Output overvoltage. Also fires transiently when V_SET is raised
-    /// above current V_OUT.
-    Ovp,
-    /// Output overcurrent.
-    Ocp,
-    /// Output overpower.
-    Opp,
-    /// Input undervoltage (LVP setpoint, not pack-side).
-    Lvp,
-    /// Over amp-hour.
-    Oah,
-    /// Output high-power time exceeded.
-    Ohp,
-    /// Over temperature.
-    Otp,
-    /// Over energy.
-    Oep,
-    /// Over watt-hour.
-    Owh,
-    /// Input overcurrent.
-    Icp,
-    /// Register read back a value not in the documented 0–10 range. We
-    /// don't trust the device in this state — recovery treats Unknown as
-    /// not-Normal so it stays gated.
-    #[strum(to_string = "unknown({0})")]
-    Unknown(u16),
-}
-
-impl XyProtectionStatus {
-    #[allow(dead_code)] // wired in once the supervisor gates recovery on it
-    fn from_register(raw: u16) -> Self {
-        match raw {
-            0 => Self::Normal,
-            1 => Self::Ovp,
-            2 => Self::Ocp,
-            3 => Self::Opp,
-            4 => Self::Lvp,
-            5 => Self::Oah,
-            6 => Self::Ohp,
-            7 => Self::Otp,
-            8 => Self::Oep,
-            9 => Self::Owh,
-            10 => Self::Icp,
-            other => Self::Unknown(other),
-        }
-    }
 }
 
 /// The set of operations the charging loop needs from the buck. Real
@@ -614,16 +556,25 @@ fn poll<D: XyDevice>(
     };
     // When the buck reports output OFF, ask why. PROTECT (0x0010) was
     // wiped during boot_sequence, so any non-Normal value here is a
-    // protection trip from the current session — diagnostically useful
-    // and (eventually) the gate for `should_restart`. While output is on
+    // protection trip from the current session — surfaced to the
+    // supervisor so it can gate `should_restart`. While output is on
     // PROTECT is necessarily Normal so we save the round-trip.
-    if output_on == Some(false) {
+    let protection_status = if output_on == Some(false) {
         match xy.read_protection_status() {
-            Ok(XyProtectionStatus::Normal) => {}
-            Ok(status) => warn!("XY PROTECT latched: {status}"),
-            Err(e) => warn!("XY read_protection_status: {e}"),
+            Ok(status) => {
+                if status != XyProtectionStatus::Normal {
+                    warn!("XY PROTECT latched: {status}");
+                }
+                Some(status)
+            }
+            Err(e) => {
+                warn!("XY read_protection_status: {e}");
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
     let battery = sd.battery_reading().map(|b| BatterySample {
         voltage: b.voltage,
         current: b.current,
@@ -632,6 +583,7 @@ fn poll<D: XyDevice>(
         setpoints,
         output_on,
         battery,
+        protection_status,
     }
 }
 
