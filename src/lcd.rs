@@ -12,7 +12,7 @@ use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::ascii::{FONT_5X8, FONT_6X10, FONT_10X20};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, Triangle};
+use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::Text;
 use esp_idf_hal::gpio::{AnyIOPin, PinDriver};
 use esp_idf_hal::ledc::{LedcDriver, LedcTimerDriver, config::TimerConfig};
@@ -27,31 +27,32 @@ use mipidsi::options::{Orientation, Rotation};
 use crate::board::LcdPins;
 use crate::net::{NetStatus, NetStatusHandle};
 
-// --- SPI / DMA ---
-
+// --- SPI ---
 const SPI_BUF_SIZE: usize = 32768;
 const DMA_BUF_SIZE: usize = 32768;
 
-// --- Timing ---
-
+// --- Display ---
+const DISPLAY_W: u32 = 320;
+const DISPLAY_H: u32 = 172;
+const LOWER_Y: i32 = 68;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const BACKLIGHT_PERCENT: u32 = 50;
 
 // --- Colors ---
-
 const COLOR_BG: Rgb565 = Rgb565::BLACK;
 const COLOR_LABEL: Rgb565 = Rgb565::new(18, 36, 18);
 const COLOR_VOLTAGE: Rgb565 = Rgb565::new(0, 63, 0);
 const COLOR_PSU_CURRENT: Rgb565 = Rgb565::new(31, 38, 0); // orange, matches #ff9800
 const COLOR_POWER: Rgb565 = Rgb565::new(31, 20, 0);
-const COLOR_CHARGING: Rgb565 = Rgb565::new(6, 55, 10); // green
-const COLOR_DISCHARGING: Rgb565 = Rgb565::new(31, 28, 0); // orange
-const COLOR_IDLE: Rgb565 = Rgb565::new(18, 36, 18); // light gray-green
-const COLOR_IP: Rgb565 = Rgb565::new(0, 57, 31); // cyan
+const COLOR_CHARGING: Rgb565 = Rgb565::new(6, 55, 10);
+const COLOR_DISCHARGING: Rgb565 = Rgb565::new(31, 28, 0);
+const COLOR_IDLE: Rgb565 = Rgb565::new(18, 36, 18);
+const COLOR_IP: Rgb565 = Rgb565::new(0, 57, 31);
 const COLOR_WARNING: Rgb565 = Rgb565::RED;
-/// Dead-band below which the battery is considered idle (|I| < 50 mA).
-const BATTERY_IDLE_THRESHOLD_A: f32 = 0.05;
 
 /// Sign convention: negative current = charging, positive = discharging.
+const BATTERY_IDLE_THRESHOLD_A: f32 = 0.05;
+
 fn battery_current_color(current: f32) -> Rgb565 {
     if current.abs() < BATTERY_IDLE_THRESHOLD_A {
         COLOR_IDLE
@@ -62,39 +63,48 @@ fn battery_current_color(current: f32) -> Rgb565 {
     }
 }
 
-// --- Layout ---
-
+// --- Layout (display-absolute pixels) ---
+//
+// Upper region (y < LOWER_Y): four 150×22 value cells in a 2×2 grid plus a
+// small uptime corner. Static labels above each cell are painted once at boot
+// directly to the display.
 const COL_LEFT: i32 = 5;
 const COL_RIGHT: i32 = 165;
+const LABEL_OFFSET_X: i32 = 8;
 const ROW1_LABEL_Y: i32 = 10;
-const ROW1_VALUE_Y: i32 = 30;
 const ROW2_LABEL_Y: i32 = 44;
-const ROW2_VALUE_Y: i32 = 62;
-const UPTIME_X: i32 = 240;
-
 const VALUE_W: u32 = 150;
 const VALUE_H: u32 = 22;
+const ROW1_TOP: i32 = 14;
+const ROW2_TOP: i32 = 46;
+const UPTIME_X: i32 = 240;
+const UPTIME_W: u32 = 80;
+const UPTIME_H: u32 = 12;
 
-const LOWER_Y: i32 = 68;
-const LOWER_W: u32 = 320;
-// The lower region is 104 px tall but rendered through a half-height
-// scratch buffer in two passes (top half then bottom half) to halve BSS
-// cost; pixels outside the buffer are clipped by `Framebuf::set_pixel`
-// and `fill_solid`.
-const LOWER_H: u32 = 52;
+// --- Scratch buffer ---
+//
+// Single 320×22 framebuffer (≈14 KB BSS) used for everything that needs
+// flicker-free composition: the upper value cells, the uptime corner, and
+// each lower-region text row. Lower-region overlays are painted only on
+// net-state change, so the per-row-blit cost is irrelevant.
+const SCRATCH_W: u32 = DISPLAY_W;
+const SCRATCH_H: u32 = 22;
+const SCRATCH_PX: usize = (SCRATCH_W * SCRATCH_H) as usize;
 
-/// Backlight brightness 0–100%.
-const BACKLIGHT_PERCENT: u32 = 50;
+// FONT_10X20 baseline within a 22-tall band — text drawn at this y lands
+// flush against the band's bottom with 2 px of headroom above.
+const BAND_BASELINE_LARGE: i32 = 16;
+// FONT_6X10 baseline within the same band — keeps labels near the top so a
+// label row blitted above its value row leaves visible spacing.
+const BAND_BASELINE_SMALL: i32 = 10;
 
-// --- Framebuffer ---
-
-struct Framebuf<const W: u32, const H: u32> {
+struct Scratch {
     pixels: &'static mut [Rgb565],
 }
 
-impl<const W: u32, const H: u32> Framebuf<W, H> {
+impl Scratch {
     fn from_buf(pixels: &'static mut [Rgb565]) -> Self {
-        assert_eq!(pixels.len(), (W * H) as usize);
+        assert_eq!(pixels.len(), SCRATCH_PX);
         pixels.fill(COLOR_BG);
         Self { pixels }
     }
@@ -103,41 +113,31 @@ impl<const W: u32, const H: u32> Framebuf<W, H> {
         self.pixels.fill(COLOR_BG);
     }
 
-    fn set_pixel(&mut self, x: i32, y: i32, color: Rgb565) {
-        if x >= 0 && x < W as i32 && y >= 0 && y < H as i32 {
-            self.pixels[y as usize * W as usize + x as usize] = color;
-        }
-    }
-
-    fn blit<D: DrawTarget<Color = Rgb565>>(&self, display: &mut D, top_left: Point)
+    /// Blit a `w × h` top-left subregion to the display.
+    fn blit<D>(&self, display: &mut D, at: Point, w: u32, h: u32)
     where
+        D: DrawTarget<Color = Rgb565>,
         D::Error: core::fmt::Debug,
     {
-        let area = Rectangle::new(top_left, Size::new(W, H));
-        display
-            .fill_contiguous(&area, self.pixels.iter().copied())
-            .unwrap();
-    }
-
-    fn blit_rows<D: DrawTarget<Color = Rgb565>>(&self, display: &mut D, top_left: Point, rows: u32)
-    where
-        D::Error: core::fmt::Debug,
-    {
-        let area = Rectangle::new(top_left, Size::new(W, rows));
-        let pixel_count = W as usize * rows as usize;
-        display
-            .fill_contiguous(&area, self.pixels[..pixel_count].iter().copied())
-            .unwrap();
+        let area = Rectangle::new(at, Size::new(w, h));
+        let row_w = SCRATCH_W as usize;
+        let take_w = w as usize;
+        let pixels = self
+            .pixels
+            .chunks(row_w)
+            .take(h as usize)
+            .flat_map(|row| row[..take_w].iter().copied());
+        display.fill_contiguous(&area, pixels).unwrap();
     }
 }
 
-impl<const W: u32, const H: u32> OriginDimensions for Framebuf<W, H> {
+impl OriginDimensions for Scratch {
     fn size(&self) -> Size {
-        Size::new(W, H)
+        Size::new(SCRATCH_W, SCRATCH_H)
     }
 }
 
-impl<const W: u32, const H: u32> DrawTarget for Framebuf<W, H> {
+impl DrawTarget for Scratch {
     type Color = Rgb565;
     type Error = core::convert::Infallible;
 
@@ -145,19 +145,21 @@ impl<const W: u32, const H: u32> DrawTarget for Framebuf<W, H> {
     where
         I: IntoIterator<Item = Pixel<Rgb565>>,
     {
-        for Pixel(point, color) in pixels {
-            self.set_pixel(point.x, point.y, color);
+        for Pixel(p, c) in pixels {
+            if p.x >= 0 && p.x < SCRATCH_W as i32 && p.y >= 0 && p.y < SCRATCH_H as i32 {
+                self.pixels[p.y as usize * SCRATCH_W as usize + p.x as usize] = c;
+            }
         }
         Ok(())
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Rgb565) -> Result<(), Self::Error> {
         let area = area.intersection(&Rectangle::new(Point::zero(), self.size()));
-        if let Some(bottom_right) = area.bottom_right() {
+        if let Some(br) = area.bottom_right() {
             let x0 = area.top_left.x as usize;
-            let w = (bottom_right.x - area.top_left.x + 1) as usize;
-            for y in area.top_left.y..=bottom_right.y {
-                let start = y as usize * W as usize + x0;
+            let w = (br.x - area.top_left.x + 1) as usize;
+            for y in area.top_left.y..=br.y {
+                let start = y as usize * SCRATCH_W as usize + x0;
                 self.pixels[start..start + w].fill(color);
             }
         }
@@ -165,61 +167,91 @@ impl<const W: u32, const H: u32> DrawTarget for Framebuf<W, H> {
     }
 }
 
-type FieldBuf = Framebuf<VALUE_W, VALUE_H>;
-type LowerBuf = Framebuf<LOWER_W, LOWER_H>;
-
 // --- Drawing helpers ---
 
-fn format_uptime(uptime: core::time::Duration) -> heapless::String<16> {
+fn format_uptime(uptime: Duration, out: &mut heapless::String<16>) {
+    out.clear();
     let secs = uptime.as_secs();
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
-    let mut out = heapless::String::new();
     let _ = write!(out, "{}h {:02}m {:02}s", h, m, s);
-    out
 }
 
-fn draw_value<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D,
-    fb: &mut FieldBuf,
-    text: &str,
-    screen_pos: Point,
-    color: Rgb565,
-) where
+fn draw_value<D>(scratch: &mut Scratch, display: &mut D, text: &str, cell_top: Point, color: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    fb.clear();
+    scratch.clear();
     Text::new(
         text,
-        Point::new(0, 16),
+        Point::new(0, BAND_BASELINE_LARGE),
         MonoTextStyle::new(&FONT_10X20, color),
     )
-    .draw(fb)
+    .draw(scratch)
     .unwrap();
-    fb.blit(display, Point::new(screen_pos.x, screen_pos.y - 16));
+    scratch.blit(display, cell_top, VALUE_W, VALUE_H);
 }
 
-// --- Host-mode rendering ---
+/// Render one text-row band: clear scratch, run `f` to paint, then blit
+/// `(SCRATCH_W × h)` at `screen_top`. Bands may overlap vertically without
+/// flicker because the overlapping rows are background-on-background.
+fn render_band<D>(
+    scratch: &mut Scratch,
+    display: &mut D,
+    screen_top: i32,
+    h: u32,
+    f: impl FnOnce(&mut Scratch),
+) where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    scratch.clear();
+    f(scratch);
+    scratch.blit(display, Point::new(0, screen_top), SCRATCH_W, h);
+}
 
-// Lower-region draw helpers below take a `y_off` and render in
-// lower-region-absolute coordinates minus that offset, so the same
-// function renders either the top half (y_off=0) or the bottom half
-// (y_off=LOWER_H). Out-of-buffer pixels are clipped by Framebuf.
+fn clear_lower<D>(display: &mut D)
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let area = Rectangle::new(
+        Point::new(0, LOWER_Y),
+        Size::new(DISPLAY_W, DISPLAY_H - LOWER_Y as u32),
+    );
+    display.fill_solid(&area, COLOR_BG).unwrap();
+}
 
-fn draw_host(
-    lb: &mut LowerBuf,
-    y_off: i32,
+// --- Lower-region states ---
+//
+// Each line is a 22-tall band whose screen top is `baseline_y - baseline_in_band`.
+// FONT_6X10 baselines use BAND_BASELINE_SMALL, FONT_10X20 uses BAND_BASELINE_LARGE.
+
+fn draw_host<D>(
+    scratch: &mut Scratch,
+    display: &mut D,
     ip: Option<std::net::Ipv4Addr>,
     has_errors: bool,
     buf: &mut heapless::String<32>,
-) {
+) where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
     let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
     let value = MonoTextStyle::new(&FONT_10X20, COLOR_IP);
+    let warn = MonoTextStyle::new(&FONT_10X20, COLOR_WARNING);
 
-    Text::new("IP", Point::new(20, 24 - y_off), label)
-        .draw(lb)
-        .unwrap();
+    // "IP" label (FONT_6X10, baseline at screen y = LOWER_Y + 24 = 92)
+    render_band(scratch, display, 92 - BAND_BASELINE_SMALL, SCRATCH_H, |s| {
+        Text::new("IP", Point::new(20, BAND_BASELINE_SMALL), label)
+            .draw(s)
+            .unwrap();
+    });
+
+    // IP value (FONT_10X20, baseline at screen y = LOWER_Y + 44 = 112) plus
+    // an inline "ERR!" indicator at the right when the event log has entries.
     buf.clear();
     match ip {
         Some(addr) => {
@@ -229,104 +261,161 @@ fn draw_host(
             let _ = write!(buf, "--");
         }
     }
-    Text::new(buf, Point::new(20, 44 - y_off), value)
-        .draw(lb)
-        .unwrap();
+    render_band(
+        scratch,
+        display,
+        112 - BAND_BASELINE_LARGE,
+        SCRATCH_H,
+        |s| {
+            Text::new(buf, Point::new(20, BAND_BASELINE_LARGE), value)
+                .draw(s)
+                .unwrap();
+            if has_errors {
+                Text::new(
+                    "ERR!",
+                    Point::new(SCRATCH_W as i32 - 50, BAND_BASELINE_LARGE),
+                    warn,
+                )
+                .draw(s)
+                .unwrap();
+            }
+        },
+    );
 
-    Text::new("URL", Point::new(20, 60 - y_off), label)
-        .draw(lb)
-        .unwrap();
+    // "URL" label (baseline at screen y = LOWER_Y + 60 = 128)
+    render_band(
+        scratch,
+        display,
+        128 - BAND_BASELINE_SMALL,
+        SCRATCH_H,
+        |s| {
+            Text::new("URL", Point::new(20, BAND_BASELINE_SMALL), label)
+                .draw(s)
+                .unwrap();
+        },
+    );
+
+    // URL value (baseline at screen y = LOWER_Y + 80 = 148)
     buf.clear();
     let _ = write!(buf, "https://{}.local", crate::wifi::HOSTNAME);
-    Text::new(buf, Point::new(20, 80 - y_off), value)
-        .draw(lb)
-        .unwrap();
-
-    if has_errors {
-        draw_warning_triangle(lb, y_off);
-    }
+    render_band(
+        scratch,
+        display,
+        148 - BAND_BASELINE_LARGE,
+        SCRATCH_H,
+        |s| {
+            Text::new(buf, Point::new(20, BAND_BASELINE_LARGE), value)
+                .draw(s)
+                .unwrap();
+        },
+    );
 }
 
-/// Filled red warning triangle with a black "!" inside, anchored to the
-/// right side of the lower region. Drawn only when the event log holds
-/// at least one entry — a hint that the user should check `/api/errors`.
-fn draw_warning_triangle(lb: &mut LowerBuf, y_off: i32) {
-    let cx = LOWER_W as i32 - 50;
-    let cy_top = 20 - y_off;
-    let cy_bot = 84 - y_off;
-    let half = 32;
-    Triangle::new(
-        Point::new(cx, cy_top),
-        Point::new(cx - half, cy_bot),
-        Point::new(cx + half, cy_bot),
-    )
-    .into_styled(PrimitiveStyle::with_fill(COLOR_WARNING))
-    .draw(lb)
-    .unwrap();
-    Text::new(
-        "!",
-        Point::new(cx - 5, cy_bot - 14),
-        MonoTextStyle::new(&FONT_10X20, Rgb565::BLACK),
-    )
-    .draw(lb)
-    .unwrap();
-}
-
-// --- Captive portal overlay ---
-
-fn draw_captive_portal(
-    lb: &mut LowerBuf,
-    y_off: i32,
+fn draw_captive_portal<D>(
+    scratch: &mut Scratch,
+    display: &mut D,
     trying: bool,
     buf: &mut heapless::String<32>,
-) {
+) where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
     let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
     let value = MonoTextStyle::new(&FONT_10X20, COLOR_VOLTAGE);
     let label = MonoTextStyle::new(&FONT_6X10, COLOR_LABEL);
+    let trying_style = MonoTextStyle::new(&FONT_6X10, COLOR_DISCHARGING);
 
-    Text::new("WiFi Setup", Point::new(20, 14 - y_off), title)
-        .draw(lb)
-        .unwrap();
-    Text::new("SSID", Point::new(20, 26 - y_off), label)
-        .draw(lb)
-        .unwrap();
-    Text::new(crate::wifi::AP_SSID, Point::new(20, 42 - y_off), value)
-        .draw(lb)
-        .unwrap();
-    Text::new("PASSWORD", Point::new(20, 54 - y_off), label)
-        .draw(lb)
-        .unwrap();
-    Text::new(crate::wifi::AP_PASS, Point::new(20, 70 - y_off), value)
-        .draw(lb)
-        .unwrap();
-    Text::new("OPEN", Point::new(20, 82 - y_off), label)
-        .draw(lb)
-        .unwrap();
+    // Title row + optional "Connecting..." badge at the right.
+    // Baseline at screen y = LOWER_Y + 18 = 86 (was 14 in legacy; nudged down
+    // 4 px so the glyph sits cleanly inside the band rather than clipping).
+    render_band(scratch, display, 86 - BAND_BASELINE_LARGE, SCRATCH_H, |s| {
+        Text::new("WiFi Setup", Point::new(20, BAND_BASELINE_LARGE), title)
+            .draw(s)
+            .unwrap();
+        if trying {
+            Text::new(
+                "Connecting...",
+                Point::new(190, BAND_BASELINE_LARGE),
+                trying_style,
+            )
+            .draw(s)
+            .unwrap();
+        }
+    });
+
+    for (label_text, label_baseline, value_text, value_baseline) in [
+        ("SSID", 94, crate::wifi::AP_SSID, 110),
+        ("PASSWORD", 122, crate::wifi::AP_PASS, 138),
+    ] {
+        render_band(
+            scratch,
+            display,
+            label_baseline - BAND_BASELINE_SMALL,
+            SCRATCH_H,
+            |s| {
+                Text::new(label_text, Point::new(20, BAND_BASELINE_SMALL), label)
+                    .draw(s)
+                    .unwrap();
+            },
+        );
+        render_band(
+            scratch,
+            display,
+            value_baseline - BAND_BASELINE_LARGE,
+            SCRATCH_H,
+            |s| {
+                Text::new(value_text, Point::new(20, BAND_BASELINE_LARGE), value)
+                    .draw(s)
+                    .unwrap();
+            },
+        );
+    }
+
+    // "OPEN" label + gateway URL.
+    render_band(
+        scratch,
+        display,
+        150 - BAND_BASELINE_SMALL,
+        SCRATCH_H,
+        |s| {
+            Text::new("OPEN", Point::new(20, BAND_BASELINE_SMALL), label)
+                .draw(s)
+                .unwrap();
+        },
+    );
     let [a, b, c, d] = crate::wifi::AP_GATEWAY;
     buf.clear();
     let _ = write!(buf, "http://{a}.{b}.{c}.{d}/");
-    Text::new(buf, Point::new(20, 98 - y_off), value)
-        .draw(lb)
-        .unwrap();
-
-    if trying {
-        // Top-right indicator so the AP creds remain readable while STA
-        // is mid-association on the user's submitted creds.
-        Text::new(
-            "Connecting...",
-            Point::new(190, 14 - y_off),
-            MonoTextStyle::new(&FONT_6X10, COLOR_DISCHARGING),
-        )
-        .draw(lb)
-        .unwrap();
-    }
+    render_band(
+        scratch,
+        display,
+        166 - BAND_BASELINE_LARGE,
+        SCRATCH_H,
+        |s| {
+            Text::new(buf, Point::new(20, BAND_BASELINE_LARGE), value)
+                .draw(s)
+                .unwrap();
+        },
+    );
 }
 
-fn draw_connecting(lb: &mut LowerBuf, y_off: i32) {
+fn draw_connecting<D>(scratch: &mut Scratch, display: &mut D)
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
     let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    Text::new("Connecting...", Point::new(20, 60 - y_off), title)
-        .draw(lb)
-        .unwrap();
+    render_band(
+        scratch,
+        display,
+        128 - BAND_BASELINE_LARGE,
+        SCRATCH_H,
+        |s| {
+            Text::new("Connecting...", Point::new(20, BAND_BASELINE_LARGE), title)
+                .draw(s)
+                .unwrap();
+        },
+    );
 }
 
 // --- Main thread ---
@@ -340,7 +429,10 @@ pub fn start(
     thread::Builder::new()
         .stack_size(16384)
         .spawn(move || {
-            // PWM backlight at reduced brightness
+            // Backing storage in BSS (single thread, taken once).
+            static mut SPI_BUF: [u8; SPI_BUF_SIZE] = [0; SPI_BUF_SIZE];
+            static mut SCRATCH_PIXELS: [Rgb565; SCRATCH_PX] = [COLOR_BG; SCRATCH_PX];
+
             let timer = LedcTimerDriver::new(
                 pins.ledc_timer,
                 &TimerConfig::default().frequency(1.kHz().into()),
@@ -349,15 +441,6 @@ pub fn start(
             let mut blk = LedcDriver::new(pins.ledc_channel, timer, pins.blk).unwrap();
             let max_duty = blk.get_max_duty();
             blk.set_duty(max_duty * BACKLIGHT_PERCENT / 100).unwrap();
-
-            // Backing storage for SPI interface scratch buffer and the two
-            // framebuffers lives in BSS — sums to ~105 KB and was previously
-            // heap-allocated (and leaked) at boot.
-            static mut SPI_BUF: [u8; SPI_BUF_SIZE] = [0; SPI_BUF_SIZE];
-            static mut FIELD_PIXELS: [Rgb565; (VALUE_W * VALUE_H) as usize] =
-                [COLOR_BG; (VALUE_W * VALUE_H) as usize];
-            static mut LOWER_PIXELS: [Rgb565; (LOWER_W * LOWER_H) as usize] =
-                [COLOR_BG; (LOWER_W * LOWER_H) as usize];
 
             let spi_driver = SpiDriver::new(
                 pins.spi,
@@ -379,11 +462,9 @@ pub fn start(
             // SAFETY: this thread is spawned exactly once and these statics
             // are not referenced anywhere else.
             let spi_ptr = &raw mut SPI_BUF;
-            let field_ptr = &raw mut FIELD_PIXELS;
-            let lower_ptr = &raw mut LOWER_PIXELS;
+            let scratch_ptr = &raw mut SCRATCH_PIXELS;
             let spi_buf: &'static mut [u8] = unsafe { &mut *spi_ptr };
-            let field_pixels: &'static mut [Rgb565] = unsafe { &mut *field_ptr };
-            let lower_pixels: &'static mut [Rgb565] = unsafe { &mut *lower_ptr };
+            let scratch_pixels: &'static mut [Rgb565] = unsafe { &mut *scratch_ptr };
             let spi_iface = SpiInterface::new(spi_device, dc, spi_buf);
 
             let mut display = Builder::new(ST7789, spi_iface)
@@ -397,24 +478,34 @@ pub fn start(
 
             display.clear(COLOR_BG).unwrap();
 
-            // Static labels (drawn once)
+            // Static labels — drawn once directly to display.
             let label_style = MonoTextStyle::new(&FONT_5X8, COLOR_LABEL);
             for &(text, pos) in &[
-                ("VOLTAGE", Point::new(COL_LEFT + 8, ROW1_LABEL_Y)),
-                ("BATTERY", Point::new(COL_LEFT + 8, ROW2_LABEL_Y)),
-                ("POWER", Point::new(COL_RIGHT + 8, ROW1_LABEL_Y)),
-                ("PSU", Point::new(COL_RIGHT + 8, ROW2_LABEL_Y)),
+                (
+                    "VOLTAGE",
+                    Point::new(COL_LEFT + LABEL_OFFSET_X, ROW1_LABEL_Y),
+                ),
+                (
+                    "BATTERY",
+                    Point::new(COL_LEFT + LABEL_OFFSET_X, ROW2_LABEL_Y),
+                ),
+                (
+                    "POWER",
+                    Point::new(COL_RIGHT + LABEL_OFFSET_X, ROW1_LABEL_Y),
+                ),
+                ("PSU", Point::new(COL_RIGHT + LABEL_OFFSET_X, ROW2_LABEL_Y)),
             ] {
                 Text::new(text, pos, label_style)
                     .draw(&mut display)
                     .unwrap();
             }
 
-            let mut fb = FieldBuf::from_buf(field_pixels);
-            let mut lb = LowerBuf::from_buf(lower_pixels);
+            let mut scratch = Scratch::from_buf(scratch_pixels);
             let mut prev_status = NetStatus::Connecting;
             let mut prev_ip: Option<std::net::Ipv4Addr> = None;
             let mut prev_has_errors = false;
+            let mut text_buf = heapless::String::<32>::new();
+            let mut up_buf = heapless::String::<16>::new();
 
             loop {
                 thread::sleep(REFRESH_INTERVAL);
@@ -429,7 +520,6 @@ pub fn start(
                 let need_redraw = net_status != prev_status
                     || (net_status == NetStatus::Host
                         && (ip != prev_ip || has_errors != prev_has_errors));
-                let mut buf = heapless::String::<32>::new();
 
                 let (r1, r2) = {
                     let sd = sensor_data.lock().unwrap();
@@ -438,83 +528,77 @@ pub fn start(
                         sd.ps_reading().unwrap_or_default(),
                     )
                 };
-                let uptime = crate::clock::uptime();
-                buf.clear();
 
-                // Values
-                let _ = write!(buf, "{:.2} V", r1.voltage);
+                // Upper region — four value cells + uptime, every tick.
+                text_buf.clear();
+                let _ = write!(text_buf, "{:.2} V", r1.voltage);
                 draw_value(
+                    &mut scratch,
                     &mut display,
-                    &mut fb,
-                    &buf,
-                    Point::new(COL_LEFT, ROW1_VALUE_Y),
+                    &text_buf,
+                    Point::new(COL_LEFT, ROW1_TOP),
                     COLOR_VOLTAGE,
                 );
 
-                buf.clear();
-                let _ = write!(buf, "{:.2} W", r1.power);
+                text_buf.clear();
+                let _ = write!(text_buf, "{:.2} W", r1.power);
                 draw_value(
+                    &mut scratch,
                     &mut display,
-                    &mut fb,
-                    &buf,
-                    Point::new(COL_RIGHT, ROW1_VALUE_Y),
+                    &text_buf,
+                    Point::new(COL_RIGHT, ROW1_TOP),
                     COLOR_POWER,
                 );
 
-                buf.clear();
-                // Sign is conveyed by color (green=charging, orange=discharging);
-                // show magnitude only.
-                let _ = write!(buf, "{:.3} A", r1.current.abs());
+                text_buf.clear();
+                // Sign is conveyed by color — show magnitude only.
+                let _ = write!(text_buf, "{:.3} A", r1.current.abs());
                 draw_value(
+                    &mut scratch,
                     &mut display,
-                    &mut fb,
-                    &buf,
-                    Point::new(COL_LEFT, ROW2_VALUE_Y),
+                    &text_buf,
+                    Point::new(COL_LEFT, ROW2_TOP),
                     battery_current_color(r1.current),
                 );
 
-                buf.clear();
-                let _ = write!(buf, "{:.3} A", r2.current);
+                text_buf.clear();
+                let _ = write!(text_buf, "{:.3} A", r2.current);
                 draw_value(
+                    &mut scratch,
                     &mut display,
-                    &mut fb,
-                    &buf,
-                    Point::new(COL_RIGHT, ROW2_VALUE_Y),
+                    &text_buf,
+                    Point::new(COL_RIGHT, ROW2_TOP),
                     COLOR_PSU_CURRENT,
                 );
 
-                // Uptime
-                let up = format_uptime(uptime);
-                fb.clear();
+                format_uptime(crate::clock::uptime(), &mut up_buf);
+                scratch.clear();
                 Text::new(
-                    &up,
+                    &up_buf,
                     Point::new(0, 8),
                     MonoTextStyle::new(&FONT_6X10, COLOR_LABEL),
                 )
-                .draw(&mut fb)
+                .draw(&mut scratch)
                 .unwrap();
-                fb.blit_rows(&mut display, Point::new(UPTIME_X, 0), 12);
+                scratch.blit(&mut display, Point::new(UPTIME_X, 0), UPTIME_W, UPTIME_H);
 
-                // Lower region: IP+warning (Host) or captive/connecting overlays.
-                // Repainted only when something visible has changed.
+                // Lower region — repainted only on visible state change.
                 if need_redraw {
                     prev_status = net_status;
                     prev_ip = ip;
                     prev_has_errors = has_errors;
-                    let half_h = LOWER_H as i32;
-                    for y_off in [0, half_h] {
-                        lb.clear();
-                        match net_status {
-                            NetStatus::Captive => {
-                                draw_captive_portal(&mut lb, y_off, false, &mut buf)
-                            }
-                            NetStatus::CaptiveTrying => {
-                                draw_captive_portal(&mut lb, y_off, true, &mut buf)
-                            }
-                            NetStatus::Connecting => draw_connecting(&mut lb, y_off),
-                            NetStatus::Host => draw_host(&mut lb, y_off, ip, has_errors, &mut buf),
+                    clear_lower(&mut display);
+                    match net_status {
+                        NetStatus::Captive => {
+                            draw_captive_portal(&mut scratch, &mut display, false, &mut text_buf)
                         }
-                        lb.blit(&mut display, Point::new(0, LOWER_Y + y_off));
+                        NetStatus::CaptiveTrying => {
+                            draw_captive_portal(&mut scratch, &mut display, true, &mut text_buf)
+                        }
+                        NetStatus::Connecting => draw_connecting(&mut scratch, &mut display),
+                        NetStatus::Host => {
+                            draw_host(&mut scratch, &mut display, ip, has_errors, &mut text_buf)
+                        }
                     }
                 }
             }
