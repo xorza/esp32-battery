@@ -11,9 +11,9 @@ use crate::transport::ModbusError;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-pub const FN_READ_HOLDING: u8 = 0x03;
-pub const FN_WRITE_SINGLE: u8 = 0x06;
-pub const FN_WRITE_MULTIPLE: u8 = 0x10;
+pub(crate) const FN_READ_HOLDING: u8 = 0x03;
+pub(crate) const FN_WRITE_SINGLE: u8 = 0x06;
+pub(crate) const FN_WRITE_MULTIPLE: u8 = 0x10;
 
 /// Maximum Modbus-RTU ADU size (slave + PDU + CRC).
 pub const MAX_ADU: usize = 256;
