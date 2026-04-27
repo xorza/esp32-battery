@@ -134,3 +134,55 @@ pub const REG_S_OCP: u16 = GROUP_BASE + GROUP_OFF_S_OCP;
 pub const REG_S_OPP: u16 = GROUP_BASE + GROUP_OFF_S_OPP;
 pub const REG_S_OTP: u16 = GROUP_BASE + GROUP_OFF_S_OTP;
 pub const REG_S_INI: u16 = GROUP_BASE + GROUP_OFF_S_INI;
+
+// ─── Bulk-access layout invariants ───────────────────────────────────────────
+//
+// Every bulk read/write in `device::*` sends a single Modbus transaction
+// over a contiguous register span. These asserts pin the adjacency the
+// callers rely on — a typo'd address constant turns into a build error
+// instead of a silent off-by-one at runtime.
+
+// `read_setpoints` (V-SET, I-SET).
+const _: () = assert!(REG_I_SET == REG_V_SET + 1);
+
+// `read_status` (V-SET..OUTPUT_EN, 19 regs indexed by absolute address).
+const _: () = assert!(REG_V_SET == 0);
+const _: () = assert!(REG_V_OUT == REG_V_SET + 2);
+const _: () = assert!(REG_I_OUT == REG_V_SET + 3);
+const _: () = assert!(REG_P_OUT == REG_V_SET + 4);
+const _: () = assert!(REG_V_IN == REG_V_SET + 5);
+const _: () = assert!(REG_PROTECT == REG_V_SET + 0x10);
+const _: () = assert!(REG_CVCC == REG_V_SET + 0x11);
+const _: () = assert!(REG_OUTPUT_EN == REG_V_SET + 0x12);
+
+// `read_totals` (AH_LOW..OUT_S, 7 regs).
+const _: () = assert!(REG_AH_HIGH == REG_AH_LOW + 1);
+const _: () = assert!(REG_WH_LOW == REG_AH_LOW + 2);
+const _: () = assert!(REG_WH_HIGH == REG_AH_LOW + 3);
+const _: () = assert!(REG_OUT_H == REG_AH_LOW + 4);
+const _: () = assert!(REG_OUT_M == REG_AH_LOW + 5);
+const _: () = assert!(REG_OUT_S == REG_AH_LOW + 6);
+
+// `set_protection` / `read_protection` (S-LVP, S-OVP, S-OCP).
+const _: () = assert!(REG_S_OVP == REG_S_LVP + 1);
+const _: () = assert!(REG_S_OCP == REG_S_LVP + 2);
+
+// `read_temperatures` (T_IN, T_EX).
+const _: () = assert!(REG_T_EX == REG_T_IN + 1);
+
+// `read_group` / `write_group` walk all 14 in-group offsets in order.
+const _: () = assert!(GROUP_OFF_V_SET == 0);
+const _: () = assert!(GROUP_OFF_I_SET == 1);
+const _: () = assert!(GROUP_OFF_S_LVP == 2);
+const _: () = assert!(GROUP_OFF_S_OVP == 3);
+const _: () = assert!(GROUP_OFF_S_OCP == 4);
+const _: () = assert!(GROUP_OFF_S_OPP == 5);
+const _: () = assert!(GROUP_OFF_S_OHP_H == 6);
+const _: () = assert!(GROUP_OFF_S_OHP_M == 7);
+const _: () = assert!(GROUP_OFF_S_OAH_L == 8);
+const _: () = assert!(GROUP_OFF_S_OAH_H == 9);
+const _: () = assert!(GROUP_OFF_S_OWH_L == 10);
+const _: () = assert!(GROUP_OFF_S_OWH_H == 11);
+const _: () = assert!(GROUP_OFF_S_OTP == 12);
+const _: () = assert!(GROUP_OFF_S_INI == 13);
+const _: () = assert!(GROUP_LEN == 14);
