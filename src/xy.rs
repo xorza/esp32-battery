@@ -568,18 +568,26 @@ fn shutdown_or_reboot<D: XyDevice>(
 /// One read cycle: poll the buck, push readings into shared sensor data,
 /// snapshot the latest battery sample, and return the supervisor's
 /// per-tick view of the world.
+///
+/// The Modbus reads run *without* the `SensorData` lock held — UART
+/// transactions can take up to `response_timeout` (500 ms) and we don't
+/// want HTTP / LCD / INA blocked on that. The mutex is only acquired in
+/// short scopes around the actual writes/reads.
 fn poll<D: XyDevice>(
     xy: &D,
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
 ) -> PollResult {
-    let mut sd = sensor_data.lock().unwrap();
-    let setpoints = read_setpoints(xy, &mut sd, recorder);
+    let setpoints = read_setpoints(xy, sensor_data, recorder);
     let output = read_output(xy, recorder);
-    let battery = sd.battery_reading().map(|b| BatterySample {
-        voltage: b.voltage,
-        current: b.current,
-    });
+    let battery = sensor_data
+        .lock()
+        .unwrap()
+        .battery_reading()
+        .map(|b| BatterySample {
+            voltage: b.voltage,
+            current: b.current,
+        });
     PollResult {
         setpoints,
         output,
@@ -589,12 +597,12 @@ fn poll<D: XyDevice>(
 
 fn read_setpoints<D: XyDevice>(
     xy: &D,
-    sd: &mut SensorData,
+    sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
 ) -> Option<Setpoints> {
     match xy.read_status() {
         Ok(s) => {
-            sd.update_ps(PsReading {
+            sensor_data.lock().unwrap().update_ps(PsReading {
                 voltage: s.v_out,
                 current: s.i_out,
                 power: s.p_out,
