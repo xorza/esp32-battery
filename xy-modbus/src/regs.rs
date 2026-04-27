@@ -4,6 +4,12 @@
 //! is the divisor to apply to the raw integer to obtain the physical
 //! value (so a raw `1440` at scale `100` is `14.40`).
 
+// This module is the canonical address surface for the whole register
+// map. Some entries aren't referenced by the high-level API yet (rarely
+// used registers, group offsets, individual M0 protection fields) but
+// are kept so the map stays complete in one place.
+#![allow(dead_code)]
+
 /// Default Modbus slave address. Reconfigurable via [`REG_SLAVE_ADDR`];
 /// the new value only takes effect after the device resets.
 pub const DEFAULT_SLAVE: u8 = 0x01;
