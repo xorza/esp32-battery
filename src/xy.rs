@@ -110,11 +110,11 @@ mod real {
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
+    use xy_modbus::esp_idf::EspIdfTransport;
     use xy_modbus::{Model, ProtectionStatus, RtuError, SafetyLimits, Status};
 
     use super::{LogicSafetyLimits, XyDevice, XyProtectionStatus};
     use crate::board::XyPins;
-    use crate::modbus_rtu::{EspUartTransport, new_transport};
 
     fn to_logic_safety(s: SafetyLimits) -> LogicSafetyLimits {
         LogicSafetyLimits {
@@ -155,7 +155,7 @@ mod real {
         // RefCell because xy_modbus::Xy needs &mut on every call but the
         // supervisor loop hands the device around as &self. Single-threaded
         // FreeRTOS task — no contention.
-        inner: RefCell<xy_modbus::Xy<EspUartTransport<'d>>>,
+        inner: RefCell<xy_modbus::Xy<EspIdfTransport<'d>>>,
     }
 
     impl Xy<'_> {
@@ -170,11 +170,9 @@ mod real {
                 &config,
             )
             .expect("UART1 init");
-            // 500 ms response window + 50 ms inter-frame gap match the
-            // XY-series spec — tighter values cause the slave to miss
-            // back-to-back writes.
-            let transport = new_transport(uart, 500, 50);
-            let inner = xy_modbus::Xy::new(transport, Model::Xy7025);
+            // Default XY-series timing baked in by `from_esp_uart`:
+            // 500 ms response window, 50 ms inter-frame gap.
+            let inner = xy_modbus::Xy::from_esp_uart(uart, Model::Xy7025);
             Self {
                 inner: RefCell::new(inner),
             }

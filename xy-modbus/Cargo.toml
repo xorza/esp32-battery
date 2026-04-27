@@ -16,9 +16,17 @@ default = ["embedded-io"]
 defmt = ["dep:defmt"]
 serde = ["dep:serde"]
 embedded-io = ["dep:embedded-io", "dep:embedded-hal"]
+# Convenience constructor for esp-idf-hal `UartDriver`. Pulls in
+# esp-idf-hal only on `target_os = "espidf"` builds — enabling the
+# feature on host targets is a no-op so `cargo test --all-features`
+# still works.
+esp-idf-hal = ["embedded-io", "dep:esp-idf-hal"]
 
 [dependencies]
 defmt = { version = "1.0", optional = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 embedded-io = { version = "0.7", optional = true }
 embedded-hal = { version = "1.0", optional = true }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-hal = { version = "0.46", optional = true }

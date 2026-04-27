@@ -10,8 +10,6 @@ mod ina;
 #[cfg(feature = "lcd")]
 mod lcd;
 mod log_ring;
-#[cfg(not(feature = "xy-fake"))]
-mod modbus_rtu;
 mod net;
 mod nvs_creds;
 mod ota;

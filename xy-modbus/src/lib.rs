@@ -22,6 +22,16 @@
 //! `embedded-io` UART. To use a different transport, disable default
 //! features and implement [`ModbusTransport`] yourself; the [`framing`]
 //! module exposes the on-wire codec.
+//!
+//! For `esp-idf-hal` users, the `esp-idf-hal` feature ships a convenience
+//! constructor so you don't need to write a UART wrapper:
+//!
+//! ```ignore
+//! use xy_modbus::{Model, Xy};
+//!
+//! let mut xy = Xy::from_esp_uart(uart, Model::Xy7025);
+//! xy.set_voltage(13.5)?;
+//! ```
 
 #![no_std]
 
@@ -36,6 +46,12 @@ pub mod transport;
 
 #[cfg(feature = "embedded-io")]
 pub mod uart;
+
+// `esp-idf-hal` itself is target-conditional (only present when targeting
+// `target_os = "espidf"`), so this module is too — enabling the feature on
+// host builds is harmless.
+#[cfg(all(feature = "esp-idf-hal", target_os = "espidf"))]
+pub mod esp_idf;
 
 // ─── Re-exports ──────────────────────────────────────────────────────────────
 
