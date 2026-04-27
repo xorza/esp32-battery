@@ -6,7 +6,7 @@ use embedded_io::ErrorType;
 
 use super::*;
 use crate::framing::crc16_modbus;
-use crate::transport::ModbusError;
+use crate::transport::{BlockingRead, ModbusError};
 
 /// Mock UART: `stale` bytes are visible immediately (simulating
 /// junk in the RX FIFO before the request); `response` bytes only
@@ -36,24 +36,11 @@ impl MockUart {
         self.stale = stale;
         self
     }
-
-    fn available(&self) -> usize {
-        let s = self.stale.len() - self.stale_pos;
-        let r = if self.armed {
-            self.response.len() - self.resp_pos
-        } else {
-            0
-        };
-        s + r
-    }
 }
 
-impl ErrorType for MockUart {
+impl BlockingRead for MockUart {
     type Error = core::convert::Infallible;
-}
-
-impl embedded_io::Read for MockUart {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+    fn read(&mut self, buf: &mut [u8], _timeout_ms: u32) -> Result<usize, Self::Error> {
         let mut written = 0;
         while written < buf.len() && self.stale_pos < self.stale.len() {
             buf[written] = self.stale[self.stale_pos];
@@ -71,10 +58,8 @@ impl embedded_io::Read for MockUart {
     }
 }
 
-impl embedded_io::ReadReady for MockUart {
-    fn read_ready(&mut self) -> Result<bool, Self::Error> {
-        Ok(self.available() > 0)
-    }
+impl ErrorType for MockUart {
+    type Error = core::convert::Infallible;
 }
 
 impl embedded_io::Write for MockUart {
@@ -180,8 +165,9 @@ struct FailingUart {
 impl ErrorType for FailingUart {
     type Error = embedded_io::ErrorKind;
 }
-impl embedded_io::Read for FailingUart {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+impl BlockingRead for FailingUart {
+    type Error = embedded_io::ErrorKind;
+    fn read(&mut self, buf: &mut [u8], _timeout_ms: u32) -> Result<usize, Self::Error> {
         if self.fail_read {
             return Err(embedded_io::ErrorKind::Other);
         }
@@ -192,11 +178,6 @@ impl embedded_io::Read for FailingUart {
             n += 1;
         }
         Ok(n)
-    }
-}
-impl embedded_io::ReadReady for FailingUart {
-    fn read_ready(&mut self) -> Result<bool, Self::Error> {
-        Ok(self.armed && self.resp_pos < self.response.len())
     }
 }
 impl embedded_io::Write for FailingUart {
@@ -351,19 +332,15 @@ fn read_exact_aggregates_byte_at_a_time() {
     impl ErrorType for DribbleUart {
         type Error = core::convert::Infallible;
     }
-    impl embedded_io::Read for DribbleUart {
-        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+    impl BlockingRead for DribbleUart {
+        type Error = core::convert::Infallible;
+        fn read(&mut self, buf: &mut [u8], _timeout_ms: u32) -> Result<usize, Self::Error> {
             if !self.armed || self.pos >= self.response.len() || buf.is_empty() {
                 return Ok(0);
             }
             buf[0] = self.response[self.pos];
             self.pos += 1;
             Ok(1)
-        }
-    }
-    impl embedded_io::ReadReady for DribbleUart {
-        fn read_ready(&mut self) -> Result<bool, Self::Error> {
-            Ok(self.armed && self.pos < self.response.len())
         }
     }
     impl embedded_io::Write for DribbleUart {

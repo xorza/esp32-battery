@@ -1,34 +1,34 @@
-//! Default Modbus-RTU transport over an `embedded-io` UART.
+//! Default Modbus-RTU transport over a [`BlockingRead`] +
+//! [`embedded_io::Write`] UART.
 //!
-//! Wrap any blocking byte stream that implements
-//! [`embedded_io::Read`] + [`embedded_io::Write`] +
-//! [`embedded_io::ReadReady`] together with an
-//! [`embedded_hal::delay::DelayNs`] timer, and you have a working
+//! Wrap any UART driver that exposes a blocking-with-timeout read (every
+//! kernel-backed HAL does) plus an [`embedded_hal::delay::DelayNs`] timer
+//! for the inter-frame silence, and you have a working
 //! [`ModbusTransport`].
 //!
 //! ```ignore
 //! use xy_modbus::{Xy, uart::UartTransport};
 //!
 //! let transport = UartTransport::new(uart, delay);
-//! let mut xy = Xy::new(transport);
+//! let mut xy = Xy::new(transport, Model::Xy7025);
 //! ```
 //!
 //! Timing defaults match the XY-series spec (~500 ms response window,
 //! ~50 ms post-write quiet gap). Override with [`UartTransport::with_timing`].
 
 use embedded_hal::delay::DelayNs;
-use embedded_io::{Read, ReadReady, Write};
+use embedded_io::Write;
 
 use crate::framing::{
     MAX_ADU, MAX_READ_REGS, MAX_WRITE_REGS, build_read_request, build_write_multiple_request,
     build_write_single_request, parse_read_response, parse_write_multiple_response,
     parse_write_single_response,
 };
-use crate::transport::{ModbusTransport, RtuError};
+use crate::transport::{BlockingRead, ModbusTransport, RtuError};
 
 // ─── UartTransport ───────────────────────────────────────────────────────────
 
-/// Generic Modbus-RTU transport over any `embedded-io` UART.
+/// Generic Modbus-RTU transport over any blocking-with-timeout UART.
 #[derive(Debug)]
 pub struct UartTransport<U, D> {
     uart: U,
@@ -39,11 +39,11 @@ pub struct UartTransport<U, D> {
 
 impl<U, D> UartTransport<U, D>
 where
-    U: Read + Write + ReadReady,
+    U: BlockingRead + Write,
     D: DelayNs,
 {
     /// Build a transport with default XY-series timing
-    /// (500 ms response window, 50 ms post-write quiet gap).
+    /// (500 ms response window, 50 ms inter-frame quiet gap).
     pub fn new(uart: U, delay: D) -> Self {
         Self {
             uart,
@@ -53,8 +53,8 @@ where
         }
     }
 
-    /// Override response timeout (max wait without any RX progress) and
-    /// the post-write quiet gap.
+    /// Override the response timeout (max wait without any byte arriving)
+    /// and the inter-frame quiet gap.
     pub fn with_timing(mut self, response_timeout_ms: u32, inter_frame_ms: u32) -> Self {
         self.response_timeout_ms = response_timeout_ms;
         self.inter_frame_ms = inter_frame_ms;
@@ -68,11 +68,16 @@ where
 
     // ─── I/O helpers ─────────────────────────────────────────────────────
 
+    /// Discard whatever is already in the UART RX buffer. Cheap
+    /// non-blocking calls (`timeout_ms = 0`) drain noise that arrived
+    /// during the inter-frame silence so it doesn't masquerade as the
+    /// start of the slave's reply.
     fn drain_rx(&mut self) {
         let mut scratch = [0u8; 32];
-        while matches!(self.uart.read_ready(), Ok(true)) {
-            if self.uart.read(&mut scratch).is_err() {
-                break;
+        loop {
+            match self.uart.read(&mut scratch, 0) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
             }
         }
     }
@@ -96,30 +101,19 @@ where
         Ok(())
     }
 
-    // Bounded by buf.len() forward progress: each iteration either consumes
-    // RX bytes (capped by buf.len() total), or sleeps 1ms and increments
-    // idle_ms (capped by response_timeout_ms). No separate wall-clock budget
-    // needed — DelayNs gives no clock to measure one against anyway.
+    /// Fill `buf` from the UART, treating "no bytes within
+    /// `response_timeout_ms`" as a timeout. Each `read` call gets a fresh
+    /// timeout — a slave that starts replying mid-window has the rest of
+    /// its frame protected by the next read's full budget. Worst-case
+    /// wall-clock is a small multiple of `response_timeout_ms` only if the
+    /// slave dribbles bytes with timeout-length pauses between them, which
+    /// no real Modbus device does.
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), RtuError> {
         let mut filled = 0;
-        let mut idle_ms = 0u32;
         while filled < buf.len() {
-            match self.uart.read_ready() {
-                Ok(true) => match self.uart.read(&mut buf[filled..]) {
-                    Ok(0) => return Err(RtuError::Io),
-                    Ok(n) => {
-                        filled += n;
-                        idle_ms = 0;
-                    }
-                    Err(_) => return Err(RtuError::Io),
-                },
-                Ok(false) => {
-                    if idle_ms >= self.response_timeout_ms {
-                        return Err(RtuError::Timeout);
-                    }
-                    self.delay.delay_ms(1);
-                    idle_ms += 1;
-                }
+            match self.uart.read(&mut buf[filled..], self.response_timeout_ms) {
+                Ok(0) => return Err(RtuError::Timeout),
+                Ok(n) => filled += n,
                 Err(_) => return Err(RtuError::Io),
             }
         }
@@ -150,7 +144,7 @@ where
 
 impl<U, D> ModbusTransport for UartTransport<U, D>
 where
-    U: Read + Write + ReadReady,
+    U: BlockingRead + Write,
     D: DelayNs,
 {
     fn read_holding(&mut self, slave: u8, addr: u16, dst: &mut [u16]) -> Result<(), RtuError> {

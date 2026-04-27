@@ -83,6 +83,33 @@ impl core::error::Error for RtuError {
     }
 }
 
+// ─── BlockingRead ────────────────────────────────────────────────────────────
+
+/// Read side of the bundled [`crate::uart::UartTransport`].
+///
+/// Wraps a UART driver that already knows how to block efficiently for
+/// incoming bytes — every kernel-backed HAL exposes one
+/// (`esp_idf_hal::uart::UartDriver::read(buf, ticks)`, embassy with
+/// timeout futures, `serialport-rs::SerialPort::read` after
+/// `set_timeout`, …). Implementing this trait is typically 3 lines that
+/// translate `timeout_ms` into the driver's native timeout type.
+///
+/// Avoiding `embedded_io::ReadReady` here is deliberate: the trait is
+/// optional in the embedded-io ecosystem and many HALs (esp-idf-hal
+/// included) don't impl it, and the busy-poll loop a `ReadReady`-based
+/// implementation needs fights kernel-backed drivers that already block
+/// cheaply.
+pub trait BlockingRead {
+    type Error;
+
+    /// Block for up to `timeout_ms` waiting for at least one byte to
+    /// arrive, then return up to `buf.len()` bytes. `Ok(0)` means the
+    /// timeout elapsed without a byte appearing. `timeout_ms == 0` is a
+    /// non-blocking poll: return whatever is already buffered without
+    /// waiting (used for the pre-TX flush).
+    fn read(&mut self, buf: &mut [u8], timeout_ms: u32) -> Result<usize, Self::Error>;
+}
+
 // ─── Transport trait ─────────────────────────────────────────────────────────
 
 /// Modbus-RTU transport: send a request, validate the response, hand

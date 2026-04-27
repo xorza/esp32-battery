@@ -57,7 +57,7 @@ pub mod esp_idf;
 
 pub use device::Xy;
 pub use framing::FrameError;
-pub use transport::{ModbusError, ModbusTransport, RtuError};
+pub use transport::{BlockingRead, ModbusError, ModbusTransport, RtuError};
 pub use types::{
     BaudRate, GroupParams, Model, OnTime, ProtectionStatus, RegMode, SafetyLimits, Setpoints,
     Status, TempUnit, Totals,
