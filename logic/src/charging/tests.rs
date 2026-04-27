@@ -203,6 +203,22 @@ fn zero_capacity_panics() {
 }
 
 #[test]
+#[should_panic]
+fn new_rejects_absorb_not_above_float() {
+    // The phase machine assumes absorb_v > float_v (Float→Absorb is "raise
+    // V_SET"). Profile-builder construction guarantees that for chemistries,
+    // but a hand-rolled Profile must still satisfy it.
+    let bogus = Profile {
+        absorb_v: 13.5,
+        float_v: 13.5,
+        regulation_a: 10.0,
+        enter_absorb_a: 3.0,
+        exit_absorb_a: 2.5,
+    };
+    let _ = ChargeSupervisor::new(bogus);
+}
+
+#[test]
 fn safety_limits_match_lfp_4s_known_values() {
     // 4S LFP daily, 50 Ah: absorb 14.4 V, float 13.5 V, CC 10 A.
     // OVP = 14.4 + 0.6 = 15.0; OCP = 10 * 1.5 = 15.0.
@@ -1306,4 +1322,69 @@ fn ack_enable_from_tripped_panics() {
         fail_tick(&mut s, b(OK_V, -0.1), TICK);
     }
     s.ack_enable();
+}
+
+#[test]
+#[should_panic]
+fn ack_voltage_update_without_pending_phase_panics() {
+    // ack_voltage_update only makes sense after an UpdateVoltage was
+    // emitted (pending_phase set). Calling it from steady-state Active
+    // would commit a None into self.phase — drop it on the floor.
+    let mut s = active(lfp_4s());
+    s.ack_voltage_update();
+}
+
+#[test]
+fn pending_does_not_enter_absorb_even_at_high_charge_current() {
+    // Defensive: in Pending the buck is OFF, so any "charging current"
+    // sample is meaningless (no current is actually flowing). The phase
+    // machine MUST NOT advance on it — only `EnableOutput` may be emitted,
+    // and after the caller acks we transition to Active still in Float.
+    let profile = lfp_4s();
+    let mut s = ChargeSupervisor::new(profile);
+    // Sample reports current well above enter_absorb_a (3 A). If the phase
+    // machine ran in Pending it would emit UpdateVoltage(absorb_v).
+    let high_current = -10.0;
+    let p = PollResult {
+        setpoints: Some(s.expected_setpoints()),
+        output: Some(BuckOutput::Off { cause: None }),
+        battery: b(profile.float_v, high_current),
+    };
+    let a = s.tick(p, TICK);
+    assert!(matches!(a, Action::EnableOutput));
+    assert!(matches!(s.phase(), Phase::Float));
+    // After ack, supervisor goes Active still in Float — first real tick
+    // will then run the phase machine. Verify the very next tick (now
+    // Active) is the one that emits the transition.
+    s.ack_enable();
+    let p_active = PollResult {
+        setpoints: Some(s.expected_setpoints()),
+        output: Some(BuckOutput::On),
+        battery: b(profile.float_v, high_current),
+    };
+    let a = s.tick(p_active, TICK);
+    assert!(matches!(a, Action::UpdateVoltage { target_v } if approx(target_v, profile.absorb_v)));
+}
+
+#[test]
+fn restart_resets_on_nan_battery() {
+    // Recovery health check filters non-finite battery samples — same as
+    // `should_restart_resets_on_missing_battery` but with NaN/Inf, which
+    // a misbehaving INA228 might emit. Resets the clock identically.
+    let mut s = active(lfp_4s());
+    latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
+    let p = healthy_recovery_poll(&s);
+    for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
+        assert!(!restart_ready(&mut s, p, TICK));
+    }
+    let p_nan = PollResult {
+        battery: Some(BatterySample {
+            voltage: f32::NAN,
+            current: -0.1,
+        }),
+        ..p
+    };
+    assert!(!restart_ready(&mut s, p_nan, TICK));
+    // One more healthy call must NOT cross — clock is back to 1.
+    assert!(!restart_ready(&mut s, p, TICK));
 }
