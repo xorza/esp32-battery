@@ -17,7 +17,7 @@ use esp32_battery_logic::form;
 
 use crate::http::{json_err, json_ok, mount_get, mount_json_get, mount_post, read_to_buf};
 use crate::net::{CredsMailbox, SubmissionStatus, SubmissionStatusHandle};
-use crate::nvs_creds::WifiCredentials;
+use crate::nvs_creds::{PASSWORD_MAX, SSID_MAX, WifiCredentials};
 use crate::wifi::{ScanCache, ScanResult};
 
 struct ScanRowsView<'a>(&'a ScanResult);
@@ -45,8 +45,13 @@ pub fn mount(
 
     let save_status = status.clone();
     mount_post(server, "/save", move |mut req| {
-        let mut body_buf = [0u8; 256];
-        let filled = read_to_buf(&mut req, &mut body_buf)?;
+        // Worst-case URL-encoded body: `ssid=` + 32*3 + `&pass=` + 63*3
+        // = 296 bytes. 384 leaves headroom for stray `&` params without
+        // letting an attacker stream unbounded input into the handler.
+        let mut body_buf = [0u8; 384];
+        let Some(filled) = read_to_buf(&mut req, &mut body_buf)? else {
+            return json_err(req, 413, "Request body too large");
+        };
         let Ok(body) = std::str::from_utf8(&body_buf[..filled]) else {
             return json_err(req, 400, "Body is not valid UTF-8");
         };
@@ -55,19 +60,22 @@ pub fn mount(
             return json_err(req, 400, "Missing SSID");
         };
 
-        let mut ssid_buf = [0u8; 33];
+        // Buffers sized one past the radio limit so an at-limit input fits
+        // and an oversize one still fills past the limit, getting rejected
+        // by the length check below rather than silently truncated.
+        let mut ssid_buf = [0u8; SSID_MAX + 1];
         let ssid_len = form::url_decode(ssid_raw, &mut ssid_buf);
         let Ok(ssid) = std::str::from_utf8(&ssid_buf[..ssid_len]) else {
             return json_err(req, 400, "SSID is not valid UTF-8");
         };
 
-        let mut pass_buf = [0u8; 65];
+        let mut pass_buf = [0u8; PASSWORD_MAX + 1];
         let pass_len = form::url_decode(pass_raw, &mut pass_buf);
         let Ok(password) = std::str::from_utf8(&pass_buf[..pass_len]) else {
             return json_err(req, 400, "Password is not valid UTF-8");
         };
 
-        if ssid.is_empty() || ssid.len() > 32 {
+        if ssid.is_empty() || ssid.len() > SSID_MAX {
             return json_err(req, 400, "Invalid SSID");
         }
         // WPA/WPA2: 8-63 chars, or empty for open networks.
@@ -75,7 +83,7 @@ pub fn mount(
             return json_err(req, 400, "Password must be 8-63 characters");
         }
 
-        let creds = WifiCredentials::new(ssid.to_string(), password.to_string());
+        let creds = WifiCredentials::new(ssid, password);
 
         // Latest-wins: a second /save before the supervisor drains
         // overwrites the first.

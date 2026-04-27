@@ -123,22 +123,27 @@ pub(crate) fn read_exact(
     Ok(())
 }
 
-/// Read up to `buf.len()` bytes from the request body, returning the
-/// number actually read. Treats short reads (EOF) as success — for
-/// handlers parsing variable-size form bodies into a bounded buffer.
+/// Read the request body into `buf`. Returns `Ok(Some(n))` with the
+/// number of bytes actually read, or `Ok(None)` if the body did not fit
+/// — the caller should reject with 413. One extra probe read past the
+/// buffer end is what distinguishes "exact fit" from "truncated".
 pub(crate) fn read_to_buf(
     req: &mut Request<&mut EspHttpConnection>,
     buf: &mut [u8],
-) -> Result<usize, EspError> {
+) -> Result<Option<usize>, EspError> {
     let mut filled = 0;
     while filled < buf.len() {
         let n = req.read(&mut buf[filled..]).map_err(|e| e.0)?;
         if n == 0 {
-            break;
+            return Ok(Some(filled));
         }
         filled += n;
     }
-    Ok(filled)
+    let mut probe = [0u8; 1];
+    match req.read(&mut probe).map_err(|e| e.0)? {
+        0 => Ok(Some(filled)),
+        _ => Ok(None),
+    }
 }
 
 /// JSON response with a caller-chosen status and pre-serialized body.
