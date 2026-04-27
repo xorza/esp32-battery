@@ -15,7 +15,7 @@ debug = true
 opt-level = "z"
 
 [workspace]
-exclude = ["logic"]
+exclude = ["logic", "xy7025"]
 
 [features]
 default = ["esp32c6", "lcd"]
