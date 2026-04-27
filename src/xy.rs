@@ -22,7 +22,7 @@ use esp32_battery_logic::charging::{
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
 
-use xy_modbus::{RtuError, Status};
+use xy_modbus::{Model, ModelCheck, RtuError, Status};
 
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
@@ -40,12 +40,18 @@ const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
 /// Derived from the profile so a chemistry/cell-count change moves them
 /// in lockstep — no chance the OVP ceiling drifts below the absorb target.
 const SAFETY: LogicSafetyLimits = PACK_PROFILE.safety_limits();
+/// Buck variant on this board. Sets the per-register scales (I-OUT,
+/// POWER, S-OCP, S-OPP) — wrong family silently shifts readings by 10×,
+/// so this also drives the boot-time `verify_model` check and the fake
+/// device's mock MODEL response.
+const PACK_MODEL: Model = Model::Xy7025;
 
 /// The set of operations the charging loop needs from the buck. Real
 /// builds get the `xy_modbus`-backed implementation; `xy-fake` builds
 /// get an in-memory canned device. The thread loop is identical.
 #[allow(dead_code)] // protection-status methods wired in once the supervisor gates recovery on them
 trait XyDevice {
+    fn verify_model(&mut self) -> Result<ModelCheck, RtuError>;
     fn read_status(&mut self) -> Result<Status, RtuError>;
     fn read_protection(&mut self) -> Result<LogicSafetyLimits, RtuError>;
     fn read_protection_status(&mut self) -> Result<XyProtectionStatus, RtuError>;
@@ -74,6 +80,13 @@ enum BootError {
     /// hand off to the supervisor — we'd be entering Pending with the
     /// buck already sourcing.
     OutputOn,
+    /// Device's MODEL register reports a code mapped to a different
+    /// scale family than the configured `Model`. Readings (especially
+    /// I-OUT) would be off by 10×; refuse to proceed.
+    ModelMismatch {
+        expected_code: u16,
+        device_code: u16,
+    },
 }
 
 impl From<RtuError> for BootError {
@@ -97,6 +110,13 @@ impl std::fmt::Display for BootError {
                 )
             }
             Self::OutputOn => f.write_str("OUTPUT_EN read back ON after disable"),
+            Self::ModelMismatch {
+                expected_code,
+                device_code,
+            } => write!(
+                f,
+                "MODEL mismatch: configured family expects 0x{expected_code:04X}, device reports 0x{device_code:04X}"
+            ),
         }
     }
 }
@@ -109,9 +129,9 @@ mod real {
     use esp_idf_hal::units::Hertz;
 
     use xy_modbus::esp_idf::EspIdfTransport;
-    use xy_modbus::{Model, ProtectionStatus, RtuError, SafetyLimits, Status};
+    use xy_modbus::{ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Status};
 
-    use super::{LogicSafetyLimits, XyDevice, XyProtectionStatus};
+    use super::{LogicSafetyLimits, PACK_MODEL, XyDevice, XyProtectionStatus};
     use crate::board::XyPins;
 
     fn to_logic_safety(s: SafetyLimits) -> LogicSafetyLimits {
@@ -165,11 +185,15 @@ mod real {
             .expect("UART1 init");
             // Default XY-series timing baked in by `from_esp_uart`:
             // 500 ms response window, 50 ms inter-frame gap.
-            Self(xy_modbus::Xy::from_esp_uart(uart, Model::Xy7025))
+            Self(xy_modbus::Xy::from_esp_uart(uart, PACK_MODEL))
         }
     }
 
     impl XyDevice for Xy<'_> {
+        fn verify_model(&mut self) -> Result<ModelCheck, RtuError> {
+            self.0.verify_model()
+        }
+
         fn read_status(&mut self) -> Result<Status, RtuError> {
             self.0.read_status()
         }
@@ -219,9 +243,9 @@ mod fake {
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
-    use xy_modbus::{RtuError, Status};
+    use xy_modbus::{ModelCheck, RtuError, Status};
 
-    use super::{LogicSafetyLimits, XyDevice, XyProtectionStatus};
+    use super::{LogicSafetyLimits, PACK_MODEL, XyDevice, XyProtectionStatus};
     use crate::board::XyPins;
 
     const BAUD: u32 = 115200;
@@ -270,6 +294,19 @@ mod fake {
     }
 
     impl XyDevice for Xy<'_> {
+        fn verify_model(&mut self) -> Result<ModelCheck, RtuError> {
+            // Fake mirrors what a correctly-wired device would report:
+            // the family code that matches `PACK_MODEL`. `expect`
+            // rather than a fallback so switching `PACK_MODEL` to an
+            // unpinned variant (SK family / Custom) fails loudly here
+            // instead of silently masking the boot gate.
+            Ok(ModelCheck::Match {
+                device_code: PACK_MODEL
+                    .expected_model_code()
+                    .expect("PACK_MODEL must have a pinned family code"),
+            })
+        }
+
         fn read_status(&mut self) -> Result<Status, RtuError> {
             let v = if self.output_on { self.v_set } else { 0.0 };
             Ok(Status {
@@ -324,6 +361,21 @@ mod fake {
 /// first tick. Readback catches dropped writes, scale mismatches, and
 /// wrong-slave wiring before the supervisor can ask for output enable.
 fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<(), BootError> {
+    // Confirm we're talking to the family we think we're talking to —
+    // before any writes go out. Wrong-family configuration silently
+    // corrupts every subsequent reading by 10×, so we refuse to proceed
+    // on Mismatch. `Inconclusive` (SK family / Custom / undocumented
+    // code) is allowed through; verification just isn't possible.
+    if let ModelCheck::Mismatch {
+        expected_code,
+        device_code,
+    } = xy.verify_model()?
+    {
+        return Err(BootError::ModelMismatch {
+            expected_code,
+            device_code,
+        });
+    }
     xy.set_output(false)?;
     // Wipe any latched protection cause from a prior session — power
     // outages and unrelated crashes leave 0x0010 set, and we don't want
