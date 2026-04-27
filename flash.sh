@@ -24,10 +24,19 @@ else
     cargo "$ALIAS"
 fi
 
+if [[ -n "${PORT:-}" ]]; then
+    : # honor caller override
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    PORT="$(ls /dev/cu.usbmodem* 2>/dev/null | head -n1 || true)"
+    [[ -z "$PORT" ]] && { echo "No /dev/cu.usbmodem* device found"; exit 1; }
+else
+    PORT="/dev/ttyACM0"
+fi
+
 espflash flash \
     --erase-data-parts ota \
     --monitor \
     --non-interactive \
     --partition-table "$PARTITIONS" \
-    --port /dev/ttyACM0 \
+    --port "$PORT" \
     "$ELF"
