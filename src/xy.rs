@@ -88,6 +88,11 @@ enum BootError {
         expected: f32,
         actual: f32,
     },
+    /// OUTPUT_EN read back as 1 after we wrote 0 + S_INI=0. Either the
+    /// disable didn't stick or the front panel re-enabled it. Refuse to
+    /// hand off to the supervisor — we'd be entering Pending with the
+    /// buck already sourcing.
+    OutputOn,
 }
 
 impl From<RtuError> for BootError {
@@ -110,6 +115,7 @@ impl std::fmt::Display for BootError {
                     "{what} readback mismatch: expected {expected:.2}, got {actual:.2}"
                 )
             }
+            Self::OutputOn => f.write_str("OUTPUT_EN read back ON after disable"),
         }
     }
 }
@@ -386,6 +392,12 @@ fn boot_sequence<D: XyDevice>(xy: &D) -> Result<(), BootError> {
     verify("OVP", SAFETY.ovp_v, p.ovp_v)?;
     verify("OCP", SAFETY.ocp_a, p.ocp_a)?;
     verify("LVP", SAFETY.lvp_v, p.lvp_v)?;
+    // Confirm the disable actually took. set_output(false) and S_INI=0
+    // both happened above; if OUTPUT_EN still reads 1, we don't trust
+    // the device enough to hand off to the supervisor.
+    if xy.read_output_on()? {
+        return Err(BootError::OutputOn);
+    }
     Ok(())
 }
 
@@ -440,20 +452,7 @@ fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
     }
     error!("XY boot failed after {BOOT_RETRY_COUNT} attempts — rebooting MCU");
     recorder.record(Event::Xy(XyError::BootSequence));
-    match xy.set_output(false) {
-        Ok(()) => warn!("XY pre-reboot set_output(false) succeeded"),
-        Err(e) => error!(
-            "XY pre-reboot set_output(false) FAILED: {e} — relying on S_INI=OFF after reboot"
-        ),
-    }
-    // Releases the WDT subscription so the reboot grace period (2 s in
-    // `reboot_after`) doesn't trip the deadman before the restart fires.
-    task_wdt::unsubscribe();
-    reboot::reboot_after("XY boot failed: rebooting now");
-    // Park until the reboot fires — nothing below would matter.
-    loop {
-        thread::park();
-    }
+    shutdown_or_reboot(xy, "pre-reboot", true);
 }
 
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
@@ -499,31 +498,46 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
                     .copied()
                     .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("<non-string panic>");
-                error!(
-                    "XY supervisor thread PANICKED: {msg} — forcing output OFF, thread will exit"
-                );
+                error!("XY supervisor thread PANICKED: {msg} — forcing output OFF");
                 recorder.record(Event::Xy(XyError::SupervisorPanic));
-                match xy.set_output(false) {
-                    Ok(()) => error!("XY post-panic set_output(false) succeeded — buck is OFF"),
-                    Err(e) => error!(
-                        "XY post-panic set_output(false) FAILED: {e} — buck may still be sourcing, hardware OVP/OCP is the only remaining backstop"
-                    ),
-                }
-                task_wdt::unsubscribe();
+                shutdown_or_reboot(&xy, "post-panic", false);
                 return;
             }
         }
     }
 
     error!(
-        "XY recovery budget exhausted ({} attempts) — forcing output OFF, thread will exit",
+        "XY recovery budget exhausted ({} attempts) — forcing output OFF",
         charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
     );
-    match xy.set_output(false) {
-        Ok(()) => error!("XY recovery-exhausted set_output(false) succeeded — buck is OFF"),
-        Err(e) => error!("XY recovery-exhausted set_output(false) FAILED: {e}"),
-    }
+    shutdown_or_reboot(&xy, "recovery-exhausted", false);
+}
+
+/// Best-effort `set_output(false)` then either exit (buck is OFF) or
+/// reboot. Reboot is forced when the caller can't continue regardless
+/// (boot failure), or triggered by a failed disable — leaving the buck
+/// sourcing with no supervisor and no WDT is the one thing we never want.
+/// S_INI=0 ensures the buck comes back OFF after the reboot.
+fn shutdown_or_reboot<D: XyDevice>(xy: &D, ctx: &'static str, force_reboot: bool) {
+    let disable_ok = match xy.set_output(false) {
+        Ok(()) => {
+            error!("XY {ctx} set_output(false) succeeded — buck is OFF");
+            true
+        }
+        Err(e) => {
+            error!("XY {ctx} set_output(false) FAILED: {e}");
+            false
+        }
+    };
+    // Releases the WDT subscription so the reboot grace period (2 s in
+    // `reboot_after`) doesn't trip the deadman before the restart fires.
     task_wdt::unsubscribe();
+    if force_reboot || !disable_ok {
+        reboot::reboot_after("XY shutdown: rebooting now");
+        loop {
+            thread::park();
+        }
+    }
 }
 
 /// One read cycle: poll the buck, push readings into shared sensor data,

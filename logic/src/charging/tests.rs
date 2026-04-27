@@ -1276,6 +1276,23 @@ fn buck_output_off_in_pending_does_not_fault() {
 }
 
 #[test]
+fn buck_output_on_in_pending_latches() {
+    // Pending expects the buck OFF — boot_sequence wrote set_output(false)
+    // and S_INI=0. If OUTPUT_EN reads ON anyway, regulation is happening
+    // under unknown conditions; latch immediately, no debounce.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p = PollResult {
+        setpoints: Some(s.expected_setpoints()),
+        output: Some(BuckOutput::On),
+        battery: b(OK_V, -0.1),
+    };
+    let a = s.tick(p, TICK);
+    assert!(matches_disable(&a, FaultReason::OutputOnInPending));
+    // Non-recoverable: caller must reboot, not retry.
+    assert_eq!(FaultReason::OutputOnInPending.recovery_healthy_for(), None);
+}
+
+#[test]
 #[should_panic]
 fn ack_enable_from_tripped_panics() {
     let mut s = active(lfp_4s());

@@ -292,6 +292,12 @@ pub enum FaultReason {
     /// over-temp tripped, or someone toggled the front panel. Payload is
     /// the cause from PROTECT (0x0010); `None` if that read failed.
     OutputUnexpectedlyOff(Option<XyProtectionStatus>),
+    /// Buck's OUTPUT_EN register read 1 while the supervisor was Pending —
+    /// output is supposed to be off until the supervisor itself enables it.
+    /// Means the boot disable / S_INI=0 didn't stick or the front panel
+    /// toggled it on. We don't know what setpoints regulation is using;
+    /// fail closed and reboot.
+    OutputOnInPending,
 }
 
 impl std::fmt::Display for FaultReason {
@@ -304,6 +310,7 @@ impl std::fmt::Display for FaultReason {
             Self::SettingsDrift => f.write_str("setpoint readback drift"),
             Self::OutputUnexpectedlyOff(Some(s)) => write!(f, "buck self-disabled ({s})"),
             Self::OutputUnexpectedlyOff(None) => f.write_str("buck self-disabled (cause unread)"),
+            Self::OutputOnInPending => f.write_str("buck output on while supervisor pending"),
         }
     }
 }
@@ -621,11 +628,20 @@ impl ChargeSupervisor {
             }
         }
 
-        // Active and the buck reports output OFF — it self-disabled
-        // (hardware OVP/OCP/LVP, over-temp, panel toggle). Latch.
-        // Pending doesn't check: output is supposed to be off there.
-        if !pending && let Some(BuckOutput::Off { cause }) = p.output {
-            return self.latch(FaultReason::OutputUnexpectedlyOff(cause));
+        // Mismatch between latch state and what the buck reports.
+        // Active expects ON: any OFF means the buck self-disabled
+        // (hardware OVP/OCP/LVP, over-temp, panel toggle).
+        // Pending expects OFF: any ON means our boot disable / S_INI=0
+        // didn't stick — fail closed and reboot rather than trust
+        // unknown regulation.
+        match (pending, p.output) {
+            (false, Some(BuckOutput::Off { cause })) => {
+                return self.latch(FaultReason::OutputUnexpectedlyOff(cause));
+            }
+            (true, Some(BuckOutput::On)) => {
+                return self.latch(FaultReason::OutputOnInPending);
+            }
+            _ => {}
         }
 
         if self
