@@ -93,20 +93,20 @@ impl ProtectionStatus {
 
 impl fmt::Display for ProtectionStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Normal => f.write_str("normal"),
-            Self::Ovp => f.write_str("ovp"),
-            Self::Ocp => f.write_str("ocp"),
-            Self::Opp => f.write_str("opp"),
-            Self::Lvp => f.write_str("lvp"),
-            Self::Oah => f.write_str("oah"),
-            Self::Ohp => f.write_str("ohp"),
-            Self::Otp => f.write_str("otp"),
-            Self::Oep => f.write_str("oep"),
-            Self::Owh => f.write_str("owh"),
-            Self::Icp => f.write_str("icp"),
-            Self::Unknown(v) => write!(f, "unknown({v})"),
-        }
+        f.write_str(match self {
+            Self::Normal => "normal",
+            Self::Ovp => "ovp",
+            Self::Ocp => "ocp",
+            Self::Opp => "opp",
+            Self::Lvp => "lvp",
+            Self::Oah => "oah",
+            Self::Ohp => "ohp",
+            Self::Otp => "otp",
+            Self::Oep => "oep",
+            Self::Owh => "owh",
+            Self::Icp => "icp",
+            Self::Unknown(v) => return write!(f, "unknown({v})"),
+        })
     }
 }
 

@@ -356,42 +356,44 @@ impl<T: ModbusTransport> Xy<T> {
 
 fn decode_group(r: &[u16; GROUP_LEN as usize], model: Model) -> GroupParams {
     let i_scale = model.current_scale();
+    let [v_set, i_set, s_lvp, s_ovp, s_ocp, s_opp, s_ohp_h, s_ohp_m, s_oah_low, s_oah_high, s_owh_low, s_owh_high, s_otp, s_ini] =
+        *r;
     GroupParams {
-        v_set: from_reg(r[GROUP_OFF_V_SET as usize], 100.0),
-        i_set: from_reg(r[GROUP_OFF_I_SET as usize], i_scale),
-        s_lvp_v: from_reg(r[GROUP_OFF_S_LVP as usize], 100.0),
-        s_ovp_v: from_reg(r[GROUP_OFF_S_OVP as usize], 100.0),
-        s_ocp_a: from_reg(r[GROUP_OFF_S_OCP as usize], i_scale),
-        s_opp_w: from_reg(r[GROUP_OFF_S_OPP as usize], model.opp_scale()),
-        s_ohp_h: r[GROUP_OFF_S_OHP_H as usize],
-        s_ohp_m: r[GROUP_OFF_S_OHP_M as usize],
-        s_oah_low: r[GROUP_OFF_S_OAH_L as usize],
-        s_oah_high: r[GROUP_OFF_S_OAH_H as usize],
-        s_owh_low: r[GROUP_OFF_S_OWH_L as usize],
-        s_owh_high: r[GROUP_OFF_S_OWH_H as usize],
-        s_otp: from_reg(r[GROUP_OFF_S_OTP as usize], 10.0),
-        power_on_output: r[GROUP_OFF_S_INI as usize] != 0,
+        v_set: from_reg(v_set, 100.0),
+        i_set: from_reg(i_set, i_scale),
+        s_lvp_v: from_reg(s_lvp, 100.0),
+        s_ovp_v: from_reg(s_ovp, 100.0),
+        s_ocp_a: from_reg(s_ocp, i_scale),
+        s_opp_w: from_reg(s_opp, model.opp_scale()),
+        s_ohp_h,
+        s_ohp_m,
+        s_oah_low,
+        s_oah_high,
+        s_owh_low,
+        s_owh_high,
+        s_otp: from_reg(s_otp, 10.0),
+        power_on_output: s_ini != 0,
     }
 }
 
 fn encode_group(p: &GroupParams, model: Model) -> [u16; GROUP_LEN as usize] {
     let i_scale = model.current_scale();
-    let mut r = [0u16; GROUP_LEN as usize];
-    r[GROUP_OFF_V_SET as usize] = to_reg(p.v_set, 100.0);
-    r[GROUP_OFF_I_SET as usize] = to_reg(p.i_set, i_scale);
-    r[GROUP_OFF_S_LVP as usize] = to_reg(p.s_lvp_v, 100.0);
-    r[GROUP_OFF_S_OVP as usize] = to_reg(p.s_ovp_v, 100.0);
-    r[GROUP_OFF_S_OCP as usize] = to_reg(p.s_ocp_a, i_scale);
-    r[GROUP_OFF_S_OPP as usize] = to_reg(p.s_opp_w, model.opp_scale());
-    r[GROUP_OFF_S_OHP_H as usize] = p.s_ohp_h;
-    r[GROUP_OFF_S_OHP_M as usize] = p.s_ohp_m;
-    r[GROUP_OFF_S_OAH_L as usize] = p.s_oah_low;
-    r[GROUP_OFF_S_OAH_H as usize] = p.s_oah_high;
-    r[GROUP_OFF_S_OWH_L as usize] = p.s_owh_low;
-    r[GROUP_OFF_S_OWH_H as usize] = p.s_owh_high;
-    r[GROUP_OFF_S_OTP as usize] = to_reg(p.s_otp, 10.0);
-    r[GROUP_OFF_S_INI as usize] = p.power_on_output as u16;
-    r
+    [
+        to_reg(p.v_set, 100.0),
+        to_reg(p.i_set, i_scale),
+        to_reg(p.s_lvp_v, 100.0),
+        to_reg(p.s_ovp_v, 100.0),
+        to_reg(p.s_ocp_a, i_scale),
+        to_reg(p.s_opp_w, model.opp_scale()),
+        p.s_ohp_h,
+        p.s_ohp_m,
+        p.s_oah_low,
+        p.s_oah_high,
+        p.s_owh_low,
+        p.s_owh_high,
+        to_reg(p.s_otp, 10.0),
+        p.power_on_output as u16,
+    ]
 }
 
 #[cfg(test)]
