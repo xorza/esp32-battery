@@ -89,10 +89,12 @@ impl<T: ModbusTransport> Xy<T> {
         })
     }
 
-    /// Read the live status block (registers 0x0000–0x0005). Single
-    /// 6-register transaction; recommended hot-loop poll.
+    /// Read the live + control snapshot (registers 0x0000–0x0012) in
+    /// a single 19-register transaction. Returns everything a supervisor
+    /// needs each tick (live readings, regulation mode, latched
+    /// protection cause, output-enable flag) in one Modbus round-trip.
     pub fn read_status(&mut self) -> Result<Status, RtuError> {
-        let mut r = [0u16; 6];
+        let mut r = [0u16; 0x13];
         self.transport.read_holding(self.slave, REG_V_SET, &mut r)?;
         let i_scale = self.model.current_scale();
         Ok(Status {
@@ -102,6 +104,9 @@ impl<T: ModbusTransport> Xy<T> {
             i_out: from_reg(r[3], i_scale),
             p_out: from_reg(r[4], self.model.power_scale()),
             v_in: from_reg(r[5], 100.0),
+            protection: ProtectionStatus::from_register(r[REG_PROTECT as usize]),
+            reg_mode: RegMode::from_reg(r[REG_CVCC as usize]),
+            output_on: r[REG_OUTPUT_EN as usize] != 0,
         })
     }
 
@@ -217,11 +222,7 @@ impl<T: ModbusTransport> Xy<T> {
     }
 
     pub fn read_reg_mode(&mut self) -> Result<RegMode, RtuError> {
-        Ok(if self.read_one(REG_CVCC)? == 0 {
-            RegMode::ConstantVoltage
-        } else {
-            RegMode::ConstantCurrent
-        })
+        Ok(RegMode::from_reg(self.read_one(REG_CVCC)?))
     }
 
     // ─── Temperatures ────────────────────────────────────────────────────────

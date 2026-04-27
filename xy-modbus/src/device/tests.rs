@@ -77,22 +77,12 @@ impl ModbusTransport for MockTransport {
     }
 }
 
-#[test]
-fn read_status_decodes_six_regs() {
-    // 1440 → 14.40 V; 1000 → 10.00 A; 1350 → 13.50 V; 50 → 0.50 A;
-    // P_OUT scale 10, so 675 → 67.5 W; 2400 → 24.00 V.
-    let mock = MockTransport::new(vec![Op::Read {
-        addr: REG_V_SET,
-        values: vec![1440, 1000, 1350, 50, 675, 2400],
-    }]);
-    let mut xy = Xy::new(mock, Model::Xy7025);
-    let s = xy.read_status().unwrap();
-    assert_eq!(s.v_set, 14.40);
-    assert_eq!(s.i_set, 10.00);
-    assert_eq!(s.v_out, 13.50);
-    assert_eq!(s.i_out, 0.50);
-    assert_eq!(s.p_out, 67.5);
-    assert_eq!(s.v_in, 24.00);
+/// Build a 19-reg fixture for `read_status` with the first six live regs
+/// populated and the rest zeroed.
+fn status_fixture(live: [u16; 6]) -> Vec<u16> {
+    let mut v = vec![0u16; 0x13];
+    v[..6].copy_from_slice(&live);
+    v
 }
 
 /// Same wire bytes decoded under XY7025 vs a Custom (SK-style) scale family
@@ -103,9 +93,10 @@ fn read_status_decodes_six_regs() {
 fn model_scales_diverge_between_xy7025_and_sk_custom() {
     // 1000 raw with /100 → 10.00 A, with /1000 → 1.000 A.
     // 675 raw with /10 → 67.5 W, with /100 → 6.75 W.
+    let regs = [1440, 1000, 1350, 1000, 675, 2400];
     let xy7025_mock = MockTransport::new(vec![Op::Read {
         addr: REG_V_SET,
-        values: vec![1440, 1000, 1350, 1000, 675, 2400],
+        values: status_fixture(regs),
     }]);
     let mut xy = Xy::new(xy7025_mock, Model::Xy7025);
     let s = xy.read_status().unwrap();
@@ -115,7 +106,7 @@ fn model_scales_diverge_between_xy7025_and_sk_custom() {
 
     let sk_mock = MockTransport::new(vec![Op::Read {
         addr: REG_V_SET,
-        values: vec![1440, 1000, 1350, 1000, 675, 2400],
+        values: status_fixture(regs),
     }]);
     let mut xy = Xy::new(
         sk_mock,
@@ -217,6 +208,39 @@ fn protection_status_decodes_known_codes() {
         xy.read_protection_status().unwrap(),
         ProtectionStatus::Unknown(99)
     );
+}
+
+#[test]
+fn read_status_decodes_19_regs_in_one_transaction() {
+    // Registers 0x0000–0x0012, 19 total. Slot indices match register
+    // addresses (0x10 = PROTECT, 0x11 = CVCC, 0x12 = OUTPUT_EN).
+    // Pin all the cross-cutting fields the supervisor cares about.
+    let mut values = [0u16; 0x13];
+    values[0x00] = 1440; // V_SET → 14.40
+    values[0x01] = 1000; // I_SET → 10.00 (XY7025 scale 100)
+    values[0x02] = 1350; // V_OUT → 13.50
+    values[0x03] = 50; // I_OUT → 0.50
+    values[0x04] = 675; // P_OUT → 67.5 (scale 10)
+    values[0x05] = 2400; // V_IN → 24.00
+    values[0x10] = 4; // PROTECT = LVP
+    values[0x11] = 1; // CVCC = ConstantCurrent
+    values[0x12] = 1; // OUTPUT_EN = on
+
+    let mock = MockTransport::new(vec![Op::Read {
+        addr: REG_V_SET,
+        values: values.to_vec(),
+    }]);
+    let mut xy = Xy::new(mock, Model::Xy7025);
+    let s = xy.read_status().unwrap();
+    assert_eq!(s.v_set, 14.40);
+    assert_eq!(s.i_set, 10.00);
+    assert_eq!(s.v_out, 13.50);
+    assert_eq!(s.i_out, 0.50);
+    assert_eq!(s.p_out, 67.5);
+    assert_eq!(s.v_in, 24.00);
+    assert_eq!(s.protection, ProtectionStatus::Lvp);
+    assert_eq!(s.reg_mode, RegMode::ConstantCurrent);
+    assert!(s.output_on);
 }
 
 #[test]

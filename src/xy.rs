@@ -51,10 +51,10 @@ const PACK_MODEL: Model = Model::Xy7025;
 #[allow(dead_code)] // protection-status methods wired in once the supervisor gates recovery on them
 trait XyDevice {
     fn verify_model(&mut self) -> Result<ModelCheck, RtuError>;
+    /// Live + control snapshot (regs 0x0000–0x0012). One Modbus
+    /// round-trip per supervisor tick.
     fn read_status(&mut self) -> Result<Status, RtuError>;
     fn read_protection(&mut self) -> Result<SafetyLimits, RtuError>;
-    fn read_protection_status(&mut self) -> Result<ProtectionStatus, RtuError>;
-    fn read_output_on(&mut self) -> Result<bool, RtuError>;
     fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError>;
     fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError>;
     fn set_protection(&mut self, limits: SafetyLimits) -> Result<(), RtuError>;
@@ -128,7 +128,7 @@ mod real {
     use esp_idf_hal::units::Hertz;
 
     use xy_modbus::esp_idf::EspIdfTransport;
-    use xy_modbus::{ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Status};
+    use xy_modbus::{ModelCheck, RtuError, SafetyLimits, Status};
 
     use super::{PACK_MODEL, XyDevice};
     use crate::board::XyPins;
@@ -168,14 +168,6 @@ mod real {
             self.0.read_protection()
         }
 
-        fn read_protection_status(&mut self) -> Result<ProtectionStatus, RtuError> {
-            self.0.read_protection_status()
-        }
-
-        fn read_output_on(&mut self) -> Result<bool, RtuError> {
-            self.0.read_output()
-        }
-
         fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
             self.0.set_voltage(volts)
         }
@@ -209,7 +201,7 @@ mod fake {
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
-    use xy_modbus::{ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Status};
+    use xy_modbus::{ModelCheck, ProtectionStatus, RegMode, RtuError, SafetyLimits, Status};
 
     use super::{PACK_MODEL, XyDevice};
     use crate::board::XyPins;
@@ -282,16 +274,13 @@ mod fake {
                 i_out: 0.0,
                 p_out: 0.0,
                 v_in: 24.0,
+                protection: self.protection_status,
+                reg_mode: RegMode::ConstantVoltage,
+                output_on: self.output_on,
             })
         }
         fn read_protection(&mut self) -> Result<SafetyLimits, RtuError> {
             Ok(self.protection)
-        }
-        fn read_protection_status(&mut self) -> Result<ProtectionStatus, RtuError> {
-            Ok(self.protection_status)
-        }
-        fn read_output_on(&mut self) -> Result<bool, RtuError> {
-            Ok(self.output_on)
         }
         fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
             self.v_set = volts;
@@ -362,7 +351,7 @@ fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<(), BootError> {
     // Confirm the disable actually took. set_output(false) and S_INI=0
     // both happened above; if OUTPUT_EN still reads 1, we don't trust
     // the device enough to hand off to the supervisor.
-    if xy.read_output_on()? {
+    if s.output_on {
         return Err(BootError::OutputOn);
     }
     Ok(())
@@ -541,8 +530,39 @@ fn poll<D: XyDevice>(
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
 ) -> PollResult {
-    let setpoints = read_setpoints(xy, sensor_data, recorder);
-    let output = read_output(xy, recorder);
+    // Single bulk read covers V_SET..V_IN, PROTECT, CVCC, OUTPUT_EN —
+    // one Modbus round-trip instead of three. PROTECT is necessarily
+    // Normal while OUTPUT_EN is on; non-Normal here means the buck
+    // self-disabled this session (boot_sequence wiped 0x0010).
+    let (setpoints, output) = match xy.read_status() {
+        Ok(s) => {
+            sensor_data.lock().unwrap().update_ps(PsReading {
+                voltage: s.v_out,
+                current: s.i_out,
+                power: s.p_out,
+            });
+            let setpoints = Some(Setpoints {
+                v_set: s.v_set,
+                i_set: s.i_set,
+            });
+            let output = Some(if s.output_on {
+                BuckOutput::On
+            } else {
+                if s.protection != ProtectionStatus::Normal {
+                    warn!("XY PROTECT latched: {}", s.protection);
+                }
+                BuckOutput::Off {
+                    cause: Some(s.protection),
+                }
+            });
+            (setpoints, output)
+        }
+        Err(e) => {
+            warn!("XY read_status: {e}");
+            recorder.record(Event::Xy(XyError::ReadStatus));
+            (None, None)
+        }
+    };
     let battery = sensor_data
         .lock()
         .unwrap()
@@ -555,62 +575,6 @@ fn poll<D: XyDevice>(
         setpoints,
         output,
         battery,
-    }
-}
-
-fn read_setpoints<D: XyDevice>(
-    xy: &mut D,
-    sensor_data: &Mutex<SensorData>,
-    recorder: &EventRecorder,
-) -> Option<Setpoints> {
-    match xy.read_status() {
-        Ok(s) => {
-            sensor_data.lock().unwrap().update_ps(PsReading {
-                voltage: s.v_out,
-                current: s.i_out,
-                power: s.p_out,
-            });
-            Some(Setpoints {
-                v_set: s.v_set,
-                i_set: s.i_set,
-            })
-        }
-        Err(e) => {
-            warn!("XY read_status: {e}");
-            recorder.record(Event::Xy(XyError::ReadStatus));
-            None
-        }
-    }
-}
-
-/// Read OUTPUT_EN separately — it's at 0x0012, not contiguous with the
-/// main readback block. When the buck reports OFF, ask PROTECT (0x0010)
-/// why — that was wiped during `boot_sequence`, so any non-Normal value
-/// here is from this session. While output is on PROTECT is necessarily
-/// Normal so we skip the round-trip.
-fn read_output<D: XyDevice>(xy: &mut D, recorder: &EventRecorder) -> Option<BuckOutput> {
-    match xy.read_output_on() {
-        Ok(true) => Some(BuckOutput::On),
-        Ok(false) => {
-            let cause = match xy.read_protection_status() {
-                Ok(status) => {
-                    if status != ProtectionStatus::Normal {
-                        warn!("XY PROTECT latched: {status}");
-                    }
-                    Some(status)
-                }
-                Err(e) => {
-                    warn!("XY read_protection_status: {e}");
-                    None
-                }
-            };
-            Some(BuckOutput::Off { cause })
-        }
-        Err(e) => {
-            warn!("XY read_output_on: {e}");
-            recorder.record(Event::Xy(XyError::ReadStatus));
-            None
-        }
     }
 }
 

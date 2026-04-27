@@ -1,5 +1,7 @@
 //! Live readings, setpoints, and cumulative counters.
 
+use super::enums::{ProtectionStatus, RegMode};
+
 // ─── Setpoints ───────────────────────────────────────────────────────────────
 
 /// Output voltage / current setpoints (registers 0x0000–0x0001).
@@ -13,7 +15,10 @@ pub struct Setpoints {
 
 // ─── Status ──────────────────────────────────────────────────────────────────
 
-/// Live status block (registers 0x0000–0x0005).
+/// Live + control snapshot covering registers 0x0000–0x0012 in a single
+/// 19-register transaction. Returns everything a supervisor needs each
+/// tick (live readings, regulation mode, latched protection cause,
+/// output-enable flag) in one Modbus round-trip.
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -24,6 +29,13 @@ pub struct Status {
     pub i_out: f32,
     pub p_out: f32,
     pub v_in: f32,
+    /// `PROTECT` register (0x0010). Necessarily `Normal` while
+    /// [`Self::output_on`] is true.
+    pub protection: ProtectionStatus,
+    /// `CVCC` register (0x0011) — current regulation mode.
+    pub reg_mode: RegMode,
+    /// `OUTPUT_EN` register (0x0012).
+    pub output_on: bool,
 }
 
 // ─── OnTime ──────────────────────────────────────────────────────────────────

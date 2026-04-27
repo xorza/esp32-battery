@@ -14,6 +14,15 @@ pub enum RegMode {
     ConstantCurrent,
 }
 
+impl RegMode {
+    pub const fn from_reg(v: u16) -> Self {
+        match v {
+            0 => Self::ConstantVoltage,
+            _ => Self::ConstantCurrent,
+        }
+    }
+}
+
 // ─── TempUnit ────────────────────────────────────────────────────────────────
 
 /// Temperature unit selected by `F-C` (register 0x0013).
