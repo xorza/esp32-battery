@@ -32,22 +32,29 @@ fn restart_ready(s: &mut ChargeSupervisor, p: PollResult, dt: Duration) -> bool 
     matches!(s.tick(p, dt), Action::RestartSupervisor)
 }
 
-/// Tick with a successful, drift-free Modbus readback where the buck
-/// reports the output state the supervisor currently expects — the
-/// common case. Phase transitions don't fire spurious `SettingsDrift`,
-/// and Active ticks don't fire spurious `OutputUnexpectedlyOff`.
-fn ok_tick(s: &mut ChargeSupervisor, battery: Option<BatterySample>, elapsed: Duration) -> Action {
+/// Drift-free PollResult matching the supervisor's expected state. Active
+/// → output ON; Pending or Tripped → output OFF (no protection cause).
+/// Tests that need to perturb one field use spread syntax:
+/// `PollResult { output: Some(BuckOutput::On), ..expected_poll(&s, ...) }`.
+fn expected_poll(s: &ChargeSupervisor, battery: Option<BatterySample>) -> PollResult {
     let output = if s.expected_output_on() {
         BuckOutput::On
     } else {
         BuckOutput::Off { cause: None }
     };
-    let p = PollResult {
+    PollResult {
         setpoints: Some(s.expected_setpoints()),
         output: Some(output),
         battery,
-    };
-    let a = s.tick(p, elapsed);
+    }
+}
+
+/// Tick with a successful, drift-free Modbus readback where the buck
+/// reports the output state the supervisor currently expects — the
+/// common case. Phase transitions don't fire spurious `SettingsDrift`,
+/// and Active ticks don't fire spurious `OutputUnexpectedlyOff`.
+fn ok_tick(s: &mut ChargeSupervisor, battery: Option<BatterySample>, elapsed: Duration) -> Action {
+    let a = s.tick(expected_poll(s, battery), elapsed);
     // Auto-ack voltage updates: this helper simulates the happy path
     // (every Modbus write succeeds), and a successful set_voltage write
     // is part of that. Tests of the retry-on-failure path use
@@ -90,6 +97,30 @@ fn active(profile: Profile) -> ChargeSupervisor {
     s
 }
 
+/// Drive the supervisor into Absorb. After this, exactly one Absorb tick
+/// has elapsed (the transition itself).
+fn enter_absorb(s: &mut ChargeSupervisor) {
+    assert!(matches!(
+        ok_tick(s, b(OK_V, -4.0), TICK),
+        Action::UpdateVoltage { .. }
+    ));
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+/// Drive `s` from Active into `Tripped(OutputUnexpectedlyOff(cause), acked: true)`.
+/// Recovery tests pass a recoverable cause (LVP); gate tests pass a
+/// non-recoverable one. The cause governs whether `tick` will eventually
+/// emit `Action::RestartSupervisor`.
+fn latch_self_disable(s: &mut ChargeSupervisor, cause: Option<XyProtectionStatus>) {
+    let p = PollResult {
+        output: Some(BuckOutput::Off { cause }),
+        ..expected_poll(s, b(OK_V, -0.1))
+    };
+    let a = s.tick(p, TICK);
+    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(cause)));
+    s.ack_disable();
+}
+
 // --- Profile construction ---
 
 #[test]
@@ -127,23 +158,6 @@ fn lfp_4s_50ah_matches_hand_calculation() {
     assert!(p.regulation_a > p.enter_absorb_a);
     assert!(p.enter_absorb_a > p.exit_absorb_a);
     assert!(s.ovp_v > p.absorb_v + OV_MARGIN_V);
-}
-
-#[test]
-fn lfp_4s_voltages_match_known_setpoints() {
-    let p = lfp_4s();
-    // 3.60 V × 4 = 14.4 V CV (daily-cycle); 3.375 V × 4 = 13.5 V float.
-    assert!(approx(p.absorb_v, 14.4));
-    assert!(approx(p.float_v, 13.5));
-}
-
-#[test]
-fn lfp_4s_currents_derive_from_capacity() {
-    // 50 Ah × {0.2C, 0.06C, 0.05C} = {10 A, 3 A, 2.5 A}.
-    let p = lfp_4s();
-    assert!(approx(p.regulation_a, 10.0));
-    assert!(approx(p.enter_absorb_a, 3.0));
-    assert!(approx(p.exit_absorb_a, 2.5));
 }
 
 #[test]
@@ -216,17 +230,6 @@ fn new_rejects_absorb_not_above_float() {
         exit_absorb_a: 2.5,
     };
     let _ = ChargeSupervisor::new(bogus);
-}
-
-#[test]
-fn safety_limits_match_lfp_4s_known_values() {
-    // 4S LFP daily, 50 Ah: absorb 14.4 V, float 13.5 V, CC 10 A.
-    // OVP = 14.4 + 0.6 = 15.0; OCP = 10 * 1.5 = 15.0.
-    // LVP is input UVLO on the XY7025: 24 V nominal − 2 V margin = 22 V.
-    let s = lfp_4s().safety_limits();
-    assert!(approx(s.ovp_v, 15.0));
-    assert!(approx(s.ocp_a, 15.0));
-    assert!(approx(s.lvp_v, 22.0));
 }
 
 #[test]
@@ -646,16 +649,6 @@ fn modbus_unhealthy_honors_elapsed() {
 
 // --- Absorb time cap ---
 
-/// Drive the supervisor into Absorb. After this, exactly one Absorb tick
-/// has elapsed (the transition itself).
-fn enter_absorb(s: &mut ChargeSupervisor) {
-    assert!(matches!(
-        ok_tick(s, b(OK_V, -4.0), TICK),
-        Action::UpdateVoltage { .. }
-    ));
-    assert!(matches!(s.phase(), Phase::Absorb));
-}
-
 #[test]
 fn absorb_does_not_time_out_below_budget() {
     let mut s = active(lfp_4s());
@@ -894,57 +887,33 @@ fn setpoint_drift_v_set_latches_immediately() {
     // Float target is 13.5 V; pretend the buck reports 12.0 V — well past
     // the 0.02 V tolerance.
     let mut s = active(lfp_4s());
-    let bad = Some(Setpoints {
-        v_set: 12.0,
-        i_set: 10.0,
-    });
-    let a = s.tick(
-        PollResult {
-            setpoints: bad,
-            output: Some(BuckOutput::On),
-            battery: b(13.5, -0.1),
-        },
-        TICK,
-    );
-    assert!(matches_disable(&a, FaultReason::SettingsDrift));
+    let p = PollResult {
+        setpoints: Some(Setpoints { v_set: 12.0, i_set: 10.0 }),
+        ..expected_poll(&s, b(13.5, -0.1))
+    };
+    assert!(matches_disable(&s.tick(p, TICK), FaultReason::SettingsDrift));
 }
 
 #[test]
 fn setpoint_drift_i_set_latches_immediately() {
     // Float target is 13.5 V (matches), but I_SET disagrees with the 10 A regulation.
     let mut s = active(lfp_4s());
-    let bad = Some(Setpoints {
-        v_set: 13.5,
-        i_set: 5.0,
-    });
-    let a = s.tick(
-        PollResult {
-            setpoints: bad,
-            output: Some(BuckOutput::On),
-            battery: b(13.5, -0.1),
-        },
-        TICK,
-    );
-    assert!(matches_disable(&a, FaultReason::SettingsDrift));
+    let p = PollResult {
+        setpoints: Some(Setpoints { v_set: 13.5, i_set: 5.0 }),
+        ..expected_poll(&s, b(13.5, -0.1))
+    };
+    assert!(matches_disable(&s.tick(p, TICK), FaultReason::SettingsDrift));
 }
 
 #[test]
 fn setpoint_within_tolerance_no_drift_fault() {
     // 0.01 V off — one register quantum, under the 0.02 tolerance.
     let mut s = active(lfp_4s());
-    let close = Some(Setpoints {
-        v_set: 13.51,
-        i_set: 10.0,
-    });
-    let a = s.tick(
-        PollResult {
-            setpoints: close,
-            output: Some(BuckOutput::On),
-            battery: b(13.5, -0.1),
-        },
-        TICK,
-    );
-    assert!(matches!(a, Action::None));
+    let p = PollResult {
+        setpoints: Some(Setpoints { v_set: 13.51, i_set: 10.0 }),
+        ..expected_poll(&s, b(13.5, -0.1))
+    };
+    assert!(matches!(s.tick(p, TICK), Action::None));
     assert!(s.fault().is_none());
 }
 
@@ -957,19 +926,11 @@ fn setpoint_drift_does_not_overwrite_existing_latch() {
         fail_tick(&mut s, b(13.5, -0.1), TICK);
     }
     assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
-    let bad = Some(Setpoints {
-        v_set: 12.0,
-        i_set: 10.0,
-    });
-    let a = s.tick(
-        PollResult {
-            setpoints: bad,
-            output: Some(BuckOutput::On),
-            battery: b(13.5, -0.1),
-        },
-        TICK,
-    );
-    assert!(matches_disable(&a, FaultReason::ModbusUnhealthy));
+    let p = PollResult {
+        setpoints: Some(Setpoints { v_set: 12.0, i_set: 10.0 }),
+        ..expected_poll(&s, b(13.5, -0.1))
+    };
+    assert!(matches_disable(&s.tick(p, TICK), FaultReason::ModbusUnhealthy));
 }
 
 // --- Pending → Active bring-up ---
@@ -1006,19 +967,11 @@ fn pending_overvolt_latches_without_debounce() {
 #[test]
 fn pending_drift_latches_without_enabling() {
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let bad = Some(Setpoints {
-        v_set: 12.0,
-        i_set: 10.0,
-    });
-    let a = s.tick(
-        PollResult {
-            setpoints: bad,
-            output: Some(BuckOutput::Off { cause: None }),
-            battery: b(OK_V, -0.1),
-        },
-        TICK,
-    );
-    assert!(matches_disable(&a, FaultReason::SettingsDrift));
+    let p = PollResult {
+        setpoints: Some(Setpoints { v_set: 12.0, i_set: 10.0 }),
+        ..expected_poll(&s, b(OK_V, -0.1))
+    };
+    assert!(matches_disable(&s.tick(p, TICK), FaultReason::SettingsDrift));
 }
 
 #[test]
@@ -1047,50 +1000,21 @@ fn buck_self_disable_in_active_latches() {
     // tripped, or panel toggled) → latch OutputUnexpectedlyOff.
     let mut s = active(lfp_4s());
     let p = PollResult {
-        setpoints: Some(s.expected_setpoints()),
         output: Some(BuckOutput::Off { cause: None }),
-        battery: b(OK_V, -0.1),
+        ..expected_poll(&s, b(OK_V, -0.1))
     };
-    let a = s.tick(p, TICK);
-    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(None)));
-}
-
-/// Drive `s` from Active into Tripped(OutputUnexpectedlyOff(cause), acked:true).
-/// Shared by every recovery test: latch → ack disable. The cause governs
-/// whether `should_restart` will eventually fire — recovery tests pass a
-/// recoverable cause (LVP), gate tests pass a non-recoverable one.
-fn latch_self_disable(s: &mut ChargeSupervisor, cause: Option<XyProtectionStatus>) {
-    let a = s.tick(
-        PollResult {
-            setpoints: Some(s.expected_setpoints()),
-            output: Some(BuckOutput::Off { cause }),
-            battery: b(OK_V, -0.1),
-        },
-        TICK,
-    );
-    assert!(matches_disable(&a, FaultReason::OutputUnexpectedlyOff(cause)));
-    s.ack_disable();
-}
-
-/// PollResult that satisfies the should_restart healthy criteria: Modbus
-/// up, output reads OFF, finite battery sample below OV.
-fn healthy_recovery_poll(s: &ChargeSupervisor) -> PollResult {
-    PollResult {
-        setpoints: Some(s.expected_setpoints()),
-        output: Some(BuckOutput::Off { cause: None }),
-        battery: b(OK_V, -0.1),
-    }
+    assert!(matches_disable(&s.tick(p, TICK), FaultReason::OutputUnexpectedlyOff(None)));
 }
 
 #[test]
 fn should_restart_after_healthy_window() {
     // Active → buck self-disables → latch → ack. After
-    // OUTPUT_RECOVERY_HEALTHY of continuously-healthy ticks, should_restart
-    // returns true (caller's cue to throw this supervisor away and re-run
-    // boot_sequence).
+    // OUTPUT_RECOVERY_HEALTHY of continuously-healthy ticks, tick emits
+    // Action::RestartSupervisor (caller's cue to throw this supervisor
+    // away and re-run boot_sequence).
     let mut s = active(lfp_4s());
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         // Recovery accumulates via tick; pre-threshold ticks return None.
         assert!(matches!(s.tick(p, TICK), Action::None));
@@ -1104,7 +1028,7 @@ fn should_restart_after_healthy_window() {
 fn should_restart_resets_on_overvoltage() {
     let mut s = active(lfp_4s());
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
     }
@@ -1123,7 +1047,7 @@ fn should_restart_resets_on_overvoltage() {
 fn should_restart_resets_on_modbus_down() {
     let mut s = active(lfp_4s());
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
     }
@@ -1140,7 +1064,7 @@ fn should_restart_resets_on_modbus_down() {
 fn should_restart_resets_on_missing_battery() {
     let mut s = active(lfp_4s());
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
     }
@@ -1155,7 +1079,7 @@ fn should_restart_resets_on_unexpected_output_on() {
     // we want a stable OFF state before signalling restart.
     let mut s = active(lfp_4s());
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
     }
@@ -1171,11 +1095,11 @@ fn should_restart_resets_on_unexpected_output_on() {
 fn should_restart_repeats_across_cycles() {
     // The supervisor itself doesn't cap recovery attempts — that lives in
     // the caller, which is what gets thrown away on each restart. A single
-    // supervisor will happily fire `should_restart=true` over and over if
-    // its latch keeps re-asserting (no flap budget at this layer).
+    // supervisor will happily emit RestartSupervisor over and over if its
+    // latch keeps re-asserting (no flap budget at this layer).
     let mut s = active(lfp_4s());
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..OUTPUT_RECOVERY_HEALTHY.as_secs() {
         restart_ready(&mut s, p, TICK);
     }
@@ -1189,7 +1113,7 @@ fn should_restart_repeats_across_cycles() {
 #[test]
 fn should_restart_false_for_non_recoverable_fault() {
     // Confirm only OutputUnexpectedlyOff is recoverable. OV trip in
-    // active state should never let should_restart fire.
+    // active state should never let RestartSupervisor be emitted.
     let mut s = active(lfp_4s());
     let absorb = lfp_4s().absorb_v;
     for _ in 0..(OV_DURATION.as_secs() + 1) {
@@ -1197,7 +1121,7 @@ fn should_restart_false_for_non_recoverable_fault() {
     }
     assert!(matches!(s.fault(), Some(FaultReason::Overvoltage)));
     s.ack_disable();
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() * 5) {
         assert!(!restart_ready(&mut s, p, TICK));
     }
@@ -1206,9 +1130,9 @@ fn should_restart_false_for_non_recoverable_fault() {
 
 #[test]
 fn should_restart_false_in_pending_and_active() {
-    // Outside Tripped, should_restart is always false regardless of input.
+    // Outside Tripped, RestartSupervisor is never emitted regardless of input.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     assert!(!restart_ready(&mut s, p, TICK)); // Pending
     let mut s = active(lfp_4s());
     assert!(!restart_ready(&mut s, p, TICK)); // Active
@@ -1230,7 +1154,7 @@ fn should_restart_false_for_non_recoverable_protection_cause() {
     ] {
         let mut s = active(lfp_4s());
         latch_self_disable(&mut s, cause);
-        let p = healthy_recovery_poll(&s);
+        let p = expected_poll(&s, b(OK_V, -0.1));
         for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() * 2) {
             assert!(!restart_ready(&mut s, p, TICK));
         }
@@ -1247,31 +1171,23 @@ fn update_voltage_retries_until_acked() {
     // supervisor's still-Float `target_voltage`.
     let profile = lfp_4s();
     let mut s = active(profile);
-    let p_in_phase_transition = PollResult {
-        // Buck readback is still at the old (Float) voltage — caller's
-        // write failed so V_SET on the device didn't change.
-        setpoints: Some(Setpoints {
-            v_set: profile.float_v,
-            i_set: profile.regulation_a,
-        }),
-        output: Some(BuckOutput::On),
-        battery: b(OK_V, -4.0),
-    };
-    let a = s.tick(p_in_phase_transition, TICK);
-    let Action::UpdateVoltage { target_v: t1 } = a else {
-        panic!("expected UpdateVoltage, got something else");
+    // expected_poll uses s.expected_setpoints(), which reflects the
+    // *current* phase (Float) — exactly the still-on-the-buck values
+    // the failed write would leave behind.
+    let p = expected_poll(&s, b(OK_V, -4.0));
+
+    let Action::UpdateVoltage { target_v: t1 } = s.tick(p, TICK) else {
+        panic!("expected UpdateVoltage");
     };
     assert!(approx(t1, profile.absorb_v));
-    // Phase NOT yet committed.
-    assert!(matches!(s.phase(), Phase::Float));
+    assert!(matches!(s.phase(), Phase::Float)); // not yet committed
     assert!(s.fault().is_none());
 
     // No ack — second tick re-emits UpdateVoltage, same target. No
     // SettingsDrift even though setpoints (Float) lag the pending phase
     // (Absorb), because expected_setpoints still uses the old phase.
-    let a = s.tick(p_in_phase_transition, TICK);
-    let Action::UpdateVoltage { target_v: t2 } = a else {
-        panic!("expected UpdateVoltage retry, got something else");
+    let Action::UpdateVoltage { target_v: t2 } = s.tick(p, TICK) else {
+        panic!("expected UpdateVoltage retry");
     };
     assert!(approx(t2, profile.absorb_v));
     assert!(matches!(s.phase(), Phase::Float));
@@ -1285,14 +1201,9 @@ fn update_voltage_retries_until_acked() {
 #[test]
 fn buck_output_off_in_pending_does_not_fault() {
     // In Pending the buck IS supposed to be off — output_on=Some(false)
-    // is normal, must not latch.
+    // is normal, must not latch. expected_poll for Pending returns Off.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let p = PollResult {
-        setpoints: Some(s.expected_setpoints()),
-        output: Some(BuckOutput::Off { cause: None }),
-        battery: b(OK_V, -0.1),
-    };
-    let a = s.tick(p, TICK);
+    let a = s.tick(expected_poll(&s, b(OK_V, -0.1)), TICK);
     assert!(matches!(a, Action::EnableOutput));
     assert!(s.fault().is_none());
 }
@@ -1304,12 +1215,10 @@ fn buck_output_on_in_pending_latches() {
     // under unknown conditions; latch immediately, no debounce.
     let mut s = ChargeSupervisor::new(lfp_4s());
     let p = PollResult {
-        setpoints: Some(s.expected_setpoints()),
         output: Some(BuckOutput::On),
-        battery: b(OK_V, -0.1),
+        ..expected_poll(&s, b(OK_V, -0.1))
     };
-    let a = s.tick(p, TICK);
-    assert!(matches_disable(&a, FaultReason::OutputOnInPending));
+    assert!(matches_disable(&s.tick(p, TICK), FaultReason::OutputOnInPending));
     // Non-recoverable: caller must reboot, not retry.
     assert_eq!(FaultReason::OutputOnInPending.recovery_healthy_for(), None);
 }
@@ -1345,24 +1254,15 @@ fn pending_does_not_enter_absorb_even_at_high_charge_current() {
     // Sample reports current well above enter_absorb_a (3 A). If the phase
     // machine ran in Pending it would emit UpdateVoltage(absorb_v).
     let high_current = -10.0;
-    let p = PollResult {
-        setpoints: Some(s.expected_setpoints()),
-        output: Some(BuckOutput::Off { cause: None }),
-        battery: b(profile.float_v, high_current),
-    };
-    let a = s.tick(p, TICK);
+    let battery = b(profile.float_v, high_current);
+    let a = s.tick(expected_poll(&s, battery), TICK);
     assert!(matches!(a, Action::EnableOutput));
     assert!(matches!(s.phase(), Phase::Float));
     // After ack, supervisor goes Active still in Float — first real tick
     // will then run the phase machine. Verify the very next tick (now
     // Active) is the one that emits the transition.
     s.ack_enable();
-    let p_active = PollResult {
-        setpoints: Some(s.expected_setpoints()),
-        output: Some(BuckOutput::On),
-        battery: b(profile.float_v, high_current),
-    };
-    let a = s.tick(p_active, TICK);
+    let a = s.tick(expected_poll(&s, battery), TICK);
     assert!(matches!(a, Action::UpdateVoltage { target_v } if approx(target_v, profile.absorb_v)));
 }
 
@@ -1373,7 +1273,7 @@ fn restart_resets_on_nan_battery() {
     // a misbehaving INA228 might emit. Resets the clock identically.
     let mut s = active(lfp_4s());
     latch_self_disable(&mut s, Some(XyProtectionStatus::Lvp));
-    let p = healthy_recovery_poll(&s);
+    let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
     }
