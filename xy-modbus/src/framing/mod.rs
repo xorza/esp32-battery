@@ -9,6 +9,8 @@
 
 use crate::transport::ModbusError;
 
+// ─── Constants ───────────────────────────────────────────────────────────────
+
 pub const FN_READ_HOLDING: u8 = 0x03;
 pub const FN_WRITE_SINGLE: u8 = 0x06;
 pub const FN_WRITE_MULTIPLE: u8 = 0x10;
@@ -23,6 +25,8 @@ pub const MAX_READ_REGS: usize = 125;
 /// Maximum registers in a single `Write Multiple Holdings` request
 /// (Modbus standard limit).
 pub const MAX_WRITE_REGS: usize = 123;
+
+// ─── FrameError ──────────────────────────────────────────────────────────────
 
 /// Why [`build_write_multiple_request`] could not assemble a frame.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -47,6 +51,8 @@ impl core::fmt::Display for FrameError {
 
 impl core::error::Error for FrameError {}
 
+// ─── CRC-16 ──────────────────────────────────────────────────────────────────
+
 /// Standard Modbus-RTU CRC-16.
 pub fn crc16_modbus(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
@@ -68,6 +74,8 @@ fn append_crc(buf: &mut [u8], len: usize) {
     buf[len] = crc as u8;
     buf[len + 1] = (crc >> 8) as u8;
 }
+
+// ─── Request builders ────────────────────────────────────────────────────────
 
 /// Build a `Read Holding Registers` (FC `0x03`) request frame.
 pub fn build_read_request(slave: u8, addr: u16, count: u16) -> [u8; 8] {
@@ -122,6 +130,8 @@ pub fn build_write_multiple_request(
     append_crc(out, 7 + bc);
     Ok(len)
 }
+
+// ─── Response parsers ────────────────────────────────────────────────────────
 
 fn check_crc(resp: &[u8], len: usize) -> Result<(), ModbusError> {
     if resp.len() < len {

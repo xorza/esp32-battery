@@ -26,6 +26,8 @@ use crate::framing::{
 };
 use crate::transport::{ModbusTransport, RtuError};
 
+// ─── UartTransport ───────────────────────────────────────────────────────────
+
 /// Generic Modbus-RTU transport over any `embedded-io` UART.
 pub struct UartTransport<U, D> {
     uart: U,
@@ -62,6 +64,8 @@ where
     pub fn release(self) -> (U, D) {
         (self.uart, self.delay)
     }
+
+    // ─── I/O helpers ─────────────────────────────────────────────────────
 
     fn drain_rx(&mut self) {
         let mut scratch = [0u8; 32];
@@ -140,6 +144,8 @@ where
         Ok(&buf[..full_len])
     }
 }
+
+// ─── ModbusTransport impl ────────────────────────────────────────────────────
 
 impl<U, D> ModbusTransport for UartTransport<U, D>
 where

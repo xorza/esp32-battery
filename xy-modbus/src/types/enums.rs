@@ -3,6 +3,8 @@
 
 use core::fmt;
 
+// ─── RegMode ─────────────────────────────────────────────────────────────────
+
 /// Regulation mode reported by `CVCC` (register 0x0011).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -11,6 +13,8 @@ pub enum RegMode {
     ConstantVoltage,
     ConstantCurrent,
 }
+
+// ─── TempUnit ────────────────────────────────────────────────────────────────
 
 /// Temperature unit selected by `F-C` (register 0x0013).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -35,6 +39,8 @@ impl TempUnit {
         }
     }
 }
+
+// ─── ProtectionStatus ────────────────────────────────────────────────────────
 
 /// Latched protection cause read from `PROTECT` (register 0x0010).
 ///
@@ -109,6 +115,8 @@ impl fmt::Display for ProtectionStatus {
         })
     }
 }
+
+// ─── BaudRate ────────────────────────────────────────────────────────────────
 
 /// Baud-rate codes for `BAUDRATE_L` (register 0x0019).
 ///

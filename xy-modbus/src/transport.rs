@@ -6,6 +6,8 @@
 
 use core::fmt;
 
+// ─── ModbusError ─────────────────────────────────────────────────────────────
+
 /// Protocol-layer error: a frame was received but failed validation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -36,6 +38,10 @@ impl fmt::Display for ModbusError {
         }
     }
 }
+
+impl core::error::Error for ModbusError {}
+
+// ─── RtuError ────────────────────────────────────────────────────────────────
 
 /// Unified error returned by the device API: either the transport
 /// (UART layer) failed, or the response was a malformed / exception
@@ -68,7 +74,6 @@ impl From<ModbusError> for RtuError {
     }
 }
 
-impl core::error::Error for ModbusError {}
 impl core::error::Error for RtuError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
@@ -77,6 +82,8 @@ impl core::error::Error for RtuError {
         }
     }
 }
+
+// ─── Transport trait ─────────────────────────────────────────────────────────
 
 /// Modbus-RTU transport: send a request, validate the response, hand
 /// back the payload (for reads) or just `Ok(())` (for writes).

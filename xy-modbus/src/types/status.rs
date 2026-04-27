@@ -1,5 +1,7 @@
 //! Live readings, setpoints, and cumulative counters.
 
+// ─── Setpoints ───────────────────────────────────────────────────────────────
+
 /// Output voltage / current setpoints (registers 0x0000–0x0001).
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -8,6 +10,8 @@ pub struct Setpoints {
     pub v_set: f32,
     pub i_set: f32,
 }
+
+// ─── Status ──────────────────────────────────────────────────────────────────
 
 /// Live status block (registers 0x0000–0x0005).
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -21,6 +25,26 @@ pub struct Status {
     pub p_out: f32,
     pub v_in: f32,
 }
+
+// ─── OnTime ──────────────────────────────────────────────────────────────────
+
+/// Output-on time as reported by the device (h/m/s).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OnTime {
+    pub hours: u16,
+    pub minutes: u16,
+    pub seconds: u16,
+}
+
+impl OnTime {
+    pub const fn total_seconds(self) -> u32 {
+        self.hours as u32 * 3600 + self.minutes as u32 * 60 + self.seconds as u32
+    }
+}
+
+// ─── Totals ──────────────────────────────────────────────────────────────────
 
 /// Cumulative output counters and on-time (registers 0x0006–0x000C).
 ///
@@ -45,21 +69,7 @@ pub struct Totals {
     pub wh_high_raw: u16,
 }
 
-/// Output-on time as reported by the device (h/m/s).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct OnTime {
-    pub hours: u16,
-    pub minutes: u16,
-    pub seconds: u16,
-}
-
-impl OnTime {
-    pub const fn total_seconds(self) -> u32 {
-        self.hours as u32 * 3600 + self.minutes as u32 * 60 + self.seconds as u32
-    }
-}
+// ─── SafetyLimits ────────────────────────────────────────────────────────────
 
 /// Hard trip limits programmed into the buck's protection registers.
 #[derive(Copy, Clone, Debug, PartialEq)]

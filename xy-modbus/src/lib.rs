@@ -25,6 +25,8 @@
 
 #![no_std]
 
+// ─── Modules ─────────────────────────────────────────────────────────────────
+
 pub mod device;
 pub mod framing;
 pub mod regs;
@@ -34,8 +36,7 @@ pub mod types;
 #[cfg(feature = "embedded-io")]
 pub mod uart;
 
-#[cfg(feature = "embedded-io")]
-pub use uart::UartTransport;
+// ─── Re-exports ──────────────────────────────────────────────────────────────
 
 pub use device::Xy;
 pub use transport::{ModbusError, ModbusTransport, RtuError};
@@ -43,3 +44,6 @@ pub use types::{
     BaudRate, GroupParams, Model, OnTime, ProtectionStatus, RegMode, SafetyLimits, Setpoints,
     Status, TempUnit, Totals,
 };
+
+#[cfg(feature = "embedded-io")]
+pub use uart::UartTransport;
