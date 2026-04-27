@@ -624,7 +624,9 @@ fn verify_model_match_for_xy7025() {
     );
     assert_eq!(
         xy.verify_model().unwrap(),
-        ModelCheck::Match { device_code: 0x6100 }
+        ModelCheck::Match {
+            device_code: 0x6100
+        }
     );
 }
 
@@ -640,7 +642,9 @@ fn verify_model_match_for_xy6020l() {
     );
     assert_eq!(
         xy.verify_model().unwrap(),
-        ModelCheck::Match { device_code: 0x6100 }
+        ModelCheck::Match {
+            device_code: 0x6100
+        }
     );
 }
 
@@ -679,6 +683,8 @@ fn verify_model_inconclusive_for_custom() {
     );
     assert_eq!(
         xy.verify_model().unwrap(),
-        ModelCheck::Inconclusive { device_code: 0x6100 }
+        ModelCheck::Inconclusive {
+            device_code: 0x6100
+        }
     );
 }

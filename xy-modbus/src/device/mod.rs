@@ -344,7 +344,10 @@ impl<T: ModbusTransport> Xy<T> {
     /// Recall a stored memory group (M0–M9) into the live operating set.
     /// `n == 0` is a no-op on the device (M0 is already current).
     pub fn recall_group(&mut self, n: u8) -> Result<(), RtuError> {
-        assert!(n < GROUP_COUNT, "group index {n} out of range (0..{GROUP_COUNT})");
+        assert!(
+            n < GROUP_COUNT,
+            "group index {n} out of range (0..{GROUP_COUNT})"
+        );
         self.write_one(REG_EXTRACT_M, n as u16)
     }
 
@@ -352,7 +355,10 @@ impl<T: ModbusTransport> Xy<T> {
 
     /// Read all 14 registers of memory group `n` (0–9).
     pub fn read_group(&mut self, n: u8) -> Result<GroupParams, RtuError> {
-        assert!(n < GROUP_COUNT, "group index {n} out of range (0..{GROUP_COUNT})");
+        assert!(
+            n < GROUP_COUNT,
+            "group index {n} out of range (0..{GROUP_COUNT})"
+        );
         let mut r = [0u16; GROUP_LEN as usize];
         self.transport
             .read_holding(self.slave, group_addr(n), &mut r)?;
@@ -364,7 +370,10 @@ impl<T: ModbusTransport> Xy<T> {
     /// otherwise it programs EEPROM and takes effect on
     /// [`Self::recall_group`].
     pub fn write_group(&mut self, n: u8, p: &GroupParams) -> Result<(), RtuError> {
-        assert!(n < GROUP_COUNT, "group index {n} out of range (0..{GROUP_COUNT})");
+        assert!(
+            n < GROUP_COUNT,
+            "group index {n} out of range (0..{GROUP_COUNT})"
+        );
         let regs = encode_group(p, self.model);
         self.transport
             .write_multiple_holdings(self.slave, group_addr(n), &regs)
