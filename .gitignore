@@ -1,4 +1,8 @@
 .DS_Store
+.claude/scheduled_tasks.lock
+/logs/*.log
+/logs/*.txt
+/logs/*.json
 
 **/target
 **/.embuild
