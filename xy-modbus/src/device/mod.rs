@@ -96,6 +96,9 @@ impl<T: ModbusTransport> Xy<T> {
     /// needs each tick (live readings, regulation mode, latched
     /// protection cause, output-enable flag) in one Modbus round-trip.
     pub fn read_status(&mut self) -> Result<Status, RtuError> {
+        // Indexing below uses absolute register addresses as array offsets,
+        // which is only valid because the bulk read starts at address 0.
+        const _: () = assert!(REG_V_SET == 0);
         let mut r = [0u16; 0x13];
         self.transport.read_holding(self.slave, REG_V_SET, &mut r)?;
         let i_scale = self.model.current_scale();
