@@ -13,6 +13,10 @@ Off-grid battery monitor and charger controller built on the ESP32-C6 (ESP32-C3 
 - **LCD** (optional, `lcd` feature): ST7789 over SPI via `mipidsi`
 - **Battery**: 4S LiFePO4 (12 V nominal); chemistry profiles for LiFePO4 (top-balance) and Li-ion are also defined in `logic/src/charging`
 
+<p align="center">
+  <img src="docs/dashboard.png" alt="Dashboard screenshot" height="600">
+</p>
+
 ## Features
 
 - **HTTPS dashboard** — voltage, current, power, SOC, heap, history chart
