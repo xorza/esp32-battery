@@ -5,14 +5,16 @@ Modbus-RTU driver for the XY-series programmable buck converters
 share a common register layout — the differences between models are
 mechanical (max V/A/W), not protocol.
 
-`no_std`, no dependencies. Bring your own UART transport.
+`no_std`, no required dependencies. Bring your own UART transport, or
+opt in to the bundled one (default `embedded-io` feature) or the
+`esp-idf-hal` glue.
 
 ## Usage
 
 ```rust,ignore
-use xy_modbus::{Xy, SafetyLimits};
+use xy_modbus::{Model, SafetyLimits, Xy};
 
-let mut xy = Xy::new(my_transport);
+let mut xy = Xy::new(my_transport, Model::Xy7025);
 
 xy.set_protection(SafetyLimits {
     lvp_v: 22.0,
@@ -27,15 +29,88 @@ let s = xy.read_status()?;
 println!("{:.2} V @ {:.2} A", s.v_out, s.i_out);
 ```
 
+`Model` selects per-register scales (I-OUT, POWER, S-OCP, S-OPP) — the
+wrong family silently shifts current and power readings by 10×. Call
+`xy.verify_model()?` at boot to catch a misconfiguration against the
+device's `MODEL` register.
+
+## Using with `esp-idf-hal`
+
+Enable the `esp-idf-hal` feature and skip writing any glue:
+
+```toml
+[dependencies]
+xy-modbus = { version = "0.1", features = ["esp-idf-hal"] }
+```
+
+```rust,ignore
+use xy_modbus::{Model, Xy};
+
+let mut xy = Xy::from_esp_uart(uart, Model::Xy7025);
+xy.set_voltage(13.5)?;
+```
+
+`from_esp_uart` wraps an `esp_idf_hal::uart::UartDriver` with the
+default XY-series timing (500 ms response window, 50 ms inter-frame
+gap). For non-default timing, build the transport manually:
+
+```rust,ignore
+use xy_modbus::{uart::UartTransport, Model, Xy};
+use esp_idf_hal::delay::FreeRtos;
+
+let transport = UartTransport::new(uart, FreeRtos).with_timing(750, 100);
+let xy = Xy::new(transport, Model::Xy7025);
+```
+
+The `esp-idf-hal` feature is target-conditional — enabling it on host
+targets (e.g. `cargo test --all-features`) is a no-op, so this is safe
+to leave on in shared `Cargo.toml` files.
+
 ## Bringing your own transport
 
-Implement [`ModbusTransport`] over your platform's UART. The
-[`framing`] module exposes the on-wire codec (`build_*` /
-`parse_*` / `crc16_modbus`), so an implementation is typically
+Two entry points, in increasing order of effort:
+
+### 1. Use the bundled `UartTransport` (default `embedded-io` feature)
+
+`UartTransport<U, D>` needs `U: BlockingRead + embedded_io::Write` and
+`D: embedded_hal::delay::DelayNs`. `BlockingRead` is one method —
+`fn read(&mut self, buf: &mut [u8], timeout_ms: u32) -> Result<usize, _>` —
+that translates to your HAL's native blocking-with-timeout read.
+Typical impl is 3 lines:
+
+```rust,ignore
+use xy_modbus::BlockingRead;
+
+impl BlockingRead for MyUart {
+    type Error = MyError;
+    fn read(&mut self, buf: &mut [u8], timeout_ms: u32) -> Result<usize, Self::Error> {
+        self.read_with_timeout(buf, Duration::from_millis(timeout_ms as u64))
+    }
+}
+```
+
+> **Heads up for esp-idf-hal users without the `esp-idf-hal` feature**:
+> if you import `embedded-io` directly to write your own transport, pin
+> it in your `Cargo.toml` to disambiguate against the `0.6.x` version
+> that `embassy-sync` pulls in transitively:
+>
+> ```toml
+> embedded-io = "0.7"
+> ```
+>
+> Otherwise `use embedded_io::Write` may resolve to the wrong version
+> and produce confusing trait-resolution errors against `UartDriver`'s
+> `0.7` impl. The `esp-idf-hal` feature avoids this by keeping all
+> embedded-io use inside the crate.
+
+### 2. Implement `ModbusTransport` directly
+
+Skip embedded-io entirely. The `framing` module exposes the on-wire
+codec (`build_*` / `parse_*` / `crc16_modbus`); a typical impl is
 under 100 lines:
 
 ```rust,ignore
-use xy_modbus::{ModbusTransport, RtuError, framing};
+use xy_modbus::{framing, ModbusTransport, RtuError};
 
 struct MyTransport { /* uart handle, timing config */ }
 
@@ -55,10 +130,10 @@ impl ModbusTransport for MyTransport {
 }
 ```
 
-The transport implementer is responsible for UART timing — the
-inter-frame gap, response timeout, and post-write quiet gap. The
-XY-series wants ~50 ms between frames and ~500 ms response window;
-see [`DATASHEET.md`](DATASHEET.md) §2 for empirical values.
+The transport implementer owns UART timing — inter-frame gap, response
+timeout, post-write quiet gap. The XY-series wants ~50 ms between
+frames and ~500 ms response window; see [`DATASHEET.md`](DATASHEET.md)
+§2 for empirical values.
 
 ## What's in the API
 
@@ -73,7 +148,7 @@ see [`DATASHEET.md`](DATASHEET.md) §2 for empirical values.
 - **Front panel & misc** — `read/set_lock`, `read/set_backlight`,
   `read/set_sleep_minutes`, `read/set_buzzer`,
   `read/set_temp_unit`, `read/set_temp_offset_*`
-- **Identity & comms** — `read_model`, `read_version`,
+- **Identity & comms** — `read_model`, `verify_model`, `read_version`,
   `read/set_slave_address`, `read/set_baud_rate`
 - **Memory groups (M0–M9)** — `read_group(n)`, `write_group(n, &p)`,
   `recall_group(n)`
@@ -89,6 +164,15 @@ prescribe a power-on / fault-recovery policy. See [`DATASHEET.md`](DATASHEET.md)
 *before* raising V-SET, force OUTPUT_EN off until verification
 passes, etc.) — translate that into the routine that fits your
 application.
+
+## Cargo features
+
+| Feature       | Default | Purpose                                                                    |
+|---------------|---------|----------------------------------------------------------------------------|
+| `embedded-io` | yes     | Bundled `UartTransport` over `BlockingRead + embedded_io::Write`.         |
+| `esp-idf-hal` | no      | `Xy::from_esp_uart(uart, model)` constructor for `esp_idf_hal::UartDriver`.|
+| `defmt`       | no      | `defmt::Format` derives on public types.                                   |
+| `serde`       | no      | `Serialize`/`Deserialize` derives on public types.                         |
 
 ## Protocol reference
 
