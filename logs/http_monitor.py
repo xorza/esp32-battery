@@ -18,7 +18,7 @@ import urllib.error
 from datetime import datetime
 
 HOST = "https://battery.lan"
-INTERVAL = 15.0
+INTERVAL = 30.0
 TIMEOUT = 8.0
 DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_STREAM = os.path.join(DIR, "http_stream.log")
