@@ -20,9 +20,31 @@ pub const MAX_ADU: usize = 256;
 /// (Modbus standard limit).
 pub const MAX_WRITE_REGS: usize = 123;
 
-/// Buffer too small to hold the assembled frame.
+/// Why [`build_write_multiple_request`] could not assemble a frame.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct BufferTooSmall;
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum FrameError {
+    /// `values` was empty or exceeded [`MAX_WRITE_REGS`] (123).
+    InvalidLength(usize),
+    /// `out` was smaller than the assembled frame (header + payload + CRC).
+    BufferTooSmall {
+        needed: usize,
+        actual: usize,
+    },
+}
+
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidLength(n) => write!(f, "invalid register count {n}"),
+            Self::BufferTooSmall { needed, actual } => {
+                write!(f, "buffer too small (need {needed}, have {actual})")
+            }
+        }
+    }
+}
+
+impl core::error::Error for FrameError {}
 
 /// Standard Modbus-RTU CRC-16.
 pub fn crc16_modbus(data: &[u8]) -> u16 {
@@ -76,14 +98,17 @@ pub fn build_write_multiple_request(
     addr: u16,
     values: &[u16],
     out: &mut [u8],
-) -> Result<usize, BufferTooSmall> {
+) -> Result<usize, FrameError> {
     if values.is_empty() || values.len() > MAX_WRITE_REGS {
-        return Err(BufferTooSmall);
+        return Err(FrameError::InvalidLength(values.len()));
     }
     let bc = 2 * values.len();
     let len = 7 + bc + 2;
     if out.len() < len {
-        return Err(BufferTooSmall);
+        return Err(FrameError::BufferTooSmall {
+            needed: len,
+            actual: out.len(),
+        });
     }
     out[0] = slave;
     out[1] = FN_WRITE_MULTIPLE;

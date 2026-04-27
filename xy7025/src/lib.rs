@@ -5,7 +5,7 @@
 //! crate's `README.md` for the full protocol reference.
 //!
 //! ```ignore
-//! use xy7025::{Xy, SafetyLimits};
+//! use xy_modbus::{Xy, SafetyLimits};
 //!
 //! let mut xy = Xy::new(my_transport);
 //! xy.set_protection(SafetyLimits { lvp_v: 22.0, ovp_v: 15.0, ocp_a: 15.0 })?;
@@ -23,7 +23,6 @@
 //! implementation is typically <100 lines over a UART.
 
 #![no_std]
-#![deny(rust_2018_idioms)]
 
 pub mod device;
 pub mod framing;

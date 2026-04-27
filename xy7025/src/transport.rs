@@ -8,6 +8,7 @@ use core::fmt;
 
 /// Protocol-layer error: a frame was received but failed validation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ModbusError {
     /// Response was shorter than the smallest valid frame for the
     /// expected reply.
@@ -40,6 +41,7 @@ impl fmt::Display for ModbusError {
 /// (UART layer) failed, or the response was a malformed / exception
 /// Modbus frame.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RtuError {
     /// UART read failed or timed out before any bytes arrived.
     UartRead,
@@ -63,6 +65,16 @@ impl fmt::Display for RtuError {
 impl From<ModbusError> for RtuError {
     fn from(e: ModbusError) -> Self {
         Self::Modbus(e)
+    }
+}
+
+impl core::error::Error for ModbusError {}
+impl core::error::Error for RtuError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Modbus(e) => Some(e),
+            _ => None,
+        }
     }
 }
 

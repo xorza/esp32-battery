@@ -154,9 +154,9 @@ impl<T: ModbusTransport> Xy<T> {
     }
 
     /// Power-on output state (S-INI, register 0x005D). `false` = OFF
-    /// at boot, `true` = ON. Persists in EEPROM. Setting `false` is
-    /// the safe default for charging applications: a brown-out leaves
-    /// the buck disabled.
+    /// at boot, `true` = ON. Persists in EEPROM. `false` is the safe
+    /// default after an unexpected power loss — the buck stays disabled
+    /// until explicitly re-enabled.
     pub fn set_power_on_output(&mut self, on: bool) -> Result<(), RtuError> {
         self.write_one(REG_S_INI, on as u16)
     }
@@ -284,7 +284,7 @@ impl<T: ModbusTransport> Xy<T> {
         self.write_one(REG_SLAVE_ADDR, addr as u16)
     }
 
-    pub fn read_baud_rate(&mut self) -> Result<Option<BaudRate>, RtuError> {
+    pub fn read_baud_rate(&mut self) -> Result<BaudRate, RtuError> {
         Ok(BaudRate::from_code(self.read_one(REG_BAUD_CODE)?))
     }
     /// Write a new baud-rate code. Takes effect after the device resets.
@@ -651,9 +651,13 @@ mod tests {
             BaudRate::B57600,
             BaudRate::B115200,
         ] {
-            assert_eq!(BaudRate::from_code(baud.code()), Some(baud));
+            assert_eq!(BaudRate::from_code(baud.code()), baud);
         }
-        assert_eq!(BaudRate::from_code(99), None);
+        assert_eq!(BaudRate::from_code(99), BaudRate::Unknown(99));
+        // Unknown round-trips its raw code.
+        assert_eq!(BaudRate::Unknown(99).code(), 99);
+        assert_eq!(BaudRate::Unknown(99).baud(), None);
+        assert_eq!(BaudRate::B9600.baud(), Some(9600));
     }
 
     #[test]

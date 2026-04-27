@@ -1,4 +1,4 @@
-# xy7025
+# xy-modbus
 
 Modbus-RTU driver for the XY-series programmable buck converters
 (XY7025, XY6020L, XY6015, XY-SK60, XY-SK120, XY-SK120X). These modules
@@ -10,7 +10,7 @@ mechanical (max V/A/W), not protocol.
 ## Usage
 
 ```rust,ignore
-use xy7025::{Xy, SafetyLimits};
+use xy_modbus::{Xy, SafetyLimits};
 
 let mut xy = Xy::new(my_transport);
 
@@ -35,7 +35,7 @@ Implement [`ModbusTransport`] over your platform's UART. The
 under 100 lines:
 
 ```rust,ignore
-use xy7025::{ModbusTransport, RtuError, framing};
+use xy_modbus::{ModbusTransport, RtuError, framing};
 
 struct MyTransport { /* uart handle, timing config */ }
 

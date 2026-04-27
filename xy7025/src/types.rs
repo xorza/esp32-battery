@@ -6,6 +6,8 @@ use core::fmt;
 
 /// Output voltage / current setpoints (registers 0x0000–0x0001).
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Setpoints {
     pub v_set: f32,
     pub i_set: f32,
@@ -13,6 +15,8 @@ pub struct Setpoints {
 
 /// Live status block (registers 0x0000–0x0005).
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Status {
     pub v_set: f32,
     pub i_set: f32,
@@ -29,6 +33,8 @@ pub struct Status {
 /// against your hardware. The raw words are exposed alongside the
 /// composed values so consumers can reinterpret them.
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Totals {
     /// Cumulative output charge in Ah.
     /// `((ah_high as u32) << 16 | ah_low as u32) as f32 / 1000.0`.
@@ -45,6 +51,8 @@ pub struct Totals {
 
 /// Output-on time as reported by the device (h/m/s).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OnTime {
     pub hours: u16,
     pub minutes: u16,
@@ -59,6 +67,8 @@ impl OnTime {
 
 /// Hard trip limits programmed into the buck's protection registers.
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SafetyLimits {
     pub lvp_v: f32,
     pub ovp_v: f32,
@@ -69,6 +79,8 @@ pub struct SafetyLimits {
 
 /// Regulation mode reported by `CVCC` (register 0x0011).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RegMode {
     ConstantVoltage,
     ConstantCurrent,
@@ -76,6 +88,8 @@ pub enum RegMode {
 
 /// Temperature unit selected by `F-C` (register 0x0013).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TempUnit {
     Celsius,
     Fahrenheit,
@@ -101,6 +115,8 @@ impl TempUnit {
 /// `Normal` (0) is the only non-tripped state. The register stays
 /// latched until written back to 0.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ProtectionStatus {
     /// Operating normally.
     Normal,
@@ -174,6 +190,8 @@ impl fmt::Display for ProtectionStatus {
 /// 0–5 and 7–8 are community-derived. Verify on your unit before
 /// committing a write. Baud changes take effect after device reset.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BaudRate {
     B9600,
     B14400,
@@ -184,9 +202,12 @@ pub enum BaudRate {
     B115200,
     B2400,
     B4800,
+    /// Register read back a code outside the documented 0–8 range.
+    Unknown(u16),
 }
 
 impl BaudRate {
+    /// Encoded register value. `Unknown(c)` round-trips its raw code.
     pub const fn code(self) -> u16 {
         match self {
             Self::B9600 => 0,
@@ -198,10 +219,11 @@ impl BaudRate {
             Self::B115200 => 6,
             Self::B2400 => 7,
             Self::B4800 => 8,
+            Self::Unknown(c) => c,
         }
     }
-    pub const fn from_code(code: u16) -> Option<Self> {
-        Some(match code {
+    pub const fn from_code(code: u16) -> Self {
+        match code {
             0 => Self::B9600,
             1 => Self::B14400,
             2 => Self::B19200,
@@ -211,11 +233,12 @@ impl BaudRate {
             6 => Self::B115200,
             7 => Self::B2400,
             8 => Self::B4800,
-            _ => return None,
-        })
+            c => Self::Unknown(c),
+        }
     }
-    pub const fn baud(self) -> u32 {
-        match self {
+    /// Bits-per-second, or `None` for `Unknown`.
+    pub const fn baud(self) -> Option<u32> {
+        Some(match self {
             Self::B2400 => 2400,
             Self::B4800 => 4800,
             Self::B9600 => 9600,
@@ -225,7 +248,8 @@ impl BaudRate {
             Self::B56000 => 56000,
             Self::B57600 => 57600,
             Self::B115200 => 115200,
-        }
+            Self::Unknown(_) => return None,
+        })
     }
 }
 
@@ -239,6 +263,8 @@ impl BaudRate {
 /// `((high as u32) << 16 | low as u32) as f32 / 1000.0` for Ah/Wh; a
 /// helper is provided below.
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GroupParams {
     pub v_set: f32,
     pub i_set: f32,
