@@ -203,9 +203,14 @@ where
 
 #[derive(Clone, PartialEq, Eq)]
 enum LowerKey {
-    Captive { trying: bool },
+    Captive {
+        trying: bool,
+    },
     Connecting,
-    Host { ip: Option<Ipv4Addr>, has_errors: bool },
+    Host {
+        ip: Option<Ipv4Addr>,
+        has_errors: bool,
+    },
 }
 
 impl LowerKey {
@@ -245,9 +250,18 @@ where
     fn draw_static_labels(&mut self) {
         let style = MonoTextStyle::new(&FONT_5X8, COLOR_LABEL);
         for &(text, pos) in &[
-            ("VOLTAGE", Point::new(COL_LEFT + LABEL_OFFSET_X, ROW1_LABEL_Y)),
-            ("BATTERY", Point::new(COL_LEFT + LABEL_OFFSET_X, ROW2_LABEL_Y)),
-            ("POWER", Point::new(COL_RIGHT + LABEL_OFFSET_X, ROW1_LABEL_Y)),
+            (
+                "VOLTAGE",
+                Point::new(COL_LEFT + LABEL_OFFSET_X, ROW1_LABEL_Y),
+            ),
+            (
+                "BATTERY",
+                Point::new(COL_LEFT + LABEL_OFFSET_X, ROW2_LABEL_Y),
+            ),
+            (
+                "POWER",
+                Point::new(COL_RIGHT + LABEL_OFFSET_X, ROW1_LABEL_Y),
+            ),
             ("PSU", Point::new(COL_RIGHT + LABEL_OFFSET_X, ROW2_LABEL_Y)),
         ] {
             Text::new(text, pos, style).draw(&mut self.display).unwrap();
@@ -364,8 +378,12 @@ where
         )
         .draw(&mut self.scratch)
         .unwrap();
-        self.scratch
-            .blit(&mut self.display, Point::new(UPTIME_X, 0), UPTIME_W, UPTIME_H);
+        self.scratch.blit(
+            &mut self.display,
+            Point::new(UPTIME_X, 0),
+            UPTIME_W,
+            UPTIME_H,
+        );
     }
 
     /// Lower region — repainted only when the visible state changes.

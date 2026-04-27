@@ -459,6 +459,27 @@ fn boot_with_retries<D: XyDevice>(xy: &D, recorder: &EventRecorder) {
     shutdown_or_reboot(xy, "pre-reboot", true, recorder);
 }
 
+/// Inner supervise loop: poll → tick → apply, until tick emits
+/// `RestartSupervisor` (caller tears down + re-runs `boot_sequence`).
+/// Panics propagate.
+fn supervise_loop<D: XyDevice>(
+    xy: &D,
+    sensor_data: &Mutex<SensorData>,
+    recorder: &EventRecorder,
+    supervisor: &mut ChargeSupervisor,
+) {
+    loop {
+        task_wdt::reset();
+        let p = poll(xy, sensor_data, recorder);
+        let action = supervisor.tick(p, POLL_INTERVAL);
+        if matches!(action, Action::RestartSupervisor) {
+            return;
+        }
+        apply_action(xy, supervisor, action, recorder);
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
 fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     // Subscribe once for the lifetime of this thread. Restarts of the
     // supervise loop (below) keep feeding the same WDT subscription.
@@ -478,35 +499,22 @@ fn run<D: XyDevice>(xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventR
         boot_with_retries(&xy, &recorder);
         let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
-        // Inner loop = supervise. Returns Ok(()) when tick emits
-        // RestartSupervisor (caller's cue to tear down + redo
-        // boot_sequence); panics propagate out as Err.
+        // catch_unwind shields the recovery loop from panics in tick /
+        // apply_action. Ok(()) = tick asked for restart; Err = panic.
         let result = catch_unwind(AssertUnwindSafe(|| {
-            loop {
-                task_wdt::reset();
-                let p = poll(&xy, &sensor_data, &recorder);
-                let action = supervisor.tick(p, POLL_INTERVAL);
-                if matches!(action, Action::RestartSupervisor) {
-                    return;
-                }
-                apply_action(&xy, &mut supervisor, action, &recorder);
-                thread::sleep(POLL_INTERVAL);
-            }
+            supervise_loop(&xy, &sensor_data, &recorder, &mut supervisor)
         }));
 
-        match result {
-            Ok(()) => continue, // outer loop re-runs boot_sequence
-            Err(panic) => {
-                let msg = panic
-                    .downcast_ref::<&'static str>()
-                    .copied()
-                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("<non-string panic>");
-                error!("XY supervisor thread PANICKED: {msg} — forcing output OFF");
-                recorder.record(Event::Xy(XyError::SupervisorPanic));
-                shutdown_or_reboot(&xy, "post-panic", false, &recorder);
-                return;
-            }
+        if let Err(panic) = result {
+            let msg = panic
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic>");
+            error!("XY supervisor thread PANICKED: {msg} — forcing output OFF");
+            recorder.record(Event::Xy(XyError::SupervisorPanic));
+            shutdown_or_reboot(&xy, "post-panic", false, &recorder);
+            return;
         }
     }
 
@@ -559,7 +567,25 @@ fn poll<D: XyDevice>(
     recorder: &EventRecorder,
 ) -> PollResult {
     let mut sd = sensor_data.lock().unwrap();
-    let setpoints = match xy.read_status() {
+    let setpoints = read_setpoints(xy, &mut sd, recorder);
+    let output = read_output(xy, recorder);
+    let battery = sd.battery_reading().map(|b| BatterySample {
+        voltage: b.voltage,
+        current: b.current,
+    });
+    PollResult {
+        setpoints,
+        output,
+        battery,
+    }
+}
+
+fn read_setpoints<D: XyDevice>(
+    xy: &D,
+    sd: &mut SensorData,
+    recorder: &EventRecorder,
+) -> Option<Setpoints> {
+    match xy.read_status() {
         Ok(s) => {
             sd.update_ps(PsReading {
                 voltage: s.v_out,
@@ -576,15 +602,16 @@ fn poll<D: XyDevice>(
             recorder.record(Event::Xy(XyError::ReadStatus));
             None
         }
-    };
-    // Read OUTPUT_EN separately — it's at 0x0012, not contiguous with the
-    // main readback block. Lets the supervisor catch buck self-disable
-    // (hardware OVP/OCP/LVP, panel toggle) within one tick. When the
-    // buck reports OFF, ask PROTECT (0x0010) why — that was wiped during
-    // boot_sequence, so any non-Normal value here is from this session.
-    // While output is on PROTECT is necessarily Normal so we skip the
-    // round-trip.
-    let output = match xy.read_output_on() {
+    }
+}
+
+/// Read OUTPUT_EN separately — it's at 0x0012, not contiguous with the
+/// main readback block. When the buck reports OFF, ask PROTECT (0x0010)
+/// why — that was wiped during `boot_sequence`, so any non-Normal value
+/// here is from this session. While output is on PROTECT is necessarily
+/// Normal so we skip the round-trip.
+fn read_output<D: XyDevice>(xy: &D, recorder: &EventRecorder) -> Option<BuckOutput> {
+    match xy.read_output_on() {
         Ok(true) => Some(BuckOutput::On),
         Ok(false) => {
             let cause = match xy.read_protection_status() {
@@ -606,15 +633,6 @@ fn poll<D: XyDevice>(
             recorder.record(Event::Xy(XyError::ReadStatus));
             None
         }
-    };
-    let battery = sd.battery_reading().map(|b| BatterySample {
-        voltage: b.voltage,
-        current: b.current,
-    });
-    PollResult {
-        setpoints,
-        output,
-        battery,
     }
 }
 

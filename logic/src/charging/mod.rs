@@ -629,7 +629,7 @@ impl ChargeSupervisor {
     /// stuck sensor mask overvoltage. Routes through the same
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
-        match self.latch {
+        let pre_enable = match self.latch {
             LatchState::Tripped {
                 reason,
                 acked: true,
@@ -638,9 +638,9 @@ impl ChargeSupervisor {
                 reason,
                 acked: false,
             } => return Action::DisableOutput(reason),
-            _ => {}
-        }
-        let pre_enable = matches!(self.latch, LatchState::Pending);
+            LatchState::Pending => true,
+            LatchState::Active { .. } => false,
+        };
 
         if let Some(sp) = p.setpoints {
             let want = self.expected_setpoints();
