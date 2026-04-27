@@ -15,6 +15,11 @@ pub(crate) const FN_READ_HOLDING: u8 = 0x03;
 pub(crate) const FN_WRITE_SINGLE: u8 = 0x06;
 pub(crate) const FN_WRITE_MULTIPLE: u8 = 0x10;
 
+/// Modbus exception flag (high bit of the function-code byte). Per the
+/// spec, function codes occupy 1..=127 — any FC byte with bit 7 set is
+/// an exception response.
+pub const EXCEPTION_BIT: u8 = 0x80;
+
 /// Maximum Modbus-RTU ADU size (slave + PDU + CRC).
 pub const MAX_ADU: usize = 256;
 
@@ -153,7 +158,7 @@ fn check_exception(resp: &[u8], slave: u8) -> Result<(), ModbusError> {
     if resp[0] != slave {
         return Err(ModbusError::BadSlave(resp[0]));
     }
-    if resp[1] & 0x80 != 0 {
+    if resp[1] & EXCEPTION_BIT != 0 {
         check_crc(resp, 5)?;
         return Err(ModbusError::Exception(resp[2]));
     }

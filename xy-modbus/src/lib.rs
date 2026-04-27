@@ -41,7 +41,7 @@ mod device;
 mod types;
 
 pub mod framing;
-pub mod regs;
+pub(crate) mod regs;
 pub mod transport;
 
 #[cfg(feature = "embedded-io")]

@@ -20,9 +20,9 @@ use embedded_hal::delay::DelayNs;
 use embedded_io::Write;
 
 use crate::framing::{
-    MAX_ADU, MAX_READ_REGS, MAX_WRITE_REGS, build_read_request, build_write_multiple_request,
-    build_write_single_request, parse_read_response, parse_write_multiple_response,
-    parse_write_single_response,
+    EXCEPTION_BIT, MAX_ADU, MAX_READ_REGS, MAX_WRITE_REGS, build_read_request,
+    build_write_multiple_request, build_write_single_request, parse_read_response,
+    parse_write_multiple_response, parse_write_single_response,
 };
 use crate::transport::{BlockingRead, ModbusTransport, RtuError};
 
@@ -88,12 +88,19 @@ where
 /// non-blocking calls (`timeout_ms = 0`) drain noise that arrived during
 /// the inter-frame silence so it doesn't masquerade as the start of the
 /// slave's reply.
+///
+/// Capped at `DRAIN_MAX_BYTES` total — a well-behaved UART hits Ok(0) or
+/// Err(…) within a few iterations, but a stuck driver returning >0
+/// forever would otherwise loop indefinitely. We'd rather give up
+/// draining and let the caller's exception/CRC checks fail than wedge.
 fn drain_rx<U: BlockingRead>(uart: &mut U) {
+    const DRAIN_MAX_BYTES: usize = 4 * MAX_ADU;
     let mut scratch = [0u8; 32];
-    loop {
+    let mut drained = 0;
+    while drained < DRAIN_MAX_BYTES {
         match uart.read(&mut scratch, 0) {
             Ok(0) | Err(_) => return,
-            Ok(_) => {}
+            Ok(n) => drained += n,
         }
     }
 }
@@ -143,7 +150,7 @@ fn read_response<'b, U: BlockingRead>(
 ) -> Result<&'b [u8], RtuError> {
     assert!(full_len >= 5 && full_len <= buf.len());
     read_exact(uart, &mut buf[..3], response_timeout_ms)?;
-    if buf[1] & 0x80 != 0 {
+    if buf[1] & EXCEPTION_BIT != 0 {
         read_exact(uart, &mut buf[3..5], response_timeout_ms)?;
         return Ok(&buf[..5]);
     }
