@@ -5,9 +5,9 @@
 //! crate's `README.md` for the full protocol reference.
 //!
 //! ```ignore
-//! use xy_modbus::{Xy, SafetyLimits};
+//! use xy_modbus::{Model, Xy, SafetyLimits};
 //!
-//! let mut xy = Xy::new(my_transport);
+//! let mut xy = Xy::new(my_transport, Model::Xy7025);
 //! xy.set_protection(SafetyLimits { lvp_v: 22.0, ovp_v: 15.0, ocp_a: 15.0 })?;
 //! xy.set_voltage(13.5)?;
 //! xy.set_current_limit(10.0)?;
@@ -40,6 +40,6 @@ pub use uart::UartTransport;
 pub use device::Xy;
 pub use transport::{ModbusError, ModbusTransport, RtuError};
 pub use types::{
-    BaudRate, GroupParams, OnTime, ProtectionStatus, RegMode, SafetyLimits, Setpoints, Status,
-    TempUnit, Totals,
+    BaudRate, GroupParams, Model, OnTime, ProtectionStatus, RegMode, SafetyLimits, Setpoints,
+    Status, TempUnit, Totals,
 };

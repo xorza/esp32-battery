@@ -4,8 +4,8 @@
 use crate::regs::*;
 use crate::transport::{ModbusTransport, RtuError};
 use crate::types::{
-    BaudRate, GroupParams, OnTime, ProtectionStatus, RegMode, SafetyLimits, Setpoints, Status,
-    TempUnit, Totals,
+    BaudRate, GroupParams, Model, OnTime, ProtectionStatus, RegMode, SafetyLimits, Setpoints,
+    Status, TempUnit, Totals,
 };
 
 // Fixed-point conversion. Inputs are clamped to u16 — caller is responsible
@@ -22,25 +22,36 @@ fn from_reg(raw: u16, scale: f32) -> f32 {
 /// Driver for the XY-series buck converter.
 ///
 /// Construct with [`Xy::new`] (default slave `0x01`) or
-/// [`Xy::with_slave`]. All methods take `&mut self` because they go
-/// through the transport.
+/// [`Xy::with_slave`]. The [`Model`] selects per-variant scales for
+/// I-SET / IOUT / S-OCP / POWER / S-OPP — passing the wrong model
+/// silently yields readings off by 10×, so cross-check
+/// [`Self::read_model`] against your hardware.
 pub struct Xy<T: ModbusTransport> {
     transport: T,
     slave: u8,
+    model: Model,
 }
 
 impl<T: ModbusTransport> Xy<T> {
     /// Wrap a transport using the default slave address (`0x01`).
-    pub fn new(transport: T) -> Self {
-        Self::with_slave(transport, DEFAULT_SLAVE)
+    pub fn new(transport: T, model: Model) -> Self {
+        Self::with_slave(transport, model, DEFAULT_SLAVE)
     }
 
-    pub fn with_slave(transport: T, slave: u8) -> Self {
-        Self { transport, slave }
+    pub fn with_slave(transport: T, model: Model, slave: u8) -> Self {
+        Self {
+            transport,
+            slave,
+            model,
+        }
     }
 
     pub fn slave(&self) -> u8 {
         self.slave
+    }
+
+    pub fn model(&self) -> Model {
+        self.model
     }
 
     /// Borrow the underlying transport.
@@ -61,7 +72,7 @@ impl<T: ModbusTransport> Xy<T> {
         self.transport.read_holding(self.slave, REG_V_SET, &mut r)?;
         Ok(Setpoints {
             v_set: from_reg(r[0], 100.0),
-            i_set: from_reg(r[1], 100.0),
+            i_set: from_reg(r[1], self.model.current_scale()),
         })
     }
 
@@ -70,12 +81,13 @@ impl<T: ModbusTransport> Xy<T> {
     pub fn read_status(&mut self) -> Result<Status, RtuError> {
         let mut r = [0u16; 6];
         self.transport.read_holding(self.slave, REG_V_SET, &mut r)?;
+        let i_scale = self.model.current_scale();
         Ok(Status {
             v_set: from_reg(r[0], 100.0),
-            i_set: from_reg(r[1], 100.0),
+            i_set: from_reg(r[1], i_scale),
             v_out: from_reg(r[2], 100.0),
-            i_out: from_reg(r[3], 100.0),
-            p_out: from_reg(r[4], 10.0),
+            i_out: from_reg(r[3], i_scale),
+            p_out: from_reg(r[4], self.model.power_scale()),
             v_in: from_reg(r[5], 100.0),
         })
     }
@@ -84,10 +96,16 @@ impl<T: ModbusTransport> Xy<T> {
         Ok(from_reg(self.read_one(REG_V_OUT)?, 100.0))
     }
     pub fn read_current_out(&mut self) -> Result<f32, RtuError> {
-        Ok(from_reg(self.read_one(REG_I_OUT)?, 100.0))
+        Ok(from_reg(
+            self.read_one(REG_I_OUT)?,
+            self.model.current_scale(),
+        ))
     }
     pub fn read_power_out(&mut self) -> Result<f32, RtuError> {
-        Ok(from_reg(self.read_one(REG_P_OUT)?, 10.0))
+        Ok(from_reg(
+            self.read_one(REG_P_OUT)?,
+            self.model.power_scale(),
+        ))
     }
     pub fn read_voltage_in(&mut self) -> Result<f32, RtuError> {
         Ok(from_reg(self.read_one(REG_V_IN)?, 100.0))
@@ -128,7 +146,7 @@ impl<T: ModbusTransport> Xy<T> {
     }
 
     pub fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError> {
-        self.write_one(REG_I_SET, to_reg(amps, 100.0))
+        self.write_one(REG_I_SET, to_reg(amps, self.model.current_scale()))
     }
 
     /// Program LVP / OVP / OCP into the active group's protection
@@ -137,7 +155,7 @@ impl<T: ModbusTransport> Xy<T> {
         let values = [
             to_reg(l.lvp_v, 100.0),
             to_reg(l.ovp_v, 100.0),
-            to_reg(l.ocp_a, 100.0),
+            to_reg(l.ocp_a, self.model.current_scale()),
         ];
         self.transport
             .write_multiple_holdings(self.slave, REG_S_LVP, &values)
@@ -150,7 +168,7 @@ impl<T: ModbusTransport> Xy<T> {
         Ok(SafetyLimits {
             lvp_v: from_reg(r[0], 100.0),
             ovp_v: from_reg(r[1], 100.0),
-            ocp_a: from_reg(r[2], 100.0),
+            ocp_a: from_reg(r[2], self.model.current_scale()),
         })
     }
 
@@ -307,7 +325,7 @@ impl<T: ModbusTransport> Xy<T> {
         let mut r = [0u16; GROUP_LEN as usize];
         self.transport
             .read_holding(self.slave, group_addr(n), &mut r)?;
-        Ok(decode_group(&r))
+        Ok(decode_group(&r, self.model))
     }
 
     /// Write all 14 registers of memory group `n` (0–9) in one bulk
@@ -316,7 +334,7 @@ impl<T: ModbusTransport> Xy<T> {
     /// [`Self::recall_group`].
     pub fn write_group(&mut self, n: u8, p: &GroupParams) -> Result<(), RtuError> {
         debug_assert!(n < GROUP_COUNT);
-        let regs = encode_group(p);
+        let regs = encode_group(p, self.model);
         self.transport
             .write_multiple_holdings(self.slave, group_addr(n), &regs)
     }
@@ -336,14 +354,15 @@ impl<T: ModbusTransport> Xy<T> {
 
 // ─── Group encode / decode ──────────────────────────────────────────────────
 
-fn decode_group(r: &[u16; GROUP_LEN as usize]) -> GroupParams {
+fn decode_group(r: &[u16; GROUP_LEN as usize], model: Model) -> GroupParams {
+    let i_scale = model.current_scale();
     GroupParams {
         v_set: from_reg(r[GROUP_OFF_V_SET as usize], 100.0),
-        i_set: from_reg(r[GROUP_OFF_I_SET as usize], 100.0),
+        i_set: from_reg(r[GROUP_OFF_I_SET as usize], i_scale),
         s_lvp_v: from_reg(r[GROUP_OFF_S_LVP as usize], 100.0),
         s_ovp_v: from_reg(r[GROUP_OFF_S_OVP as usize], 100.0),
-        s_ocp_a: from_reg(r[GROUP_OFF_S_OCP as usize], 100.0),
-        s_opp_w: r[GROUP_OFF_S_OPP as usize],
+        s_ocp_a: from_reg(r[GROUP_OFF_S_OCP as usize], i_scale),
+        s_opp_w: from_reg(r[GROUP_OFF_S_OPP as usize], model.opp_scale()),
         s_ohp_h: r[GROUP_OFF_S_OHP_H as usize],
         s_ohp_m: r[GROUP_OFF_S_OHP_M as usize],
         s_oah_low: r[GROUP_OFF_S_OAH_L as usize],
@@ -355,14 +374,15 @@ fn decode_group(r: &[u16; GROUP_LEN as usize]) -> GroupParams {
     }
 }
 
-fn encode_group(p: &GroupParams) -> [u16; GROUP_LEN as usize] {
+fn encode_group(p: &GroupParams, model: Model) -> [u16; GROUP_LEN as usize] {
+    let i_scale = model.current_scale();
     let mut r = [0u16; GROUP_LEN as usize];
     r[GROUP_OFF_V_SET as usize] = to_reg(p.v_set, 100.0);
-    r[GROUP_OFF_I_SET as usize] = to_reg(p.i_set, 100.0);
+    r[GROUP_OFF_I_SET as usize] = to_reg(p.i_set, i_scale);
     r[GROUP_OFF_S_LVP as usize] = to_reg(p.s_lvp_v, 100.0);
     r[GROUP_OFF_S_OVP as usize] = to_reg(p.s_ovp_v, 100.0);
-    r[GROUP_OFF_S_OCP as usize] = to_reg(p.s_ocp_a, 100.0);
-    r[GROUP_OFF_S_OPP as usize] = p.s_opp_w;
+    r[GROUP_OFF_S_OCP as usize] = to_reg(p.s_ocp_a, i_scale);
+    r[GROUP_OFF_S_OPP as usize] = to_reg(p.s_opp_w, model.opp_scale());
     r[GROUP_OFF_S_OHP_H as usize] = p.s_ohp_h;
     r[GROUP_OFF_S_OHP_M as usize] = p.s_ohp_m;
     r[GROUP_OFF_S_OAH_L as usize] = p.s_oah_low;
@@ -468,7 +488,7 @@ mod tests {
             addr: REG_V_SET,
             values: vec![1440, 1000, 1350, 50, 675, 2400],
         }]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         let s = xy.read_status().unwrap();
         assert_eq!(s.v_set, 14.40);
         assert_eq!(s.i_set, 10.00);
@@ -478,6 +498,55 @@ mod tests {
         assert_eq!(s.v_in, 24.00);
     }
 
+    /// Same wire bytes decoded under XY7025 vs SK120 must yield 10× different
+    /// physical values for I-SET, IOUT, S-OCP and POWER (per DATASHEET §3
+    /// model scale table). Locks in that `Model` actually changes behavior —
+    /// a no-op `current_scale` would silently report the same numbers.
+    #[test]
+    fn model_scales_diverge_between_xy7025_and_sk120() {
+        // 1000 raw with /100 → 10.00 A, with /1000 → 1.000 A.
+        // 675 raw with /10 → 67.5 W, with /100 → 6.75 W.
+        let xy7025_mock = MockTransport::new(vec![Op::Read {
+            addr: REG_V_SET,
+            values: vec![1440, 1000, 1350, 1000, 675, 2400],
+        }]);
+        let mut xy = Xy::new(xy7025_mock, Model::Xy7025);
+        let s = xy.read_status().unwrap();
+        assert_eq!(s.i_set, 10.00);
+        assert_eq!(s.i_out, 10.00);
+        assert_eq!(s.p_out, 67.5);
+
+        let sk_mock = MockTransport::new(vec![Op::Read {
+            addr: REG_V_SET,
+            values: vec![1440, 1000, 1350, 1000, 675, 2400],
+        }]);
+        let mut xy = Xy::new(sk_mock, Model::Sk120);
+        let s = xy.read_status().unwrap();
+        assert_eq!(s.i_set, 1.000);
+        assert_eq!(s.i_out, 1.000);
+        assert_eq!(s.p_out, 6.75);
+
+        // V_SET, V_OUT, V_IN scales are model-invariant (always /100).
+        assert_eq!(s.v_set, 14.40);
+        assert_eq!(s.v_out, 13.50);
+        assert_eq!(s.v_in, 24.00);
+    }
+
+    /// `Model::Custom` lets users dial in scales for hardware not covered
+    /// by the preset variants. Verify the three scale getters route
+    /// through the supplied values verbatim.
+    #[test]
+    fn custom_model_routes_user_supplied_scales() {
+        let m = Model::Custom {
+            current_scale: 500.0,
+            power_scale: 25.0,
+            opp_scale: 4.0,
+        };
+        assert_eq!(m.current_scale(), 500.0);
+        assert_eq!(m.power_scale(), 25.0);
+        assert_eq!(m.opp_scale(), 4.0);
+    }
+
     #[test]
     fn set_voltage_scales_correctly() {
         // 14.40 V → 1440 raw.
@@ -485,7 +554,7 @@ mod tests {
             addr: REG_V_SET,
             value: 1440,
         }]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         xy.set_voltage(14.40).unwrap();
     }
 
@@ -496,7 +565,7 @@ mod tests {
             addr: REG_S_LVP,
             values: vec![1000, 1500, 1250],
         }]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         xy.set_protection(SafetyLimits {
             lvp_v: 10.0,
             ovp_v: 15.0,
@@ -511,7 +580,7 @@ mod tests {
             addr: REG_S_LVP,
             values: vec![1000, 1500, 1250],
         }]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         let l = xy.read_protection().unwrap();
         assert_eq!(l.lvp_v, 10.0);
         assert_eq!(l.ovp_v, 15.0);
@@ -534,7 +603,7 @@ mod tests {
                 values: vec![99],
             },
         ]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         assert_eq!(
             xy.read_protection_status().unwrap(),
             ProtectionStatus::Normal
@@ -556,7 +625,7 @@ mod tests {
             addr: REG_AH_LOW,
             values: vec![500, 2, 12345, 0, 1, 23, 45],
         }]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         let t = xy.read_totals().unwrap();
         assert_eq!(t.charge_ah, 131.572);
         assert_eq!(t.energy_wh, 12.345);
@@ -592,11 +661,11 @@ mod tests {
                 0,    // s_ini
             ],
         }]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         let g = xy.read_group(1).unwrap();
         assert_eq!(g.v_set, 14.40);
         assert_eq!(g.s_ovp_v, 15.00);
-        assert_eq!(g.s_opp_w, 1800);
+        assert_eq!(g.s_opp_w, 1800.0);
         assert_eq!(g.s_otp, 95.0);
         assert!(!g.power_on_output);
     }
@@ -609,7 +678,7 @@ mod tests {
             s_lvp_v: 10.00,
             s_ovp_v: 15.00,
             s_ocp_a: 12.50,
-            s_opp_w: 1800,
+            s_opp_w: 1800.0,
             s_ohp_h: 0,
             s_ohp_m: 0,
             s_oah_low: 0,
@@ -623,7 +692,7 @@ mod tests {
             addr: group_addr(2),
             values: vec![1440, 1000, 1000, 1500, 1250, 1800, 0, 0, 0, 0, 0, 0, 950, 1],
         }]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         xy.write_group(2, &p).unwrap();
     }
 
@@ -659,7 +728,7 @@ mod tests {
             s_lvp_v: 10.00,
             s_ovp_v: 15.00,
             s_ocp_a: 12.50,
-            s_opp_w: 1800,
+            s_opp_w: 1800.0,
             s_ohp_h: 7,
             s_ohp_m: 30,
             s_oah_low: 500,
@@ -669,8 +738,8 @@ mod tests {
             s_otp: 95.0,
             power_on_output: true,
         };
-        let regs = encode_group(&p);
-        let decoded = decode_group(&regs);
+        let regs = encode_group(&p, Model::Xy7025);
+        let decoded = decode_group(&regs, Model::Xy7025);
         assert_eq!(decoded.v_set, p.v_set);
         assert_eq!(decoded.i_set, p.i_set);
         assert_eq!(decoded.s_lvp_v, p.s_lvp_v);
@@ -699,7 +768,7 @@ mod tests {
                     addr: $addr,
                     value: $value,
                 }]);
-                let mut xy = Xy::new(mock);
+                let mut xy = Xy::new(mock, Model::Xy7025);
                 $action(&mut xy).unwrap();
             }};
         }
@@ -728,102 +797,147 @@ mod tests {
     #[test]
     fn one_shot_getters_use_correct_addr_and_scale() {
         // read_voltage_out: REG_V_OUT, scale 100
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_V_OUT,
-            values: vec![1234],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_V_OUT,
+                values: vec![1234],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_voltage_out().unwrap(), 12.34);
 
         // read_current_out: REG_I_OUT, scale 100
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_I_OUT,
-            values: vec![500],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_I_OUT,
+                values: vec![500],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_current_out().unwrap(), 5.00);
 
         // read_power_out: REG_P_OUT, scale 10
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_P_OUT,
-            values: vec![675],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_P_OUT,
+                values: vec![675],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_power_out().unwrap(), 67.5);
 
         // read_voltage_in: REG_V_IN, scale 100
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_V_IN,
-            values: vec![2400],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_V_IN,
+                values: vec![2400],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_voltage_in().unwrap(), 24.00);
 
         // read_setpoints: 2-reg bulk read at REG_V_SET
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_V_SET,
-            values: vec![1440, 1000],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_V_SET,
+                values: vec![1440, 1000],
+            }]),
+            Model::Xy7025,
+        );
         let s = xy.read_setpoints().unwrap();
         assert_eq!(s.v_set, 14.40);
         assert_eq!(s.i_set, 10.00);
 
         // read_temperatures: 2-reg bulk read at REG_T_IN, scale 10 each
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_T_IN,
-            values: vec![345, 256],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_T_IN,
+                values: vec![345, 256],
+            }]),
+            Model::Xy7025,
+        );
         let (tin, tex) = xy.read_temperatures().unwrap();
         assert_eq!(tin, 34.5);
         assert_eq!(tex, 25.6);
 
         // read_reg_mode: 0 → CV, nonzero → CC
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_CVCC,
-            values: vec![0],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_CVCC,
+                values: vec![0],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_reg_mode().unwrap(), RegMode::ConstantVoltage);
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_CVCC,
-            values: vec![1],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_CVCC,
+                values: vec![1],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_reg_mode().unwrap(), RegMode::ConstantCurrent);
 
         // read_output: REG_OUTPUT_EN
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_OUTPUT_EN,
-            values: vec![1],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_OUTPUT_EN,
+                values: vec![1],
+            }]),
+            Model::Xy7025,
+        );
         assert!(xy.read_output().unwrap());
 
         // read_lock, read_backlight, read_sleep_minutes, read_buzzer
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_LOCK,
-            values: vec![1],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_LOCK,
+                values: vec![1],
+            }]),
+            Model::Xy7025,
+        );
         assert!(xy.read_lock().unwrap());
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_BACKLIGHT,
-            values: vec![4],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_BACKLIGHT,
+                values: vec![4],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_backlight().unwrap(), 4);
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_SLEEP,
-            values: vec![15],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_SLEEP,
+                values: vec![15],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_sleep_minutes().unwrap(), 15);
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_BUZZER,
-            values: vec![0],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_BUZZER,
+                values: vec![0],
+            }]),
+            Model::Xy7025,
+        );
         assert!(!xy.read_buzzer().unwrap());
 
         // read_slave_address, read_power_on_output
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_SLAVE_ADDR,
-            values: vec![7],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_SLAVE_ADDR,
+                values: vec![7],
+            }]),
+            Model::Xy7025,
+        );
         assert_eq!(xy.read_slave_address().unwrap(), 7);
-        let mut xy = Xy::new(MockTransport::new(vec![Op::Read {
-            addr: REG_S_INI,
-            values: vec![1],
-        }]));
+        let mut xy = Xy::new(
+            MockTransport::new(vec![Op::Read {
+                addr: REG_S_INI,
+                values: vec![1],
+            }]),
+            Model::Xy7025,
+        );
         assert!(xy.read_power_on_output().unwrap());
     }
 
@@ -848,7 +962,7 @@ mod tests {
                 values: vec![TempUnit::Fahrenheit.to_reg()],
             },
         ]);
-        let mut xy = Xy::new(mock);
+        let mut xy = Xy::new(mock, Model::Xy7025);
         xy.set_temp_unit(TempUnit::Celsius).unwrap();
         assert_eq!(xy.read_temp_unit().unwrap(), TempUnit::Celsius);
         xy.set_temp_unit(TempUnit::Fahrenheit).unwrap();
@@ -874,7 +988,7 @@ mod tests {
                 unreachable!()
             }
         }
-        let mut xy = Xy::new(FailRead);
+        let mut xy = Xy::new(FailRead, Model::Xy7025);
         assert!(matches!(
             xy.read_voltage_out(),
             Err(RtuError::Modbus(ModbusError::BadCrc))
