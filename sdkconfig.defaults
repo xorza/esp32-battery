@@ -80,6 +80,11 @@ CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_INIT=n
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 
+# Free TX buffer / CA / peer cert when sessions are idle.
+# CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+# CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+
 # HTTPS server support
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
 
@@ -90,16 +95,49 @@ CONFIG_ESP_HTTPS_SERVER_ENABLE=y
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 
-# Free TX buffer / CA / peer cert when sessions are idle.
-# CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
-# CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
-# CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+# We use a P-256 ECDSA cert; no other curves are reachable. Each disabled
+# curve drops ~2-4 KB of flash. Curve25519 stays for browser X25519 ECDHE.
+CONFIG_MBEDTLS_ECP_DP_SECP384R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP521R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP192R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP224R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP192K1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP224K1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP256K1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_BP256R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_BP384R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_BP512R1_ENABLED=n
 
-# LAN is v4-only; disabling IPv6 saves ~5KB DRAM + flash.
+# Trim TLS features we don't use. ALPN is HTTP/2 only; renegotiation is
+# deprecated; MFL is RFC 6066 fragment-length negotiation we don't need.
+CONFIG_MBEDTLS_SSL_ALPN=n
+CONFIG_MBEDTLS_SSL_RENEGOTIATION=n
+CONFIG_MBEDTLS_SSL_MAX_FRAGMENT_LENGTH=n
+
+# Drop the mbedTLS error-string table (~6-8 KB). Logs become numeric codes.
+CONFIG_MBEDTLS_ERROR_STRINGS=n
+
+# Drop esp_err_t → string table (~3-6 KB). Same tradeoff.
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+
+# LAN is v4-only, but IPv6 must stay enabled: esp-idf-sys's compile-time
+# libc constant checks reference AF_INET6/PF_INET6 unconditionally and
+# fail to build when LWIP_IPV6 is disabled.
 CONFIG_LWIP_IPV6=y
 
 # Use ROM TLSF heap allocator (saves ~2KB IRAM + flash).
 CONFIG_HEAP_TLSF_USE_ROM_IMPL=y
+
+# AMPDU off — drops WiFi throughput 30-50% but saves ~3-5KB RAM.
+# Dashboard traffic is tiny so the throughput hit is invisible.
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+
+# GDB stub eats ~6KB; we don't connect a debugger over serial.
+CONFIG_ESP_GDBSTUB_ENABLED=n
+
+# mDNS: dashboard advertises one HTTPS service; default 10 slots is wasteful.
+CONFIG_MDNS_MAX_SERVICES=2
 
 # Route esp_log output to the built-in USB-Serial/JTAG peripheral so logs
 # are visible on /dev/ttyACM0 without a separate UART-to-USB cable.

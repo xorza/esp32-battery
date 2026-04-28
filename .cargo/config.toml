@@ -10,11 +10,17 @@ check-c3 = "check --target riscv32imc-esp-espidf --no-default-features --feature
 
 [target.riscv32imac-esp-espidf]
 linker = "ldproxy"
-rustflags = ["--cfg", "espidf_time64"]
+rustflags = [
+    "--cfg", "espidf_time64",
+    "-Zunstable-options", "-Cpanic=immediate-abort",
+]
 
 [target.riscv32imc-esp-espidf]
 linker = "ldproxy"
-rustflags = ["--cfg", "espidf_time64"]
+rustflags = [
+    "--cfg", "espidf_time64",
+    "-Zunstable-options", "-Cpanic=immediate-abort",
+]
 
 [unstable]
 build-std = ["std", "panic_abort"]
