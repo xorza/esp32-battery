@@ -8,7 +8,6 @@
 //! and (under `xy-fake`) an in-memory stand-in that drives the same
 //! supervisor loop without touching the bus.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -451,31 +450,7 @@ fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: Ev
         boot_with_retries(&mut xy, &recorder);
         let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
-        // catch_unwind shields the recovery loop from panics in tick /
-        // apply_action. Ok(()) = tick asked for restart; Err = panic.
-        // Asymmetric with `ina.rs`, which lets panics propagate to the
-        // panic hook: the XY drives the buck output, so on panic we want
-        // a graceful `set_output(false)` attempt before the hook reboots
-        // — INA is a read-only sensor with no such obligation.
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            supervise_loop(&mut xy, &sensor_data, &recorder, &mut supervisor, &wdt)
-        }));
-
-        if let Err(panic) = result {
-            let msg = panic
-                .downcast_ref::<&'static str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<non-string panic>");
-            error!("XY supervisor thread PANICKED: {msg} — forcing output OFF");
-            recorder.record(Event::Xy(XyError::SupervisorPanic));
-            // Drop before shutdown_or_reboot — its reboot path parks
-            // forever, which would otherwise hold the subscription
-            // through the 2 s reboot grace and trip the deadman.
-            drop(wdt);
-            shutdown_or_reboot(&mut xy, "post-panic", false, &recorder);
-            return;
-        }
+        supervise_loop(&mut xy, &sensor_data, &recorder, &mut supervisor, &wdt);
     }
 
     error!(

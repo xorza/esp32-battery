@@ -39,7 +39,6 @@ pub enum XyError {
     SetVoltage,
     SetOutput,
     BootSequence,
-    SupervisorPanic,
 }
 
 impl XyError {

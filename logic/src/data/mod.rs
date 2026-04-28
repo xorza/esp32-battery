@@ -2,12 +2,11 @@
 //!
 //! `SensorData` is a thin orchestrator over two concerns: per-producer
 //! staleness tracking (`LiveReadings`) and the adaptive-resolution history
-//! ring + on-flash codec (`history`). Persistence (NVS I/O, save scheduling)
-//! lives in the firmware crate's main loop — `data` is pure model.
+//! ring (`history`).
 
 mod history;
 
-pub use history::{HISTORY_CAPACITY, SERIALIZED_MAX_BYTES};
+pub use history::HISTORY_CAPACITY;
 
 use history::History;
 
@@ -182,25 +181,6 @@ impl SensorData {
         self.history.interval()
     }
 
-    /// Restore history from a previously-saved blob. Call at startup
-    /// before the first `tick`. Returns `false` if the blob is malformed.
-    pub fn load_from_bytes(&mut self, bytes: &[u8]) -> bool {
-        if history::deserialize(bytes, &mut self.history) {
-            log::info!("Loaded {} samples from blob", self.history.samples().len());
-            true
-        } else {
-            log::warn!("Failed to parse history blob ({} bytes)", bytes.len());
-            false
-        }
-    }
-
-    /// Serialize history + metadata into the caller-provided buffer for
-    /// NVS storage; returns the number of bytes written. `out` must hold
-    /// at least `SERIALIZED_MAX_BYTES` to fit any valid history.
-    pub fn serialize_into(&self, out: &mut [u8]) -> usize {
-        history::serialize_into(&self.history, out)
-    }
-
     /// Drive the history pipeline forward by one tick. `now_epoch` is the
     /// wall-clock second the caller wants stamped on any committed sample;
     /// `None` (e.g. before NTP sync) gates out commits but still ages the
@@ -283,14 +263,6 @@ mod tests {
             );
         }
         start_t + n
-    }
-
-    fn sd_with_blob(sd: &SensorData) -> SensorData {
-        let mut buf = vec![0u8; super::SERIALIZED_MAX_BYTES];
-        let n = sd.serialize_into(&mut buf);
-        let mut fresh = SensorData::new();
-        assert!(fresh.load_from_bytes(&buf[..n]));
-        fresh
     }
 
     // --- Default / basic update ---
@@ -411,20 +383,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn power_online_roundtrips_through_persistence() {
-        let mut sd = SensorData::new();
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(13.0, 2.0), 0);
-        update(&mut sd, bat_reading(13.0, 1.0), ps_reading(0.0, 0.0), 1);
-        let mut buf = vec![0u8; super::SERIALIZED_MAX_BYTES];
-        let n = sd.serialize_into(&mut buf);
-
-        let mut sd2 = SensorData::new();
-        assert!(sd2.load_from_bytes(&buf[..n]));
-        assert!((sd2.history()[0].power_online - 1.0).abs() < 0.001);
-        assert!(sd2.history()[1].power_online.abs() < 0.001);
-    }
-
     // --- Ordering / no-NTP guards ---
 
     #[test]
@@ -459,60 +417,6 @@ mod tests {
     }
 
     // --- Restore-from-blob ---
-
-    #[test]
-    fn loads_from_platform_on_first_update() {
-        let mut sd = SensorData::new();
-        for i in 0..10u32 {
-            update(
-                &mut sd,
-                bat_reading(13.0, 1.0),
-                ps_reading(13.0, 2.0),
-                1000 + i,
-            );
-        }
-
-        let mut sd2 = sd_with_blob(&sd);
-        update(
-            &mut sd2,
-            bat_reading(14.0, 3.0),
-            ps_reading(14.0, 4.0),
-            1010,
-        );
-
-        assert_eq!(sd2.history().len(), 11);
-        assert_eq!(sd2.interval(), 1);
-        assert_eq!(sd2.history()[0].time_s, 1000);
-        assert!((sd2.history()[0].battery_current - 1.0).abs() < 0.001);
-        assert_eq!(sd2.history()[10].time_s, 1010);
-        assert!((sd2.history()[10].voltage - 14.0).abs() < 0.001);
-        assert!((sd2.history()[10].battery_current - 3.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn load_restores_old_blob_via_update() {
-        let mut sd = SensorData::new();
-        fill(&mut sd, 100, 1000);
-
-        let mut sd2 = sd_with_blob(&sd);
-        update(
-            &mut sd2,
-            bat_reading(13.0, 1.0),
-            ps_reading(13.0, 2.0),
-            5000,
-        );
-
-        assert_eq!(sd2.history().len(), 101);
-        assert_eq!(sd2.history()[0].time_s, 1000);
-        assert_eq!(sd2.history()[100].time_s, 5000);
-    }
-
-    #[test]
-    fn load_rejects_corrupt_blob() {
-        let mut sd = SensorData::new();
-        assert!(!sd.load_from_bytes(&[0xFF; 10]));
-        assert!(sd.history().is_empty());
-    }
 
     // --- Producer-independence: a dead sensor must not halt history ---
 

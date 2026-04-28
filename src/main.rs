@@ -4,11 +4,11 @@ mod captive_api;
 mod clock;
 mod dns;
 mod errors;
-mod history_store;
 mod http;
 mod ina;
 #[cfg(feature = "lcd")]
 mod lcd;
+#[cfg(any())]
 mod log_ring;
 mod net;
 mod nvs_creds;
@@ -32,7 +32,6 @@ use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::EventLog;
 
 use crate::clock::{EventRecorder, uptime};
-use crate::history_store::HistoryStore;
 use crate::net::{LinkState, NetState, NetStatusHandle, ResetSignal, SubmissionStatus};
 use crate::nvs_creds::WifiCredentials;
 
@@ -53,9 +52,6 @@ const CAPTIVE_TRYING_TIMEOUT: Duration = Duration::from_secs(20);
 /// Supervisor loop period.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
 
-/// Interval between flash writes of the serialized history blob.
-const SAVE_INTERVAL_S: u32 = 600;
-
 struct StaCtx {
     sensor_data: Arc<Mutex<SensorData>>,
     event_log: Arc<Mutex<EventLog>>,
@@ -74,43 +70,6 @@ impl StaCtx {
     }
 }
 
-/// Tick the data store and, on the save-interval boundary, write a snapshot
-/// to NVS. The serialize call runs under the same lock as `tick`; the actual
-/// flash I/O happens after the lock is dropped.
-fn tick_and_persist(
-    sensor_data: &Mutex<SensorData>,
-    store: &HistoryStore,
-    last_save_s: &mut Option<u32>,
-    epoch: Option<u32>,
-) {
-    let should_save = {
-        let mut sd = sensor_data.lock().unwrap();
-        sd.tick(epoch);
-        match (epoch, *last_save_s) {
-            (Some(t), Some(last)) if t.saturating_sub(last) >= SAVE_INTERVAL_S => {
-                *last_save_s = Some(t);
-                true
-            }
-            (Some(t), None) => {
-                *last_save_s = Some(t);
-                false
-            }
-            _ => false,
-        }
-    };
-    if should_save {
-        // SensorData lock is reacquired briefly inside `save_with` to fill
-        // the store's scratch buffer; it's released before the slow NVS
-        // erase/write so producer threads don't stall on flash I/O.
-        store.save_with(|buf| {
-            let sd = sensor_data.lock().unwrap();
-            let n = sd.serialize_into(buf);
-            log::info!("Emitting save payload: {} bytes", n);
-            n
-        });
-    }
-}
-
 fn main() {
     esp_idf_svc::sys::link_patches();
     let logger = esp_idf_svc::log::init_from_esp_idf();
@@ -121,18 +80,10 @@ fn main() {
         .filter()
         .set_target_level("*", log::LevelFilter::Warn)
         .ok();
+    #[cfg(any())]
     log_ring::init();
     ota::init();
     task_wdt::init();
-
-    // Reboot on any thread panic. Without this, a panic in (e.g.) the INA thread
-    // poisons the sensor_data mutex; subsequent HTTP / LCD handlers then panic on
-    // lock(), leaving a half-dead device that doesn't get caught by the watchdog.
-    std::panic::set_hook(Box::new(|info| {
-        log::error!("panic: {info}");
-        thread::sleep(Duration::from_millis(500));
-        esp_idf_svc::hal::reset::restart();
-    }));
 
     let board = board::Board::take();
     let sysloop = EspSystemEventLoop::take().unwrap();
@@ -142,24 +93,14 @@ fn main() {
     let boot_creds = nvs_creds::load(&nvs);
 
     let clock = clock::EspClock::new();
-    let history_store = HistoryStore::new(nvs_partition.clone());
 
     let wifi = wifi::WifiDriver::new(board.modem, sysloop, nvs_partition);
 
-    // Load persisted history at boot so the first commit doesn't dump a stale
-    // blob and the dashboard has data before the first live commit lands.
-    let mut sd = esp32_battery_logic::data::SensorData::new();
-    history_store.load_with(|bytes| {
-        if !sd.load_from_bytes(bytes) {
-            warn!("history blob in NVS is corrupt or from an older version — discarding");
-        }
-    });
-
-    let sensor_data: Arc<Mutex<SensorData>> = Arc::new(Mutex::new(sd));
+    let sensor_data: Arc<Mutex<SensorData>> =
+        Arc::new(Mutex::new(esp32_battery_logic::data::SensorData::new()));
     let event_log: Arc<Mutex<EventLog>> =
         Arc::new(Mutex::new(esp32_battery_logic::error_log::EventLog::new()));
     let net_status = NetStatusHandle::new();
-    let mut last_save_s: Option<u32> = None;
 
     let _sntp = clock::start_sntp(clock.clone());
 
@@ -219,12 +160,7 @@ fn main() {
     loop {
         thread::sleep(TICK_PERIOD);
         let now = uptime();
-        tick_and_persist(
-            &sensor_data,
-            &history_store,
-            &mut last_save_s,
-            clock.epoch_s(),
-        );
+        sensor_data.lock().unwrap().tick(clock.epoch_s());
 
         if sta_ctx.reset.take() {
             state = force_captive_idle(state);

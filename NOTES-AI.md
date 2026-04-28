@@ -32,7 +32,6 @@ Per-MCU lockfiles: `components_esp32c6.lock`, `components_esp32c3.lock` (managed
 - `xy.rs` — XY7025 Modbus thread + `ChargeSupervisor` integration. Honors `xy-fake` feature.
 - `ota.rs` — `/ota/upload`. HMAC-SHA256-verified firmware writes to inactive OTA partition.
 - `nvs_creds.rs` — WiFi creds in NVS. Single read at boot; supervisor never re-reads per tick.
-- `history_store.rs` — serialized history blob in NVS (~4 KiB). Loaded once at boot, saved every `SAVE_INTERVAL_S` (600 s).
 - `clock.rs` — `uptime()`, `EspClock` (SNTP-backed wall-clock seconds), `EventRecorder` (clock + event-log shim passed to producers).
 - `log_ring.rs` — in-memory log ring; `init()` installs as a slog drain; mounted at `/api/log`.
 - `errors.rs` — `/api/errors` reads the structured `EventLog`.
@@ -47,8 +46,8 @@ Per-MCU lockfiles: `components_esp32c6.lock`, `components_esp32c3.lock` (managed
 - `battery.rs` — `ocv_soc(voltage)` 4S LiFePO4 lookup with linear interpolation.
 - `charging/mod.rs` — `Chemistry`, `Profile::for_pack`, `SafetyLimits`, `ChargeSupervisor` two-phase CV FSM (Float ↔ Absorb hysteresis on charging current). `Action`, `BatterySample`, `FaultReason` types. Sign convention: charging current is **negative** (matches INA228 wiring).
 - `charging/tests.rs` — supervisor transitions, debounce, hysteresis, fault trips.
-- `data/mod.rs` — `SensorData`, `Ina228Reading`, `PsReading`, `Sample`. `LiveReadings` per-producer staleness (5 ticks). Owns the ring + codec.
-- `data/history.rs` — adaptive-resolution history ring + serialization. `HISTORY_CAPACITY` derived from `SERIALIZED_MAX_BYTES = 4096`. Compaction halves resolution when full so total time-coverage grows.
+- `data/mod.rs` — `SensorData`, `Ina228Reading`, `PsReading`, `Sample`. `LiveReadings` per-producer staleness (5 ticks). Owns the in-memory history ring.
+- `data/history.rs` — adaptive-resolution history ring (`HISTORY_CAPACITY = 204`). Compaction halves resolution when full so total time-coverage grows.
 - `error_log.rs` — `EventLog` ring + `Event` enum with sensor / Modbus / charging variants.
 - `log_ring.rs` — generic in-memory log ring used by both crates.
 - `form.rs` — URL-decode + form parsing (used by `/save`).

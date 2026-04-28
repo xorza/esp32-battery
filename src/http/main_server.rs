@@ -10,8 +10,10 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::EventLog;
 
+#[cfg(any())]
+use crate::log_ring;
 use crate::net::ResetSignal;
-use crate::{api, errors, log_ring, ota, wifi_reset};
+use crate::{api, errors, ota, wifi_reset};
 
 use super::{create_server, serve_common_assets, serve_static};
 
@@ -43,6 +45,7 @@ pub fn start(
 
     api::mount(&mut server, sensor_data);
     errors::mount(&mut server, event_log);
+    #[cfg(any())]
     log_ring::mount(&mut server);
     wifi_reset::mount(&mut server, nvs, reset);
     ota::mount(&mut server);
