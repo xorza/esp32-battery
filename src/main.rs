@@ -8,7 +8,7 @@ mod http;
 mod ina;
 #[cfg(feature = "lcd")]
 mod lcd;
-#[cfg(any())]
+
 mod log_ring;
 mod net;
 mod nvs_creds;
@@ -80,7 +80,7 @@ fn main() {
         .filter()
         .set_target_level("*", log::LevelFilter::Warn)
         .ok();
-    #[cfg(any())]
+
     log_ring::init();
     ota::init();
     task_wdt::init();
