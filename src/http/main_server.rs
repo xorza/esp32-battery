@@ -21,7 +21,7 @@ pub fn start(
     nvs: Arc<EspNvs<NvsDefault>>,
     reset: ResetSignal,
 ) -> EspHttpServer<'static> {
-    let mut server = create_server(10240, false, 2, Some(Duration::from_secs(0)), true);
+    let mut server = create_server(10240, false, 3, Some(Duration::from_secs(0)), true);
 
     serve_common_assets(&mut server);
     serve_static(
