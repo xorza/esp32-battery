@@ -52,6 +52,28 @@ const CAPTIVE_TRYING_TIMEOUT: Duration = Duration::from_secs(20);
 /// Supervisor loop period.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
 
+/// Quiet down the ESP-IDF C-side logger before any subsystem starts emitting.
+/// Rust `log::` calls go through a separate path and aren't filtered here.
+fn init_logging() {
+    let logger = esp_idf_svc::log::init_from_esp_idf();
+    // INFO chatter (handshake-per-poll from esp_https_server, wifi state
+    // spam, etc.) on every ESP-IDF tag.
+    logger
+        .filter()
+        .set_target_level("*", log::LevelFilter::Warn)
+        .ok();
+    // Per-connection TLS handshake failures: every browser hitting the
+    // dashboard with our self-signed CA prints a 3-line E/E/W burst
+    // ("mbedtls_ssl_handshake -0x7780") which is expected for an untrusted
+    // cert and drowns the log.
+    for tag in ["esp-tls-mbedtls", "esp_https_server", "httpd"] {
+        logger
+            .filter()
+            .set_target_level(tag, log::LevelFilter::Off)
+            .ok();
+    }
+}
+
 struct StaCtx {
     sensor_data: Arc<Mutex<SensorData>>,
     event_log: Arc<Mutex<EventLog>>,
@@ -72,14 +94,7 @@ impl StaCtx {
 
 fn main() {
     esp_idf_svc::sys::link_patches();
-    let logger = esp_idf_svc::log::init_from_esp_idf();
-    // Mute INFO chatter from the ESP-IDF C side (handshake-per-poll from
-    // esp_https_server, wifi state spam, etc.). "*" is the ESP-IDF default
-    // tag; our Rust log macros go through the `log` crate and are unaffected.
-    logger
-        .filter()
-        .set_target_level("*", log::LevelFilter::Warn)
-        .ok();
+    init_logging();
 
     log_ring::init();
     ota::init();
