@@ -62,10 +62,10 @@ fn init_logging() {
         .filter()
         .set_target_level("*", log::LevelFilter::Warn)
         .ok();
-    // Per-connection TLS handshake failures: every browser hitting the
-    // dashboard with our self-signed CA prints a 3-line E/E/W burst
-    // ("mbedtls_ssl_handshake -0x7780") which is expected for an untrusted
-    // cert and drowns the log.
+    // Per-connection TLS handshake failures: clients on the LAN that don't
+    // have our Homelab CA installed reject the cert and send a fatal alert
+    // (TLS alert 46 / certificate_unknown). Confirmed via mbedtls debug
+    // logging. The 3-line E/E/W burst per failed connection drowns the log.
     for tag in ["esp-tls-mbedtls", "esp_https_server", "httpd"] {
         logger
             .filter()
