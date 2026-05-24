@@ -414,9 +414,12 @@ fn supervise_loop<D: XyDevice>(
     supervisor: &mut ChargeSupervisor,
     wdt: &task_wdt::WdtToken,
 ) {
+    // Tracks the last-seen PROTECT cause so a latch is logged to the event
+    // log once per episode, not on every poll while it stays latched.
+    let mut last_protection = ProtectionStatus::Normal;
     loop {
         wdt.reset();
-        let p = poll(xy, sensor_data, recorder);
+        let p = poll(xy, sensor_data, recorder, &mut last_protection);
         let action = supervisor.tick(p, POLL_INTERVAL);
         if matches!(action, Action::RestartSupervisor) {
             return;
@@ -499,6 +502,7 @@ fn poll<D: XyDevice>(
     xy: &mut D,
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
+    last_protection: &mut ProtectionStatus,
 ) -> PollResult {
     // Single bulk read covers V_SET..V_IN, PROTECT, CVCC, OUTPUT_EN —
     // one Modbus round-trip instead of three. PROTECT is necessarily
@@ -516,11 +520,18 @@ fn poll<D: XyDevice>(
                 i_set: s.i_set,
             });
             let output = Some(if s.output_on {
+                *last_protection = ProtectionStatus::Normal;
                 BuckOutput::On
             } else {
-                if s.protection != ProtectionStatus::Normal {
+                // Record once per latch episode (rising edge / cause change),
+                // not every poll — the warn! stays per-poll for log visibility.
+                if let Some(ev) = XyError::from_protection(s.protection) {
                     warn!("XY PROTECT latched: {}", s.protection);
+                    if *last_protection != s.protection {
+                        recorder.record(Event::Xy(ev));
+                    }
                 }
+                *last_protection = s.protection;
                 BuckOutput::Off {
                     cause: Some(s.protection),
                 }
