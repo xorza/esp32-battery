@@ -52,6 +52,9 @@ embuild = "*"
 flate2 = "*"
 
 [patch.crates-io]
+# Registry embuild 0.33.1 can't parse ESP-IDF v6.0.1's tools.json (unknown
+# `win-arm64` platform); git master adds it. Drop once embuild publishes.
+embuild = { git = "https://github.com/esp-rs/embuild", branch = "master" }
 esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git", branch = "master" }
 esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git", branch = "master" }
 esp-idf-hal = { git = "https://github.com/xorza/esp-idf-hal.git", branch = "feat/i2c-driver" }
