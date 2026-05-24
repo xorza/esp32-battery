@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use strum::IntoStaticStr;
 
+use crate::battery::{self, Chemistry};
+
 pub use xy_modbus::{ProtectionStatus, SafetyLimits, Setpoints};
 
 // ─── Tunables ────────────────────────────────────────────────────────────────
@@ -100,21 +102,9 @@ pub const OUTPUT_RECOVERY_MAX_ATTEMPTS: u32 = 3;
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug)]
-pub enum Chemistry {
-    /// Daily-cycling LFP: 3.60 V/cell absorb, 3.375 V/cell float.
-    /// Matches Victron / Battle Born defaults — gentler on cells than 3.65 V,
-    /// reaches ~99% SoC either way (Battery University BU-808b, Off-Grid Garage tests).
-    LiFePo4,
-    /// Top-balance variant for LFP: 3.65 V/cell absorb (manufacturer max).
-    /// Use sparingly when the BMS needs the high voltage to balance cells.
-    LiFePo4TopBalance,
-    /// Longevity-tuned Li-ion (NMC/LCO): 4.10 V/cell absorb, 4.00 V/cell float.
-    /// 4.10 V trades ~15% capacity for dramatically more cycles vs. 4.20 V.
-    LiIon,
-}
-
-#[derive(Copy, Clone, Debug)]
 pub struct Profile {
+    pub chemistry: Chemistry,
+    pub cells: u8,
     pub absorb_v: f32,
     pub float_v: f32,
     /// Constant-current setpoint sent to the buck during normal charging.
@@ -386,17 +376,6 @@ pub struct ChargeSupervisor {
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
 
-impl Chemistry {
-    /// Per-cell (absorb_v, float_v). Scaled by cell count in `Profile::for_pack`.
-    const fn per_cell(self) -> (f32, f32) {
-        match self {
-            Chemistry::LiFePo4 => (3.60, 3.375),
-            Chemistry::LiFePo4TopBalance => (3.65, 3.375),
-            Chemistry::LiIon => (4.10, 4.00),
-        }
-    }
-}
-
 impl Profile {
     /// Build a pack-level profile from chemistry, series cell count, and
     /// pack capacity. Voltages scale with `cells`; charge/taper currents
@@ -406,15 +385,23 @@ impl Profile {
     pub const fn for_pack(chemistry: Chemistry, cells: u8, capacity_ah: f32) -> Self {
         assert!(cells > 0);
         assert!(capacity_ah > 0.0);
-        let (av, fv) = chemistry.per_cell();
+        let v = chemistry.charge_voltages();
         let s = cells as f32;
         Self {
-            absorb_v: av * s,
-            float_v: fv * s,
+            chemistry,
+            cells,
+            absorb_v: v.absorb_v * s,
+            float_v: v.float_v * s,
             regulation_a: capacity_ah * REGULATION_C,
             enter_absorb_a: capacity_ah * ENTER_ABSORB_C,
             exit_absorb_a: capacity_ah * EXIT_ABSORB_C,
         }
+    }
+
+    /// Estimated state-of-charge (0.0–100.0) from pack bus voltage, using
+    /// this pack's chemistry and cell count.
+    pub fn soc(&self, pack_voltage_v: f32) -> f32 {
+        battery::ocv_soc(self.chemistry, self.cells, pack_voltage_v)
     }
 
     /// Derive hard trip thresholds for the buck's own protection. The buck

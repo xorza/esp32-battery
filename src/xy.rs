@@ -15,13 +15,14 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    self, Action, BatterySample, BuckOutput, ChargeSupervisor, Chemistry, PollResult, Profile,
+    self, Action, BatterySample, BuckOutput, ChargeSupervisor, PollResult,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
 
 use xy_modbus::{Model, ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Setpoints, Status};
 
+use crate::PACK_PROFILE;
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
 use crate::reboot;
@@ -29,11 +30,6 @@ use crate::task_wdt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-/// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
-/// absorb / 13.5 V float. Currents derive from capacity via the `*_C`
-/// constants in `charging`: 0.2C = 10 A CC, 0.06C = 3 A enter, 0.05C = 2.5 A
-/// exit (manufacturer-standard tail).
-const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
 /// Hard trip thresholds programmed into the XY's protection registers.
 /// Derived from the profile so a chemistry/cell-count change moves them
 /// in lockstep — no chance the OVP ceiling drifts below the absorb target.

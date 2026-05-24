@@ -226,6 +226,8 @@ fn new_rejects_absorb_not_above_float() {
     // V_SET"). Profile-builder construction guarantees that for chemistries,
     // but a hand-rolled Profile must still satisfy it.
     let bogus = Profile {
+        chemistry: Chemistry::LiFePo4,
+        cells: 4,
         absorb_v: 13.5,
         float_v: 13.5,
         regulation_a: 10.0,

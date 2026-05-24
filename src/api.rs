@@ -10,9 +10,9 @@ use serde::ser::SerializeSeq;
 
 use std::sync::{Arc, Mutex};
 
-use esp32_battery_logic::battery;
 use esp32_battery_logic::data::{Sample, SensorData};
 
+use crate::PACK_PROFILE;
 use crate::clock::uptime;
 use crate::http::mount_json_get;
 use crate::wifi::sta_rssi;
@@ -99,7 +99,7 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
             power_online: store.power_online(),
             heap: HeapInfo::new(),
             battery: BatteryReading {
-                soc: battery::ocv_soc(bat.voltage),
+                soc: PACK_PROFILE.soc(bat.voltage),
                 current: bat.current,
                 power: bat.power,
             },

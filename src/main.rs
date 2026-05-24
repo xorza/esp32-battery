@@ -28,6 +28,8 @@ use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use log::warn;
 
+use esp32_battery_logic::battery::Chemistry;
+use esp32_battery_logic::charging::Profile;
 use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::EventLog;
 
@@ -51,6 +53,14 @@ const CAPTIVE_TRYING_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Supervisor loop period.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
+
+/// This board's pack: 4S LiFePO4, 50 Ah. Daily-cycle setpoints — 14.4 V
+/// absorb / 13.5 V float. Currents derive from capacity via the `*_C`
+/// constants in `charging`: 0.2C = 10 A CC, 0.06C = 3 A enter, 0.05C = 2.5 A
+/// exit (manufacturer-standard tail). Single source of pack identity —
+/// charge setpoints, hardware safety limits, and reported SoC all derive
+/// from it.
+pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
 
 /// Quiet down the ESP-IDF C-side logger before any subsystem starts emitting.
 /// Rust `log::` calls go through a separate path and aren't filtered here.
