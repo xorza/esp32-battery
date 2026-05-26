@@ -20,11 +20,15 @@ pub struct Ina228Reading {
 }
 
 /// Power-supply reading sourced from the XY7025 Modbus client (no charge register).
+/// `v_set`/`i_set` are the programmed CV/CC targets (diagnostic — surfaces what
+/// the buck is actually told to do vs. what it outputs).
 #[derive(Clone, Copy, Default)]
 pub struct PsReading {
     pub voltage: f32,
     pub current: f32,
     pub power: f32,
+    pub v_set: f32,
+    pub i_set: f32,
 }
 
 /// A single timestamped data point for charting (both sensors).
@@ -128,6 +132,9 @@ impl LiveReadings {
 pub struct SensorData {
     live: LiveReadings,
     history: History,
+    /// XY `MODEL` register (`0x0016`) read once at boot. `0` = not yet read.
+    /// Diagnostic only — confirms the configured `Model`'s scale family.
+    pub model_code: u16,
 }
 
 impl Default for SensorData {
@@ -141,6 +148,7 @@ impl SensorData {
         Self {
             live: LiveReadings::new(),
             history: History::new(),
+            model_code: 0,
         }
     }
 
@@ -242,6 +250,8 @@ mod tests {
             voltage,
             current,
             power: voltage * current,
+            v_set: 0.0,
+            i_set: 0.0,
         }
     }
 

@@ -30,9 +30,9 @@ use log::warn;
 
 use esp32_battery_logic::battery::Chemistry;
 use esp32_battery_logic::charging::{INPUT_LVP_MARGIN_V, Profile};
-use xy_modbus::SafetyLimits;
 use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::EventLog;
+use xy_modbus::SafetyLimits;
 
 use crate::clock::{EventRecorder, uptime};
 use crate::net::{LinkState, NetState, NetStatusHandle, ResetSignal, SubmissionStatus};
@@ -61,7 +61,7 @@ const TICK_PERIOD: Duration = Duration::from_secs(1);
 /// exit (manufacturer-standard tail). Single source of pack identity —
 /// charge setpoints, hardware safety limits, and reported SoC all derive
 /// from it.
-pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiIon, 3, 9.0);
+pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiIon, 4, 50.0);
 
 /// Hard trip thresholds programmed into the XY's protection registers (OVP/OCP/LVP).
 /// Derived from the profile so a chemistry/cell-count change moves them

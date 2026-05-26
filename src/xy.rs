@@ -305,22 +305,26 @@ mod fake {
 /// is the supervisor's job, conditional on a fresh, drift-free, in-range
 /// first tick. Readback catches dropped writes, scale mismatches, and
 /// wrong-slave wiring before the supervisor can ask for output enable.
-fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<(), BootError> {
+fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<u16, BootError> {
     // Confirm we're talking to the family we think we're talking to —
     // before any writes go out. Wrong-family configuration silently
     // corrupts every subsequent reading by 10×, so we refuse to proceed
     // on Mismatch. `Inconclusive` (SK family / Custom / undocumented
     // code) is allowed through; verification just isn't possible.
-    if let ModelCheck::Mismatch {
-        expected_code,
-        device_code,
-    } = xy.verify_model()?
-    {
-        return Err(BootError::ModelMismatch {
+    let device_code = match xy.verify_model()? {
+        ModelCheck::Mismatch {
             expected_code,
             device_code,
-        });
-    }
+        } => {
+            return Err(BootError::ModelMismatch {
+                expected_code,
+                device_code,
+            });
+        }
+        ModelCheck::Match { device_code } | ModelCheck::Inconclusive { device_code } => {
+            device_code
+        }
+    };
     xy.set_output(false)?;
     // Wipe any latched protection cause from a prior session — power
     // outages and unrelated crashes leave 0x0010 set, and we don't want
@@ -344,7 +348,7 @@ fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<(), BootError> {
     if s.output_on {
         return Err(BootError::OutputOn);
     }
-    Ok(())
+    Ok(device_code)
 }
 
 /// One register quantum is 0.01 (V or A); allow up to two quanta for
@@ -385,19 +389,20 @@ const _: () = assert!(task_wdt::WDT_TIMEOUT.as_secs() > POLL_INTERVAL.as_secs() 
 /// transient causes (XY7025 still powering up, UART state, ESP IDF
 /// driver wedged), and S_INI=OFF means the buck comes back disabled
 /// even if our set_output call below failed.
-fn boot_with_retries<D: XyDevice>(xy: &mut D, recorder: &EventRecorder) {
+fn boot_with_retries<D: XyDevice>(xy: &mut D, recorder: &EventRecorder) -> u16 {
     for attempt in 0..BOOT_RETRY_COUNT {
         if attempt > 0 {
             thread::sleep(BOOT_RETRY_DELAY);
         }
         match boot_sequence(xy) {
-            Ok(()) => return,
+            Ok(device_code) => return device_code,
             Err(e) => warn!("XY boot attempt {}/{BOOT_RETRY_COUNT}: {e}", attempt + 1),
         }
     }
     error!("XY boot failed after {BOOT_RETRY_COUNT} attempts — rebooting MCU");
     recorder.record(Event::Xy(XyError::BootSequence));
     shutdown_or_reboot(xy, "pre-reboot", true, recorder);
+    unreachable!("shutdown_or_reboot with force_reboot=true reboots the MCU");
 }
 
 /// Inner supervise loop: poll → tick → apply, until tick emits
@@ -442,7 +447,8 @@ fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: Ev
                 charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
             );
         }
-        boot_with_retries(&mut xy, &recorder);
+        let model_code = boot_with_retries(&mut xy, &recorder);
+        sensor_data.lock().unwrap().model_code = model_code;
         let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
         supervise_loop(&mut xy, &sensor_data, &recorder, &mut supervisor, &wdt);
@@ -510,6 +516,8 @@ fn poll<D: XyDevice>(
                 voltage: s.v_out,
                 current: s.i_out,
                 power: s.p_out,
+                v_set: s.v_set,
+                i_set: s.i_set,
             });
             let setpoints = Some(Setpoints {
                 v_set: s.v_set,

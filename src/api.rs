@@ -29,6 +29,8 @@ pub struct PsReading {
     pub voltage: f32,
     pub current: f32,
     pub power: f32,
+    pub v_set: f32,
+    pub i_set: f32,
 }
 
 /// Serializes a borrowed slice of history samples as a JSON array of 5-tuples
@@ -81,6 +83,7 @@ pub struct ApiResponse<'a> {
     pub heap: HeapInfo,
     pub battery: BatteryReading,
     pub ps: PsReading,
+    pub model_code: u16,
     pub history: HistoryView<'a>,
 }
 
@@ -107,7 +110,10 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
                 voltage: ps.voltage,
                 current: ps.current,
                 power: ps.power,
+                v_set: ps.v_set,
+                i_set: ps.i_set,
             },
+            model_code: store.model_code,
             history: HistoryView(store.history()),
         };
         let history_len = response.history.0.len();
