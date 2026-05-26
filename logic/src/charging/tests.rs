@@ -13,6 +13,9 @@ fn approx(a: f32, b: f32) -> bool {
 
 /// Sub-OV-threshold voltage used by tests that only care about phase logic.
 const OK_V: f32 = 13.5;
+/// Nominal DC input rail the board feeds the buck — mirrors firmware's
+/// `INPUT_NOMINAL_V`. Drives the input-UVLO (LVP) derivation.
+const INPUT_NOMINAL_V: f32 = 24.0;
 /// Wall time elapsed per simulated tick. Tests choose 1 s so iteration
 /// counts read as seconds when comparing against duration budgets.
 const TICK: Duration = Duration::from_secs(1);
@@ -152,7 +155,7 @@ fn lfp_4s_50ah_matches_hand_calculation() {
     assert!(approx(p.regulation_a, 10.00));
     assert!(approx(p.enter_absorb_a, 3.00));
     assert!(approx(p.exit_absorb_a, 2.50));
-    let s = p.safety_limits();
+    let s = p.safety_limits(INPUT_NOMINAL_V);
     assert!(approx(s.ovp_v, 15.00));
     assert!(approx(s.ocp_a, 15.00));
     assert!(approx(s.lvp_v, 22.00));
@@ -241,15 +244,15 @@ fn new_rejects_absorb_not_above_float() {
 fn safety_limits_track_chemistry_change() {
     // Top-balance pushes absorb to 14.6 V — OVP must move up too, not stay
     // at the 4S-daily 15.0 V. Without derived limits this is the footgun.
-    let s = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 50.0).safety_limits();
+    let s = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 50.0).safety_limits(INPUT_NOMINAL_V);
     assert!(approx(s.ovp_v, 15.2));
     assert!(s.ovp_v > 14.6, "OVP must clear absorb_v");
 }
 
 #[test]
 fn safety_limits_track_cell_count_change() {
-    let s4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).safety_limits();
-    let s8 = Profile::for_pack(Chemistry::LiFePo4, 8, 50.0).safety_limits();
+    let s4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).safety_limits(INPUT_NOMINAL_V);
+    let s8 = Profile::for_pack(Chemistry::LiFePo4, 8, 50.0).safety_limits(INPUT_NOMINAL_V);
     assert!(s8.ovp_v > s4.ovp_v, "OVP scales with cell count");
     // OCP is current-only (and capacity-derived) and LVP is input-side —
     // both independent of S.
@@ -268,7 +271,7 @@ fn safety_limits_ovp_clears_supervisor_threshold() {
         (Chemistry::LiIon, 3),
     ] {
         let p = Profile::for_pack(chem, cells, 50.0);
-        let s = p.safety_limits();
+        let s = p.safety_limits(INPUT_NOMINAL_V);
         let supervisor_trip = p.absorb_v + OV_MARGIN_V;
         assert!(
             s.ovp_v > supervisor_trip,

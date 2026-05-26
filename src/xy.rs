@@ -22,7 +22,7 @@ use esp32_battery_logic::error_log::{Event, XyError};
 
 use xy_modbus::{Model, ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Setpoints, Status};
 
-use crate::PACK_PROFILE;
+use crate::{PACK_PROFILE, SAFETY};
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
 use crate::reboot;
@@ -30,10 +30,6 @@ use crate::task_wdt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-/// Hard trip thresholds programmed into the XY's protection registers.
-/// Derived from the profile so a chemistry/cell-count change moves them
-/// in lockstep — no chance the OVP ceiling drifts below the absorb target.
-const SAFETY: SafetyLimits = PACK_PROFILE.safety_limits();
 /// Buck variant on this board. Sets the per-register scales (I-OUT,
 /// POWER, S-OCP, S-OPP) — wrong family silently shifts readings by 10×,
 /// so this also drives the boot-time `verify_model` check and the fake

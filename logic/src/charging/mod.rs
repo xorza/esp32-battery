@@ -52,13 +52,9 @@ pub const OV_MARGIN_V: f32 = 0.2;
 pub const HARDWARE_OVP_MARGIN_V: f32 = OV_MARGIN_V * 3.0;
 const _: () = assert!(HARDWARE_OVP_MARGIN_V > OV_MARGIN_V);
 
-/// Nominal DC input feeding the XY7025 buck. Used to derive the buck's input
-/// UVLO (LVP register) — it has nothing to do with the pack profile.
-pub const INPUT_NOMINAL_V: f32 = 24.0;
-/// Headroom below `INPUT_NOMINAL_V` before the buck cuts output on input sag.
+/// Headroom below the DC input rail before the buck cuts output on input sag.
 /// 2 V tolerates ~8% droop and stays well above the XY7025's 12 V minimum.
 pub const INPUT_LVP_MARGIN_V: f32 = 2.0;
-const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
 
 /// How long the pack must hold above `absorb_v + OV_MARGIN_V` before tripping.
 /// Time-based so the debounce isn't sensitive to poll cadence.
@@ -411,11 +407,11 @@ impl Profile {
     /// (the const-block above enforces this at compile time). OCP is 50%
     /// over the CC setpoint. LVP on the XY7025 is **input** UVLO, not a
     /// pack-side cutoff — it's tied to the supply rail, not the profile.
-    pub const fn safety_limits(&self) -> SafetyLimits {
+    pub const fn safety_limits(&self, input_nominal_v: f32) -> SafetyLimits {
         SafetyLimits {
             ovp_v: self.absorb_v + HARDWARE_OVP_MARGIN_V,
             ocp_a: self.regulation_a * 1.5,
-            lvp_v: INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V,
+            lvp_v: input_nominal_v - INPUT_LVP_MARGIN_V,
         }
     }
 }

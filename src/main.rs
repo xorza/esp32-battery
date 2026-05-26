@@ -29,7 +29,8 @@ use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use log::warn;
 
 use esp32_battery_logic::battery::Chemistry;
-use esp32_battery_logic::charging::Profile;
+use esp32_battery_logic::charging::{INPUT_LVP_MARGIN_V, Profile};
+use xy_modbus::SafetyLimits;
 use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::EventLog;
 
@@ -60,7 +61,17 @@ const TICK_PERIOD: Duration = Duration::from_secs(1);
 /// exit (manufacturer-standard tail). Single source of pack identity —
 /// charge setpoints, hardware safety limits, and reported SoC all derive
 /// from it.
-pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
+pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiIon, 3, 9.0);
+
+/// Hard trip thresholds programmed into the XY's protection registers (OVP/OCP/LVP).
+/// Derived from the profile so a chemistry/cell-count change moves them
+/// in lockstep — no chance the OVP ceiling drifts below the absorb target.
+/// Nominal DC input feeding the XY7025 buck. Drives the buck's input UVLO
+/// (LVP register) — a board/supply property, not part of the pack profile.
+pub(crate) const INPUT_NOMINAL_V: f32 = 24.0;
+const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
+
+pub(crate) const SAFETY: SafetyLimits = PACK_PROFILE.safety_limits(INPUT_NOMINAL_V);
 
 /// Quiet down the ESP-IDF C-side logger before any subsystem starts emitting.
 /// Rust `log::` calls go through a separate path and aren't filtered here.
