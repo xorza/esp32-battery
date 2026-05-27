@@ -18,6 +18,16 @@ pub enum Chemistry {
     LiIon,
 }
 
+impl core::fmt::Display for Chemistry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Chemistry::LiFePo4 => "LFP",
+            Chemistry::LiFePo4TopBalance => "LFP-TB",
+            Chemistry::LiIon => "Li-ion",
+        })
+    }
+}
+
 /// Per-cell charge setpoints. Scaled by cell count in `charging::Profile::for_pack`.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct CellVoltages {

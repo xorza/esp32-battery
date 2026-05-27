@@ -3,6 +3,8 @@
 //! Wire format preserves the prior hand-rolled shape so the frontend is unchanged.
 //! History rows use a 5-tuple that serializes as `[t, v, c1, c2, online]`.
 
+use core::fmt::Write as _;
+
 use esp_idf_svc::http::server::EspHttpServer;
 use log::debug;
 use serde::Serialize;
@@ -84,6 +86,8 @@ pub struct ApiResponse<'a> {
     pub battery: BatteryReading,
     pub ps: PsReading,
     pub model_code: u16,
+    /// Static pack identity, e.g. `LFP 4S 50Ah`.
+    pub profile: &'a str,
     pub history: HistoryView<'a>,
 }
 
@@ -95,6 +99,8 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
         let store = sensor_data.lock().unwrap();
         let bat = store.battery_reading().unwrap_or_default();
         let ps = store.ps_reading().unwrap_or_default();
+        let mut profile = heapless::String::<32>::new();
+        let _ = write!(profile, "{PACK_PROFILE}");
         let response = ApiResponse {
             uptime: uptime().as_secs() as u32,
             rssi: sta_rssi(),
@@ -114,6 +120,7 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
                 i_set: ps.i_set,
             },
             model_code: store.model_code,
+            profile: &profile,
             history: HistoryView(store.history()),
         };
         let history_len = response.history.0.len();

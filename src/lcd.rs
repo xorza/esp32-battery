@@ -436,6 +436,10 @@ where
         buf.clear();
         let _ = write!(buf, "https://{}.local", crate::wifi::HOSTNAME);
         self.kv_row(LOWER_ROW2_TOP, "URL", &buf, COLOR_IP);
+
+        buf.clear();
+        let _ = write!(buf, "{}", crate::PACK_PROFILE);
+        self.kv_row(LOWER_ROW3_TOP, "PACK", &buf, COLOR_VOLTAGE);
     }
 }
 

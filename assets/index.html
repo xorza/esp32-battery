@@ -99,6 +99,7 @@
         </div>
 
         <div class="footer">
+            <span id="profile">--</span>
             <span id="uptime">--</span>
             <span class="wifi-icon" id="wifi_icon">
                 <span class="wifi-bar"></span>
@@ -200,6 +201,7 @@
                         }
 
                         // Footer
+                        $("profile").textContent = d.profile;
                         $("uptime").textContent = formatUptime(d.uptime);
                         const bars = $("wifi_icon").children;
                         const level =

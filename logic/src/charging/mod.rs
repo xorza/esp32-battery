@@ -109,6 +109,9 @@ pub const OUTPUT_RECOVERY_MAX_ATTEMPTS: u32 = 3;
 pub struct Profile {
     pub chemistry: Chemistry,
     pub cells: u8,
+    /// Rated pack capacity — the input the `*_a` currents were scaled from.
+    /// Kept for display/identity; not used by the supervisor.
+    pub capacity_ah: f32,
     pub absorb_v: f32,
     pub float_v: f32,
     /// Constant-current setpoint sent to the buck during normal charging.
@@ -388,6 +391,7 @@ impl Profile {
         Self {
             chemistry,
             cells,
+            capacity_ah,
             absorb_v: v.absorb_v * s,
             float_v: v.float_v * s,
             regulation_a: capacity_ah * REGULATION_C,
@@ -415,6 +419,17 @@ impl Profile {
             ocp_a: self.regulation_a * 1.5,
             lvp_v: input_nominal_v - INPUT_LVP_MARGIN_V,
         }
+    }
+}
+
+/// Compact pack identity for the LCD / web UI, e.g. `LFP 4S 50Ah`.
+impl std::fmt::Display for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}S {:.0}Ah",
+            self.chemistry, self.cells, self.capacity_ah
+        )
     }
 }
 

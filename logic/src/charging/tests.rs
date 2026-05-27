@@ -188,6 +188,17 @@ fn liion_3s_voltages_match_known_setpoints() {
 }
 
 #[test]
+fn profile_display_is_compact_pack_identity() {
+    // chemistry label + series count + rated capacity, no decimals.
+    assert_eq!(Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).to_string(), "LFP 4S 50Ah");
+    assert_eq!(Profile::for_pack(Chemistry::LiIon, 3, 17.0).to_string(), "Li-ion 3S 17Ah");
+    assert_eq!(
+        Profile::for_pack(Chemistry::LiFePo4TopBalance, 8, 100.0).to_string(),
+        "LFP-TB 8S 100Ah"
+    );
+}
+
+#[test]
 fn voltages_scale_with_cell_count() {
     let p1 = Profile::for_pack(Chemistry::LiFePo4, 1, 50.0);
     let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
@@ -236,6 +247,7 @@ fn new_rejects_absorb_not_above_float() {
     let bogus = Profile {
         chemistry: Chemistry::LiFePo4,
         cells: 4,
+        capacity_ah: 50.0,
         absorb_v: 13.5,
         float_v: 13.5,
         regulation_a: 10.0,
