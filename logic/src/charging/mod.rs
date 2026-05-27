@@ -197,7 +197,7 @@ impl Phase {
 /// under the same conditions. `OutputUnexpectedlyOff` carries the
 /// device-reported protection cause when we managed to read it (`None`
 /// means the PROTECT register read itself failed).
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FaultReason {
     /// No fresh battery reading for `BATTERY_MISSING_TIMEOUT.as_secs()` consecutive ticks.
     /// Without current/voltage we cannot supervise charging — fail closed.
@@ -282,6 +282,7 @@ impl FaultReason {
 /// fault paths. After a fault latches, only `DisableOutput` is ever
 /// emitted until the disable is ACKed. Once acked, recoverable faults
 /// accumulate a healthy window and eventually emit `RestartSupervisor`.
+#[derive(Debug)]
 pub enum Action {
     None,
     /// Caller should write `set_output(true)`. V_SET is untouched —
@@ -373,6 +374,13 @@ pub struct ChargeSupervisor {
     /// each new latch. Only meaningful when the latched fault has a
     /// recovery policy.
     recovery: Debounce,
+    /// Decided during Pending bring-up: the pack's resting voltage (output
+    /// has been OFF) was below the CV plateau, so it isn't full and the
+    /// supervisor should resume Absorb instead of parking in Float.
+    /// Consumed by `ack_enable`. Without it, a pack power-cycled above
+    /// ~75% rests too near `float_v` to ever draw `enter_absorb_a`, so it
+    /// would stall at the float level and never finish charging.
+    enable_into_absorb: bool,
 }
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
@@ -436,10 +444,13 @@ impl std::fmt::Display for Profile {
 impl ChargeSupervisor {
     pub fn new(profile: Profile) -> Self {
         assert!(profile.absorb_v > profile.float_v);
-        // Boot conservative: Phase::Float (re-derive from observed current,
-        // never resume Absorb across a reset) and LatchState::Pending
-        // (output stays OFF until the first healthy tick — bringing up the
-        // buck is the supervisor's job, so cold-boot can't bypass safety).
+        // Boot conservative: Phase::Float and LatchState::Pending (output
+        // stays OFF until the first healthy tick — bringing up the buck is
+        // the supervisor's job, so cold-boot can't bypass safety). We never
+        // trust a *stored* phase across a reset, but the Pending bring-up
+        // re-derives it from the pack's resting voltage: a pack below the CV
+        // plateau isn't full, so `ack_enable` resumes Absorb rather than
+        // stalling in Float.
         Self {
             profile,
             phase: Phase::Float,
@@ -450,6 +461,7 @@ impl ChargeSupervisor {
             modbus_err: Debounce::default(),
             latch: LatchState::Pending,
             recovery: Debounce::default(),
+            enable_into_absorb: false,
         }
     }
 
@@ -459,6 +471,13 @@ impl ChargeSupervisor {
 
     fn target_voltage(&self) -> f32 {
         self.voltage_for_phase(self.phase)
+    }
+
+    /// Pack voltage within `ABSORB_CV_BAND_V` of `absorb_v` — i.e. at/above
+    /// the CV plateau. Doubles as "full" at bring-up and "clock the absorb
+    /// timeout" once in Absorb.
+    fn at_cv_plateau(&self, voltage: f32) -> bool {
+        voltage >= self.profile.absorb_v - ABSORB_CV_BAND_V
     }
 
     fn voltage_for_phase(&self, phase: Phase) -> f32 {
@@ -509,9 +528,11 @@ impl ChargeSupervisor {
     pub fn ack_enable(&mut self) {
         match self.latch {
             LatchState::Pending => {
-                self.latch = LatchState::Active {
-                    pending_voltage: None,
-                }
+                // If the pack came up below the CV plateau it isn't full;
+                // resume Absorb via the pending-voltage path (V_SET steps
+                // float_v → absorb_v on the first Active tick, no drift).
+                let pending_voltage = self.enable_into_absorb.then_some(Phase::Absorb);
+                self.latch = LatchState::Active { pending_voltage };
             }
             _ => panic!("ack_enable from non-Pending state"),
         }
@@ -642,11 +663,14 @@ impl ChargeSupervisor {
         // sustained read failures, but takes 5 s; this gate avoids
         // emitting EnableOutput in the meantime.
         if pre_enable {
-            return if p.setpoints.is_some() {
-                Action::EnableOutput
-            } else {
-                Action::None
-            };
+            if p.setpoints.is_none() {
+                return Action::None;
+            }
+            // Output has been OFF through Pending, so `b.voltage` is the
+            // pack's resting voltage — the true SoC signal. Below the CV
+            // plateau ⇒ not full ⇒ `ack_enable` resumes Absorb.
+            self.enable_into_absorb = !self.at_cv_plateau(b.voltage);
+            return Action::EnableOutput;
         }
 
         // Re-emit UpdateVoltage until the caller acks the previous one.
@@ -689,7 +713,7 @@ impl ChargeSupervisor {
         // Clock the absorb timeout only while the pack sits at the CV plateau.
         // A CC dip (load transient pulling voltage back below absorb_v) resets
         // it via Debounce — that's genuine charging, not a stuck taper.
-        let at_cv = b.voltage >= self.profile.absorb_v - ABSORB_CV_BAND_V;
+        let at_cv = self.at_cv_plateau(b.voltage);
         if self.phase == Phase::Absorb && self.absorb.step(at_cv, elapsed, MAX_ABSORB) {
             return self.latch(FaultReason::AbsorbTimeout);
         }

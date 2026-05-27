@@ -325,5 +325,4 @@ mod tests {
         let acc = SampleAccum::default();
         acc.average(0, 0);
     }
-
 }

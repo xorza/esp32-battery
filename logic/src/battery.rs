@@ -80,9 +80,18 @@ impl Chemistry {
     /// Per-cell absorb/float setpoints for this chemistry.
     pub(crate) const fn charge_voltages(self) -> CellVoltages {
         match self {
-            Chemistry::LiFePo4 => CellVoltages { absorb_v: 3.60, float_v: 3.375 },
-            Chemistry::LiFePo4TopBalance => CellVoltages { absorb_v: 3.65, float_v: 3.375 },
-            Chemistry::LiIon => CellVoltages { absorb_v: 4.10, float_v: 4.00 },
+            Chemistry::LiFePo4 => CellVoltages {
+                absorb_v: 3.60,
+                float_v: 3.375,
+            },
+            Chemistry::LiFePo4TopBalance => CellVoltages {
+                absorb_v: 3.65,
+                float_v: 3.375,
+            },
+            Chemistry::LiIon => CellVoltages {
+                absorb_v: 4.10,
+                float_v: 4.00,
+            },
         }
     }
 
@@ -220,7 +229,10 @@ mod tests {
         let mut v = 0.0;
         while v <= 20.0 {
             let soc = ocv_soc(LFP, 4, v);
-            assert!((0.0..=100.0).contains(&soc), "ocv_soc({v}) = {soc} out of range");
+            assert!(
+                (0.0..=100.0).contains(&soc),
+                "ocv_soc({v}) = {soc} out of range"
+            );
             v += 0.1;
         }
     }

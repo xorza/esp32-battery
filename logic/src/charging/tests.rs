@@ -95,13 +95,16 @@ fn fail_tick(
 /// don't care about the bring-up dance use this; tests that exercise
 /// Pending behavior call `ChargeSupervisor::new` directly.
 fn active(profile: Profile) -> ChargeSupervisor {
-    // Use the profile's own float_v for the bring-up sample so this
-    // helper works for any chemistry / cell count without crossing OV.
-    let bring_up_v = profile.float_v;
+    // Bring up at the CV plateau (`absorb_v`, still under the OV trip) so
+    // the pack reads as full and the supervisor lands in Float — the
+    // precondition these tests assume. A resting voltage below the plateau
+    // would (correctly) resume Absorb; that path has its own tests.
+    let bring_up_v = profile.absorb_v;
     let mut s = ChargeSupervisor::new(profile);
     let a = ok_tick(&mut s, b(bring_up_v, -0.1), TICK);
     assert!(matches!(a, Action::EnableOutput));
     s.ack_enable();
+    assert!(matches!(s.phase(), Phase::Float));
     s
 }
 
@@ -190,8 +193,14 @@ fn liion_3s_voltages_match_known_setpoints() {
 #[test]
 fn profile_display_is_compact_pack_identity() {
     // chemistry label + series count + rated capacity, no decimals.
-    assert_eq!(Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).to_string(), "LFP 4S 50Ah");
-    assert_eq!(Profile::for_pack(Chemistry::LiIon, 3, 17.0).to_string(), "Li-ion 3S 17Ah");
+    assert_eq!(
+        Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).to_string(),
+        "LFP 4S 50Ah"
+    );
+    assert_eq!(
+        Profile::for_pack(Chemistry::LiIon, 3, 17.0).to_string(),
+        "Li-ion 3S 17Ah"
+    );
     assert_eq!(
         Profile::for_pack(Chemistry::LiFePo4TopBalance, 8, 100.0).to_string(),
         "LFP-TB 8S 100Ah"
@@ -1032,6 +1041,42 @@ fn pending_re_emits_enable_until_acked() {
         let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
         assert!(matches!(a, Action::EnableOutput));
     }
+}
+
+#[test]
+fn low_pack_resumes_absorb_after_bringup() {
+    // Regression: a partially-charged pack power-cycled mid-charge rests
+    // below the CV plateau but near float_v, so it can't draw
+    // enter_absorb_a (3 A here). The old current-only gate left it stuck in
+    // Float forever. Now the resting voltage at bring-up (< absorb_v -
+    // band) routes it back into Absorb regardless of current.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    // OK_V = 13.5 is below absorb_v - band (14.3); current -0.1 A is far
+    // under enter_absorb_a — exactly the stuck scenario.
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(a, Action::EnableOutput));
+    s.ack_enable();
+    assert!(matches!(s.phase(), Phase::Float)); // not committed until V_SET write
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(
+        matches!(a, Action::UpdateVoltage { target_v } if approx(target_v, lfp_4s().absorb_v)),
+        "expected UpdateVoltage to absorb_v, got {a:?}",
+    );
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn full_pack_stays_float_after_bringup() {
+    // A pack resting at the CV plateau is full — bring-up must NOT resume
+    // Absorb. With low current it sits in Float (maintenance), no voltage
+    // bump.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
+    assert!(matches!(a, Action::EnableOutput));
+    s.ack_enable();
+    let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
+    assert!(matches!(a, Action::None), "expected None, got {a:?}");
+    assert!(matches!(s.phase(), Phase::Float));
 }
 
 #[test]

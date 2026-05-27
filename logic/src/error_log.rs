@@ -332,7 +332,11 @@ mod tests {
             (ProtectionStatus::Oep, XyError::ProtectOep, "protect_oep"),
             (ProtectionStatus::Owh, XyError::ProtectOwh, "protect_owh"),
             (ProtectionStatus::Icp, XyError::ProtectIcp, "protect_icp"),
-            (ProtectionStatus::Unknown(99), XyError::ProtectUnknown, "protect_unknown"),
+            (
+                ProtectionStatus::Unknown(99),
+                XyError::ProtectUnknown,
+                "protect_unknown",
+            ),
         ];
         for (status, expected, name) in cases {
             assert_eq!(XyError::from_protection(status), Some(expected));
