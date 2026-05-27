@@ -22,11 +22,11 @@ use esp32_battery_logic::error_log::{Event, XyError};
 
 use xy_modbus::{Model, ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Setpoints, Status};
 
-use crate::{PACK_PROFILE, SAFETY};
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
 use crate::reboot;
 use crate::task_wdt;
+use crate::{PACK_PROFILE, SAFETY};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -321,9 +321,7 @@ fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<u16, BootError> {
                 device_code,
             });
         }
-        ModelCheck::Match { device_code } | ModelCheck::Inconclusive { device_code } => {
-            device_code
-        }
+        ModelCheck::Match { device_code } | ModelCheck::Inconclusive { device_code } => device_code,
     };
     xy.set_output(false)?;
     // Wipe any latched protection cause from a prior session — power

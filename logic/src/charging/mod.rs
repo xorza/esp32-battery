@@ -142,35 +142,29 @@ pub enum BuckOutput {
 /// OCP/OPP can signal a real downstream fault (short, sticky FET); OVP
 /// means pack-side trouble; energy/time limits hit programmed budgets.
 /// Reboot-required for those.
-pub trait ProtectionRecovery {
-    fn is_recoverable(self) -> bool;
-}
-
-impl ProtectionRecovery for ProtectionStatus {
-    fn is_recoverable(self) -> bool {
-        match self {
-            // Input-side and over-temp issues that genuinely clear with
-            // time (AC sag returns, fan cools the case).
-            Self::Lvp | Self::Otp => true,
-            // Output went off but the device reports no protection.
-            // Means a front-panel toggle, external Modbus write, or
-            // EMI on the panel button GPIO — all human/environmental
-            // causes that warrant someone looking. Auto-recovering
-            // would just burn the restart budget on something that
-            // didn't fix itself.
-            Self::Normal => false,
-            // Output / pack / load problems that need someone to look.
-            Self::Ovp
-            | Self::Ocp
-            | Self::Opp
-            | Self::Oah
-            | Self::Ohp
-            | Self::Oep
-            | Self::Owh
-            | Self::Icp => false,
-            // Off-spec read — don't trust ourselves.
-            Self::Unknown(_) => false,
-        }
+fn is_recoverable(cause: ProtectionStatus) -> bool {
+    match cause {
+        // Input-side and over-temp issues that genuinely clear with
+        // time (AC sag returns, fan cools the case).
+        ProtectionStatus::Lvp | ProtectionStatus::Otp => true,
+        // Output went off but the device reports no protection.
+        // Means a front-panel toggle, external Modbus write, or
+        // EMI on the panel button GPIO — all human/environmental
+        // causes that warrant someone looking. Auto-recovering
+        // would just burn the restart budget on something that
+        // didn't fix itself.
+        ProtectionStatus::Normal => false,
+        // Output / pack / load problems that need someone to look.
+        ProtectionStatus::Ovp
+        | ProtectionStatus::Ocp
+        | ProtectionStatus::Opp
+        | ProtectionStatus::Oah
+        | ProtectionStatus::Ohp
+        | ProtectionStatus::Oep
+        | ProtectionStatus::Owh
+        | ProtectionStatus::Icp => false,
+        // Off-spec read — don't trust ourselves.
+        ProtectionStatus::Unknown(_) => false,
     }
 }
 
@@ -258,7 +252,7 @@ impl FaultReason {
             // external write, EMI on the button GPIO) — not transient
             // in the sense that matters. Cause=None (PROTECT read
             // failed): conservative, treat as non-recoverable.
-            Self::OutputUnexpectedlyOff(Some(cause)) if cause.is_recoverable() => {
+            Self::OutputUnexpectedlyOff(Some(cause)) if is_recoverable(cause) => {
                 Some(OUTPUT_RECOVERY_HEALTHY)
             }
             _ => None,
@@ -363,11 +357,10 @@ pub struct ChargeSupervisor {
     battery_missing: Debounce,
     modbus_err: Debounce,
     latch: LatchState,
-    /// Continuous healthy-state time accumulated since the current
-    /// Tripped latch, advanced only by `tick_recovery`. Reset on each
-    /// new latch. Only meaningful when the latched fault has a recovery
-    /// policy.
-    recovery_elapsed: Duration,
+    /// Healthy-state debouncer advanced only by `tick_recovery`. Reset on
+    /// each new latch. Only meaningful when the latched fault has a
+    /// recovery policy.
+    recovery: Debounce,
 }
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
@@ -432,7 +425,7 @@ impl ChargeSupervisor {
             battery_missing: Debounce::default(),
             modbus_err: Debounce::default(),
             latch: LatchState::Pending,
-            recovery_elapsed: Duration::ZERO,
+            recovery: Debounce::default(),
         }
     }
 
@@ -440,7 +433,7 @@ impl ChargeSupervisor {
         self.phase
     }
 
-    pub fn target_voltage(&self) -> f32 {
+    fn target_voltage(&self) -> f32 {
         self.voltage_for_phase(self.phase)
     }
 
@@ -468,19 +461,11 @@ impl ChargeSupervisor {
     /// limits, etc.), it must use the same defer-and-ack pattern as
     /// `pending_voltage` for V_SET, otherwise a successful write to a new
     /// I_SET will trip `SettingsDrift` on the very next tick.
-    pub fn expected_setpoints(&self) -> Setpoints {
+    fn expected_setpoints(&self) -> Setpoints {
         Setpoints {
             v_set: self.target_voltage(),
             i_set: self.profile.regulation_a,
         }
-    }
-
-    /// Whether the supervisor expects the buck's output to be on right
-    /// now. False in Pending (haven't enabled yet) and Tripped; true in
-    /// Active. Used to detect when the buck self-disabled (hardware
-    /// OVP/OCP/LVP, panel toggle, etc.).
-    pub fn expected_output_on(&self) -> bool {
-        matches!(self.latch, LatchState::Active { .. })
     }
 
     /// Caller invokes this after a successful `set_output(false)` Modbus write.
@@ -688,8 +673,8 @@ impl ChargeSupervisor {
             reason,
             acked: false,
         };
-        // New latch — reset recovery elapsed clock.
-        self.recovery_elapsed = Duration::ZERO;
+        // New latch — reset recovery clock.
+        self.recovery.elapsed = Duration::ZERO;
         Action::DisableOutput(reason)
     }
 
@@ -714,12 +699,7 @@ impl ChargeSupervisor {
             .unwrap_or(false);
         let healthy =
             p.setpoints.is_some() && matches!(p.output, Some(BuckOutput::Off { .. })) && battery_ok;
-        if !healthy {
-            self.recovery_elapsed = Duration::ZERO;
-            return Action::None;
-        }
-        self.recovery_elapsed = self.recovery_elapsed.saturating_add(elapsed);
-        if self.recovery_elapsed >= healthy_for {
+        if self.recovery.step(healthy, elapsed, healthy_for) {
             Action::RestartSupervisor
         } else {
             Action::None

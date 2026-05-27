@@ -40,7 +40,7 @@ fn restart_ready(s: &mut ChargeSupervisor, p: PollResult, dt: Duration) -> bool 
 /// Tests that need to perturb one field use spread syntax:
 /// `PollResult { output: Some(BuckOutput::On), ..expected_poll(&s, ...) }`.
 fn expected_poll(s: &ChargeSupervisor, battery: Option<BatterySample>) -> PollResult {
-    let output = if s.expected_output_on() {
+    let output = if matches!(s.latch, LatchState::Active { .. }) {
         BuckOutput::On
     } else {
         BuckOutput::Off { cause: None }
