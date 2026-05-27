@@ -71,7 +71,7 @@ const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
 /// the `MAX_ABSORB` clock. Wide enough to absorb sensing noise / IR drop at
 /// the knee, narrow enough that the CC ramp (well below `absorb_v`) never
 /// arms the timer.
-const ABSORB_CV_BAND_V: f32 = 0.2;
+const ABSORB_CV_BAND_V: f32 = 0.1;
 /// How long charging current must hold below `exit_absorb_a` before the
 /// supervisor accepts the taper as real and drops back to Float. Filters
 /// brief sags from switching noise or transient loads that would otherwise
