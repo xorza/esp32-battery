@@ -61,7 +61,8 @@ const TICK_PERIOD: Duration = Duration::from_secs(1);
 /// exit (manufacturer-standard tail). Single source of pack identity —
 /// charge setpoints, hardware safety limits, and reported SoC all derive
 /// from it.
-pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiIon, 4, 50.0);
+pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
+// pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiIon, 3, 17.0);
 
 /// Hard trip thresholds programmed into the XY's protection registers (OVP/OCP/LVP).
 /// Derived from the profile so a chemistry/cell-count change moves them
@@ -69,6 +70,7 @@ pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiIon, 4, 
 /// Nominal DC input feeding the XY7025 buck. Drives the buck's input UVLO
 /// (LVP register) — a board/supply property, not part of the pack profile.
 pub(crate) const INPUT_NOMINAL_V: f32 = 24.0;
+// pub(crate) const INPUT_NOMINAL_V: f32 = 19.0;
 const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
 
 pub(crate) const SAFETY: SafetyLimits = PACK_PROFILE.safety_limits(INPUT_NOMINAL_V);
