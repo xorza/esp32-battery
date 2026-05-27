@@ -59,9 +59,9 @@ A moving average on the ADC would also work; the time-debounce is simpler and le
 
 ### 4.2 Maximum Absorption Timer
 
-`MAX_ABSORB = 2 h`. If charging current never tapers below `exit_absorb_a` within this window, the supervisor latches `FaultReason::AbsorbTimeout` and disables the buck. Catches stuck-current scenarios (parasitic load pinning current above the tail, BMS balancer drawing continuously, etc.) before the pack sits at CV indefinitely.
+`MAX_ABSORB = 2 h`. The timer clocks **time at the CV plateau only** — it arms once the pack reaches `absorb_v` (within `ABSORB_CV_BAND_V = 0.1 V`) and resets on any dip back into CC. If the current never tapers below `exit_absorb_a` while held at CV for this window, the supervisor latches `FaultReason::AbsorbTimeout` and disables the buck. Catches stuck-current scenarios (parasitic load pinning current above the tail, BMS balancer drawing continuously, etc.) before the pack sits at CV indefinitely.
 
-A healthy 50 Ah pack at 0.05C tail typically taper-finishes in well under 30 min — the 2 h cap is generous headroom, not a typical operating point.
+The CC ramp is deliberately excluded: a deeply discharged pack enters Absorb immediately (current > `enter_absorb_a`) and can spend several hours in CC at 0.2C before reaching `absorb_v` — clocking that against a 2 h cap would fault a healthy charge-from-empty. A healthy pack at 0.05C tail taper-finishes in well under 30 min *once at CV*, so the 2 h cap is generous headroom, not a typical operating point.
 
 ### 4.3 BMS Handshaking
 
@@ -92,7 +92,7 @@ The supervisor latches the buck off on any of these conditions:
 | `BatterySensorStale` | No fresh INA228 reading | `BATTERY_MISSING_TIMEOUT` = 10 s |
 | `ModbusUnhealthy` | Continuous Modbus failures to the XY7025 | `MODBUS_UNHEALTHY_TIMEOUT` = 5 s |
 | `Overvoltage` | `v_batt > absorb_v + OV_MARGIN_V` | `OV_DURATION` = 3 s |
-| `AbsorbTimeout` | Stuck in Absorb without tapering | `MAX_ABSORB` = 2 h |
+| `AbsorbTimeout` | Held at CV plateau without tapering (CC ramp excluded) | `MAX_ABSORB` = 2 h |
 
 After latching, the supervisor emits `Action::DisableOutput` on every `tick()` until the caller successfully writes `set_output(false)` to the buck and calls `ack_disable()`. Once acked, the supervisor goes silent — only a reboot clears the latch.
 

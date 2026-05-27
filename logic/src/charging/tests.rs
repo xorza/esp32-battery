@@ -12,7 +12,12 @@ fn approx(a: f32, b: f32) -> bool {
 }
 
 /// Sub-OV-threshold voltage used by tests that only care about phase logic.
+/// Below the LFP fixture's CV plateau (14.4), so it does NOT arm the absorb
+/// timeout — represents the CC ramp.
 const OK_V: f32 = 13.5;
+/// Pack voltage sitting at the LFP fixture's CV plateau (`absorb_v` = 14.4).
+/// Arms the `MAX_ABSORB` clock; stays under the OV trip (14.6).
+const CV_V: f32 = 14.4;
 /// Nominal DC input rail the board feeds the buck — mirrors firmware's
 /// `INPUT_NOMINAL_V`. Drives the input-UVLO (LVP) derivation.
 const INPUT_NOMINAL_V: f32 = 24.0;
@@ -634,7 +639,7 @@ fn absorb_timeout_in_a_single_large_elapsed_tick() {
     let mut s = active(lfp_4s());
     enter_absorb(&mut s);
     assert!(matches_disable(
-        &ok_tick(&mut s, b(OK_V, -3.0), MAX_ABSORB),
+        &ok_tick(&mut s, b(CV_V, -3.0), MAX_ABSORB),
         FaultReason::AbsorbTimeout,
     ));
 }
@@ -661,10 +666,10 @@ fn modbus_unhealthy_honors_elapsed() {
 fn absorb_does_not_time_out_below_budget() {
     let mut s = active(lfp_4s());
     enter_absorb(&mut s);
-    // Hold absorb just shy of the cap. Current pinned above exit threshold
-    // (2.5 A) so we never drop to Float on our own.
+    // Hold at the CV plateau just shy of the cap. Current pinned above exit
+    // threshold (2.5 A) so we never drop to Float on our own.
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
-        assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(CV_V, -3.0), TICK), Action::None));
     }
     assert!(s.fault().is_none());
 }
@@ -686,7 +691,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     // Spend most of the budget in absorb, leaving room for a full exit
     // debounce window before the absorb timeout would fire.
     for _ in 0..(MAX_ABSORB.as_secs() - EXIT_DEBOUNCE.as_secs() - 10) {
-        ok_tick(&mut s, b(OK_V, -3.0), TICK);
+        ok_tick(&mut s, b(CV_V, -3.0), TICK);
     }
     // …then taper to Float. Sub-tail current for the debounce window
     // before the transition fires, then absorb_elapsed resets.
@@ -704,6 +709,41 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     enter_absorb(&mut s);
     for _ in 0..20 {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
+    }
+    assert!(s.fault().is_none());
+}
+
+#[test]
+fn cc_ramp_below_absorb_v_does_not_arm_timeout() {
+    // Core of the empty-pack fix: an empty pack enters Absorb immediately and
+    // sits in CC (voltage well below absorb_v=14.4) for hours while it climbs.
+    // The timeout clocks the CV plateau only, so the CC ramp must never fault
+    // however long it runs.
+    let mut s = active(lfp_4s());
+    enter_absorb(&mut s);
+    for _ in 0..(MAX_ABSORB.as_secs() + 10) {
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
+    }
+    assert!(s.fault().is_none());
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn absorb_timer_resets_on_cc_dip() {
+    // A load transient pulling the pack back below absorb_v (CC again) resets
+    // the clock — that's genuine charging, not a stuck taper. Arm the timer to
+    // one tick shy of the cap, dip once into CC, then a second near-full CV
+    // hold must still not fault: proves the dip cleared the accumulated time.
+    let mut s = active(lfp_4s());
+    enter_absorb(&mut s);
+    for _ in 0..(MAX_ABSORB.as_secs() - 1) {
+        ok_tick(&mut s, b(CV_V, -3.0), TICK);
+    }
+    assert!(s.fault().is_none());
+    // CC dip: voltage below the CV band resets the absorb debouncer.
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
+    for _ in 0..(MAX_ABSORB.as_secs() - 1) {
+        assert!(matches!(ok_tick(&mut s, b(CV_V, -3.0), TICK), Action::None));
     }
     assert!(s.fault().is_none());
 }
@@ -882,11 +922,11 @@ fn supervisor_latches_on_absorb_timeout() {
     // Hold Absorb until just before the cap. Current pinned above exit
     // threshold so the controller can't taper out on its own.
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
-        ok_tick(&mut s, b(13.5, -3.0), TICK);
+        ok_tick(&mut s, b(CV_V, -3.0), TICK);
     }
     assert!(s.fault().is_none());
 
-    let a = ok_tick(&mut s, b(13.5, -3.0), TICK);
+    let a = ok_tick(&mut s, b(CV_V, -3.0), TICK);
     assert!(matches_disable(&a, FaultReason::AbsorbTimeout));
 }
 

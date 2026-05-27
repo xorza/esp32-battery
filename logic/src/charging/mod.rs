@@ -59,11 +59,19 @@ pub const INPUT_LVP_MARGIN_V: f32 = 2.0;
 /// How long the pack must hold above `absorb_v + OV_MARGIN_V` before tripping.
 /// Time-based so the debounce isn't sensitive to poll cadence.
 const OV_DURATION: Duration = Duration::from_secs(3);
-/// Cap on how long absorb can run continuously. With the manufacturer-spec
-/// 0.05C tail (`EXIT_ABSORB_C`), a healthy pack tapers under 30 min — 2 h
-/// is generous headroom while keeping a stuck-current scenario from sitting
-/// at CV indefinitely.
+/// Cap on how long the pack may hold at the CV plateau (`absorb_v`) without
+/// the current tapering out. Clocks the CV phase only — *not* the CC ramp,
+/// which from a deeply discharged pack at 0.2C can legitimately run several
+/// hours before the pack even reaches `absorb_v`. With the manufacturer-spec
+/// 0.05C tail (`EXIT_ABSORB_C`), a healthy pack tapers under 30 min once at
+/// CV — 2 h is generous headroom while keeping a stuck-current scenario from
+/// sitting at CV indefinitely.
 const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
+/// Pack voltage within this of `absorb_v` counts as "at the CV plateau" for
+/// the `MAX_ABSORB` clock. Wide enough to absorb sensing noise / IR drop at
+/// the knee, narrow enough that the CC ramp (well below `absorb_v`) never
+/// arms the timer.
+const ABSORB_CV_BAND_V: f32 = 0.2;
 /// How long charging current must hold below `exit_absorb_a` before the
 /// supervisor accepts the taper as real and drops back to Float. Filters
 /// brief sags from switching noise or transient loads that would otherwise
@@ -198,9 +206,10 @@ pub enum FaultReason {
     /// Pack voltage exceeded `absorb_v + OV_MARGIN_V` for `OV_DURATION.as_secs()` ticks.
     /// Catches drift below the XY's hardware OVP trip but above the profile target.
     Overvoltage,
-    /// Absorb ran for `MAX_ABSORB.as_secs()` ticks. Under a parasitic load
-    /// pinning current above `exit_absorb_a` we'd otherwise sit at CV
-    /// forever.
+    /// Pack held at the CV plateau (`absorb_v`) for `MAX_ABSORB.as_secs()`
+    /// ticks without tapering out. Under a parasitic load pinning current
+    /// above `exit_absorb_a` we'd otherwise sit at CV forever. The CC ramp
+    /// up to `absorb_v` doesn't count — only time spent actually at CV.
     AbsorbTimeout,
     /// XY7025 setpoint readback (V_SET or I_SET) disagreed with what we
     /// commanded. The buck is sourcing under unknown setpoints — disable
@@ -662,7 +671,11 @@ impl ChargeSupervisor {
             };
         }
 
-        if self.phase == Phase::Absorb && self.absorb.step(true, elapsed, MAX_ABSORB) {
+        // Clock the absorb timeout only while the pack sits at the CV plateau.
+        // A CC dip (load transient pulling voltage back below absorb_v) resets
+        // it via Debounce — that's genuine charging, not a stuck taper.
+        let at_cv = b.voltage >= self.profile.absorb_v - ABSORB_CV_BAND_V;
+        if self.phase == Phase::Absorb && self.absorb.step(at_cv, elapsed, MAX_ABSORB) {
             return self.latch(FaultReason::AbsorbTimeout);
         }
         Action::None
