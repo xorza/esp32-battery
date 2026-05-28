@@ -15,7 +15,7 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    Action, BatterySample, BuckOutput, ChargeSupervisor, PollResult,
+    self, Action, BatterySample, BuckOutput, ChargeSupervisor, PollResult, VoltageWriter,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
@@ -47,18 +47,20 @@ const PACK_MODEL: Model = Model::Xy7025;
 /// The set of operations the charging loop needs from the buck. Real
 /// builds get the `xy_modbus`-backed implementation; `xy-fake` builds
 /// get an in-memory canned device. The thread loop is identical.
-trait XyDevice {
+///
+/// Extends `charging::VoltageWriter` so `set_voltage` / `set_output`
+/// are defined exactly once and `charging::apply_update_voltage` can
+/// drive any `XyDevice` directly.
+trait XyDevice: VoltageWriter {
     fn verify_model(&mut self) -> Result<ModelCheck, RtuError>;
     /// Live + control snapshot (regs 0x0000–0x0012). One Modbus
     /// round-trip per supervisor tick.
     fn read_status(&mut self) -> Result<Status, RtuError>;
     fn read_protection(&mut self) -> Result<SafetyLimits, RtuError>;
-    fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError>;
     fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError>;
     fn set_protection(&mut self, limits: SafetyLimits) -> Result<(), RtuError>;
     /// Write 0 to PROTECT (0x0010) to clear a latched protection cause.
     fn clear_protection_status(&mut self) -> Result<(), RtuError>;
-    fn set_output(&mut self, on: bool) -> Result<(), RtuError>;
     /// Program S_INI (power-on default of OUTPUT_EN). We always pass
     /// `false` so a brown-out / unrelated reset brings the buck back
     /// disabled — the supervisor's bring-up is the only thing allowed
@@ -132,6 +134,8 @@ mod real {
     use xy_modbus::esp_idf::EspIdfTransport;
     use xy_modbus::{ModelCheck, RtuError, SafetyLimits, Status};
 
+    use esp32_battery_logic::charging::VoltageWriter;
+
     use super::{PACK_MODEL, XyDevice};
     use crate::board::XyPins;
 
@@ -157,6 +161,15 @@ mod real {
         }
     }
 
+    impl VoltageWriter for Xy<'_> {
+        fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
+            self.0.set_voltage(volts)
+        }
+        fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
+            self.0.set_output(on)
+        }
+    }
+
     impl XyDevice for Xy<'_> {
         fn verify_model(&mut self) -> Result<ModelCheck, RtuError> {
             self.0.verify_model()
@@ -170,10 +183,6 @@ mod real {
             self.0.read_protection()
         }
 
-        fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
-            self.0.set_voltage(volts)
-        }
-
         fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError> {
             self.0.set_current_limit(amps)
         }
@@ -184,10 +193,6 @@ mod real {
 
         fn clear_protection_status(&mut self) -> Result<(), RtuError> {
             self.0.clear_protection_status()
-        }
-
-        fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
-            self.0.set_output(on)
         }
 
         fn set_power_on_default(&mut self, on: bool) -> Result<(), RtuError> {
@@ -203,6 +208,7 @@ mod fake {
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
+    use esp32_battery_logic::charging::VoltageWriter;
     use xy_modbus::{ModelCheck, ProtectionStatus, RegMode, RtuError, SafetyLimits, Status};
 
     use super::{PACK_MODEL, XyDevice};
@@ -253,6 +259,17 @@ mod fake {
         }
     }
 
+    impl VoltageWriter for Xy<'_> {
+        fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
+            self.v_set = volts;
+            Ok(())
+        }
+        fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
+            self.output_on = on;
+            Ok(())
+        }
+    }
+
     impl XyDevice for Xy<'_> {
         fn verify_model(&mut self) -> Result<ModelCheck, RtuError> {
             // Fake mirrors what a correctly-wired device would report:
@@ -284,10 +301,6 @@ mod fake {
         fn read_protection(&mut self) -> Result<SafetyLimits, RtuError> {
             Ok(self.protection)
         }
-        fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
-            self.v_set = volts;
-            Ok(())
-        }
         fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError> {
             self.i_set = amps;
             Ok(())
@@ -298,10 +311,6 @@ mod fake {
         }
         fn clear_protection_status(&mut self) -> Result<(), RtuError> {
             self.protection_status = ProtectionStatus::Normal;
-            Ok(())
-        }
-        fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
-            self.output_on = on;
             Ok(())
         }
         fn set_power_on_default(&mut self, _on: bool) -> Result<(), RtuError> {
@@ -539,70 +548,6 @@ fn poll<D: XyDevice>(
     }
 }
 
-/// Write V_SET, optionally cycling output around the write for safety on
-/// step-downs. Stepping V_SET down with output enabled drives reverse
-/// current through the XY7025's synchronous low-side FET and can blow
-/// it (and propagate upstream — neither port has anti-backup
-/// protection). For step-ups the cycle is unnecessary; we write live.
-///
-/// Partial failure leaves the buck OFF and lets the supervisor latch
-/// naturally on the next tick (SettingsDrift if V_SET committed but the
-/// re-enable failed, OutputUnexpectedlyOff otherwise). A reboot is the
-/// recovery path either way — the buck is safe, just not regulating.
-fn apply_update_voltage<D: XyDevice>(
-    xy: &mut D,
-    supervisor: &mut ChargeSupervisor,
-    target_v: f32,
-    cycle_output: bool,
-    recorder: &EventRecorder,
-) {
-    if !cycle_output {
-        match xy.set_voltage(target_v) {
-            Ok(()) => {
-                supervisor.ack_voltage_update();
-                info!(
-                    "charge phase → {}: V_set = {target_v:.2} V",
-                    supervisor.phase().label()
-                );
-            }
-            Err(e) => {
-                warn!("XY set_voltage({target_v}): {e} — supervisor will retry next tick");
-                recorder.record(Event::Xy(XyError::SetVoltage));
-            }
-        }
-        return;
-    }
-
-    info!("charge phase step-down → V_set = {target_v:.2} V (cycling output)");
-    if let Err(e) = xy.set_output(false) {
-        warn!("XY safe-step-down set_output(false): {e} — will retry next tick");
-        recorder.record(Event::Xy(XyError::SetOutput));
-        return;
-    }
-    // Let inductor current decay and the buck's internal state quiesce
-    // before reprogramming V_SET. Modbus latency would usually cover
-    // this, but an explicit sleep removes the dependence on timing.
-    thread::sleep(STEP_DOWN_SETTLE);
-    if let Err(e) = xy.set_voltage(target_v) {
-        warn!("XY safe-step-down set_voltage({target_v}): {e} — buck stays OFF, will retry");
-        recorder.record(Event::Xy(XyError::SetVoltage));
-        return;
-    }
-    // V_SET is now on the buck — commit the phase so the next tick's
-    // drift check sees matching setpoints. If the re-enable below fails,
-    // the supervisor will latch on output-off, which is the safe outcome.
-    supervisor.ack_voltage_update();
-    if let Err(e) = xy.set_output(true) {
-        error!("XY safe-step-down set_output(true): {e} — buck OFF after voltage commit");
-        recorder.record(Event::Xy(XyError::SetOutput));
-        return;
-    }
-    info!(
-        "charge phase → {}: V_set = {target_v:.2} V (step-down complete)",
-        supervisor.phase().label()
-    );
-}
-
 fn apply_action<D: XyDevice>(
     xy: &mut D,
     supervisor: &mut ChargeSupervisor,
@@ -624,7 +569,14 @@ fn apply_action<D: XyDevice>(
         Action::UpdateVoltage {
             target_v,
             cycle_output,
-        } => apply_update_voltage(xy, supervisor, target_v, cycle_output, recorder),
+        } => charging::apply_update_voltage(
+            xy,
+            supervisor,
+            target_v,
+            cycle_output,
+            STEP_DOWN_SETTLE,
+            |err| recorder.record(Event::Xy(err)),
+        ),
         Action::DisableOutput(reason) => match xy.set_output(false) {
             Ok(()) => {
                 error!("CHARGE FAULT ({reason}): PS output DISABLED");

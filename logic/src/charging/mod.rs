@@ -14,16 +14,22 @@
 //! negates internally, so profile thresholds stay positive and read
 //! naturally.
 //!
-//! Pure logic: no I/O. The firmware calls `tick()` each poll and writes
-//! the returned action to the buck converter.
+//! The supervisor proper is pure logic: no I/O. The firmware calls
+//! `tick()` each poll and writes the returned `Action` to the buck.
+//! `apply_update_voltage` is the one I/O-bound helper, hosted here so
+//! the safe-step-down sequencing is testable against a `VoltageWriter`
+//! mock without an esp-idf target.
 
+use std::thread;
 use std::time::Duration;
 
+use log::{error, info, warn};
 use strum::IntoStaticStr;
 
 use crate::battery::{self, Chemistry};
+use crate::error_log::XyError;
 
-pub use xy_modbus::{ProtectionStatus, SafetyLimits, Setpoints};
+pub use xy_modbus::{ProtectionStatus, RtuError, SafetyLimits, Setpoints};
 // Imported by name for terse pattern matching on the buck's PROTECT register —
 // LVP and OTP are the only causes the supervisor handles in-place.
 use ProtectionStatus::{Lvp, Otp};
@@ -756,6 +762,96 @@ impl ChargeSupervisor {
             acked: false,
         };
         Action::DisableOutput(reason)
+    }
+}
+
+// ─── Firmware-side V_SET sequencing ──────────────────────────────────────────
+
+/// Minimal device interface used by [`apply_update_voltage`] — only the
+/// two writes the safe step-down sequence needs. Lives here (not in
+/// firmware) so the sequencing is host-testable with a mock.
+pub trait VoltageWriter {
+    fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError>;
+    fn set_output(&mut self, on: bool) -> Result<(), RtuError>;
+}
+
+/// Execute one `Action::UpdateVoltage`. For `cycle_output: false` (step-up)
+/// writes V_SET live. For `cycle_output: true` (step-down) runs
+/// `set_output(false)` → settle → `set_voltage` → `ack_voltage_update`
+/// → `set_output(true)`. Partial failures attempt best-effort restore so
+/// a single transient Modbus glitch doesn't drop the UPS load:
+///
+/// - Step-2 failure (`set_voltage` after disable): re-enable output so the
+///   supervisor can retry the whole sequence next tick instead of latching.
+/// - Step-3 failure (`set_output(true)` after V_SET commit): retried once
+///   inline. If still failing, the supervisor latches on the next tick
+///   — V_SET is already committed, so the failure mode is safe.
+///
+/// `settle` is the quiet window between disable and the V_SET write
+/// (zero in tests). `on_error` is invoked once per Modbus error so the
+/// firmware can drop it into its event log.
+pub fn apply_update_voltage<W: VoltageWriter>(
+    xy: &mut W,
+    supervisor: &mut ChargeSupervisor,
+    target_v: f32,
+    cycle_output: bool,
+    settle: Duration,
+    mut on_error: impl FnMut(XyError),
+) {
+    if !cycle_output {
+        match xy.set_voltage(target_v) {
+            Ok(()) => {
+                supervisor.ack_voltage_update();
+                info!(
+                    "charge phase → {}: V_set = {target_v:.2} V",
+                    supervisor.phase().label()
+                );
+            }
+            Err(e) => {
+                warn!("XY set_voltage({target_v}): {e} — supervisor will retry next tick");
+                on_error(XyError::SetVoltage);
+            }
+        }
+        return;
+    }
+
+    info!("charge phase step-down → V_set = {target_v:.2} V (cycling output)");
+    if let Err(e) = xy.set_output(false) {
+        warn!("XY safe-step-down set_output(false): {e} — will retry next tick");
+        on_error(XyError::SetOutput);
+        return;
+    }
+    thread::sleep(settle);
+    if let Err(e) = xy.set_voltage(target_v) {
+        warn!("XY safe-step-down set_voltage({target_v}): {e} — attempting output restore");
+        on_error(XyError::SetVoltage);
+        // Best-effort restore so the UPS load stays powered. Supervisor
+        // is still in Active+pending_voltage=Some(next) and will
+        // re-emit UpdateVoltage on the next tick for another attempt.
+        if let Err(e) = xy.set_output(true) {
+            error!("XY safe-step-down restore set_output(true): {e} — buck OFF, will latch");
+            on_error(XyError::SetOutput);
+        }
+        return;
+    }
+    // V_SET is on the buck; commit the phase so the next tick's drift
+    // check sees matching setpoints.
+    supervisor.ack_voltage_update();
+    // Step 3: re-enable. Retry once inline to ride out a single
+    // transient glitch; persistent failure latches on the next tick.
+    let enable = xy.set_output(true).or_else(|e| {
+        warn!("XY safe-step-down set_output(true) attempt 1: {e} — retrying");
+        xy.set_output(true)
+    });
+    match enable {
+        Ok(()) => info!(
+            "charge phase → {}: V_set = {target_v:.2} V (step-down complete)",
+            supervisor.phase().label()
+        ),
+        Err(e) => {
+            error!("XY safe-step-down set_output(true): {e} — buck OFF after voltage commit");
+            on_error(XyError::SetOutput);
+        }
     }
 }
 

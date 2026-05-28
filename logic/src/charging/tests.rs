@@ -1534,3 +1534,238 @@ fn otp_recovery_accepts_buck_auto_re_enable() {
         }
     ));
 }
+
+// ─── apply_update_voltage (firmware-side sequencing) ────────────────────────
+
+/// Programmable mock for `VoltageWriter`. Records every call in order and
+/// can be primed to fail at a specific call index per method, exercising
+/// the partial-failure paths in `apply_update_voltage`.
+#[derive(Default)]
+struct MockWriter {
+    set_output_calls: Vec<bool>,
+    set_voltage_calls: Vec<f32>,
+    fail_set_output_at: Vec<usize>,
+    fail_set_voltage_at: Vec<usize>,
+}
+
+impl VoltageWriter for MockWriter {
+    fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
+        let idx = self.set_voltage_calls.len();
+        self.set_voltage_calls.push(volts);
+        if self.fail_set_voltage_at.contains(&idx) {
+            Err(RtuError::Timeout)
+        } else {
+            Ok(())
+        }
+    }
+    fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
+        let idx = self.set_output_calls.len();
+        self.set_output_calls.push(on);
+        if self.fail_set_output_at.contains(&idx) {
+            Err(RtuError::Timeout)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Drive `s` from Active+Absorb to Active+pending_voltage=Some(Float) by
+/// holding at the CV plateau with tapered current through `EXIT_DEBOUNCE`.
+/// Final tick emits the transition; pending_voltage is left set so the
+/// test caller owns the apply step.
+fn drive_to_absorb_to_float_pending(s: &mut ChargeSupervisor) {
+    enter_absorb(s);
+    let tapered = b(CV_V, -(lfp_4s().exit_absorb_a - 0.1));
+    let p = expected_poll(s, tapered);
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(s.tick(p, TICK), Action::None));
+    }
+    assert!(matches!(
+        s.tick(p, TICK),
+        Action::UpdateVoltage {
+            cycle_output: true,
+            ..
+        }
+    ));
+}
+
+const NO_SETTLE: Duration = Duration::ZERO;
+
+#[test]
+fn apply_step_up_happy_path() {
+    let mut s = active(lfp_4s());
+    let p = expected_poll(&s, b(OK_V, -4.0));
+    assert!(matches!(
+        s.tick(p, TICK),
+        Action::UpdateVoltage {
+            cycle_output: false,
+            ..
+        }
+    ));
+    let mut errs = Vec::new();
+    let mut xy = MockWriter::default();
+    apply_update_voltage(&mut xy, &mut s, lfp_4s().absorb_v, false, NO_SETTLE, |e| {
+        errs.push(e)
+    });
+    assert_eq!(xy.set_voltage_calls, vec![lfp_4s().absorb_v]);
+    assert!(
+        xy.set_output_calls.is_empty(),
+        "step-up must not touch output"
+    );
+    assert!(errs.is_empty());
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn apply_step_down_happy_path() {
+    let mut s = active(lfp_4s());
+    drive_to_absorb_to_float_pending(&mut s);
+    let mut errs = Vec::new();
+    let mut xy = MockWriter::default();
+    apply_update_voltage(&mut xy, &mut s, lfp_4s().float_v, true, NO_SETTLE, |e| {
+        errs.push(e)
+    });
+    assert_eq!(
+        xy.set_output_calls,
+        vec![false, true],
+        "must disable then re-enable around the write"
+    );
+    assert_eq!(xy.set_voltage_calls, vec![lfp_4s().float_v]);
+    assert!(errs.is_empty());
+    assert!(matches!(s.phase(), Phase::Float));
+}
+
+#[test]
+fn apply_step_down_step1_failure_does_not_write_voltage() {
+    let mut s = active(lfp_4s());
+    drive_to_absorb_to_float_pending(&mut s);
+    let mut errs = Vec::new();
+    let mut xy = MockWriter {
+        fail_set_output_at: vec![0],
+        ..Default::default()
+    };
+    apply_update_voltage(&mut xy, &mut s, lfp_4s().float_v, true, NO_SETTLE, |e| {
+        errs.push(e)
+    });
+    assert_eq!(xy.set_output_calls, vec![false]);
+    assert!(xy.set_voltage_calls.is_empty());
+    assert_eq!(errs, vec![XyError::SetOutput]);
+    assert!(matches!(s.phase(), Phase::Absorb));
+    // Supervisor re-emits UpdateVoltage on next tick for retry.
+    let p = expected_poll(&s, b(CV_V, -(lfp_4s().exit_absorb_a - 0.1)));
+    assert!(matches!(
+        s.tick(p, TICK),
+        Action::UpdateVoltage {
+            cycle_output: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn apply_step_down_step2_failure_restores_output() {
+    let mut s = active(lfp_4s());
+    drive_to_absorb_to_float_pending(&mut s);
+    let mut errs = Vec::new();
+    let mut xy = MockWriter {
+        fail_set_voltage_at: vec![0],
+        ..Default::default()
+    };
+    apply_update_voltage(&mut xy, &mut s, lfp_4s().float_v, true, NO_SETTLE, |e| {
+        errs.push(e)
+    });
+    assert_eq!(
+        xy.set_output_calls,
+        vec![false, true],
+        "must restore output after set_voltage failure"
+    );
+    assert_eq!(xy.set_voltage_calls, vec![lfp_4s().float_v]);
+    assert_eq!(errs, vec![XyError::SetVoltage]);
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn apply_step_down_step2_then_restore_both_fail_records_both() {
+    let mut s = active(lfp_4s());
+    drive_to_absorb_to_float_pending(&mut s);
+    let mut errs = Vec::new();
+    let mut xy = MockWriter {
+        fail_set_voltage_at: vec![0],
+        // call 0 = initial disable (success), call 1 = restore (fail).
+        fail_set_output_at: vec![1],
+        ..Default::default()
+    };
+    apply_update_voltage(&mut xy, &mut s, lfp_4s().float_v, true, NO_SETTLE, |e| {
+        errs.push(e)
+    });
+    assert_eq!(xy.set_output_calls, vec![false, true]);
+    assert_eq!(errs, vec![XyError::SetVoltage, XyError::SetOutput]);
+    assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn apply_step_down_step3_failure_retries_once_then_records() {
+    let mut s = active(lfp_4s());
+    drive_to_absorb_to_float_pending(&mut s);
+    let mut errs = Vec::new();
+    let mut xy = MockWriter {
+        // call 0 = initial disable (ok), 1 = re-enable attempt 1 (fail),
+        // 2 = re-enable attempt 2 (fail).
+        fail_set_output_at: vec![1, 2],
+        ..Default::default()
+    };
+    apply_update_voltage(&mut xy, &mut s, lfp_4s().float_v, true, NO_SETTLE, |e| {
+        errs.push(e)
+    });
+    assert_eq!(xy.set_output_calls, vec![false, true, true]);
+    assert_eq!(xy.set_voltage_calls, vec![lfp_4s().float_v]);
+    assert_eq!(errs, vec![XyError::SetOutput]);
+    // Phase IS committed (ack ran between V_SET write and re-enable).
+    assert!(matches!(s.phase(), Phase::Float));
+}
+
+#[test]
+fn apply_step_down_step3_first_attempt_recovers_on_retry() {
+    let mut s = active(lfp_4s());
+    drive_to_absorb_to_float_pending(&mut s);
+    let mut errs = Vec::new();
+    let mut xy = MockWriter {
+        // Re-enable attempt 1 fails, attempt 2 succeeds — no error recorded.
+        fail_set_output_at: vec![1],
+        ..Default::default()
+    };
+    apply_update_voltage(&mut xy, &mut s, lfp_4s().float_v, true, NO_SETTLE, |e| {
+        errs.push(e)
+    });
+    assert_eq!(xy.set_output_calls, vec![false, true, true]);
+    assert!(errs.is_empty(), "transient single failure must not record");
+    assert!(matches!(s.phase(), Phase::Float));
+}
+
+#[test]
+fn apply_step_up_failure_does_not_touch_output() {
+    let mut s = active(lfp_4s());
+    let p = expected_poll(&s, b(OK_V, -4.0));
+    assert!(matches!(
+        s.tick(p, TICK),
+        Action::UpdateVoltage {
+            cycle_output: false,
+            ..
+        }
+    ));
+    let mut errs = Vec::new();
+    let mut xy = MockWriter {
+        fail_set_voltage_at: vec![0],
+        ..Default::default()
+    };
+    apply_update_voltage(&mut xy, &mut s, lfp_4s().absorb_v, false, NO_SETTLE, |e| {
+        errs.push(e)
+    });
+    assert!(
+        xy.set_output_calls.is_empty(),
+        "step-up failure must NOT cycle output"
+    );
+    assert_eq!(xy.set_voltage_calls, vec![lfp_4s().absorb_v]);
+    assert_eq!(errs, vec![XyError::SetVoltage]);
+    assert!(matches!(s.phase(), Phase::Float));
+}
