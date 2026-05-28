@@ -273,6 +273,20 @@ impl FaultReason {
             _ => None,
         }
     }
+
+    /// Stable snake_case identifier — what API consumers and dashboards
+    /// match on. The `Display` impl is the human-readable form for logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BatterySensorStale => "battery_sensor_stale",
+            Self::ModbusUnhealthy => "modbus_unhealthy",
+            Self::Overvoltage => "overvoltage",
+            Self::AbsorbTimeout => "absorb_timeout",
+            Self::SettingsDrift => "settings_drift",
+            Self::OutputUnexpectedlyOff(_) => "output_unexpectedly_off",
+            Self::OutputOnInPending => "output_on_in_pending",
+        }
+    }
 }
 
 /// What the poll loop should do this tick.
@@ -470,6 +484,14 @@ impl ChargeSupervisor {
 
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+
+    /// Phase only while the supervisor is actually regulating (output ON).
+    /// `None` in Pending (output still off, waiting to enable) and Tripped
+    /// (latched fault). Surfaced to the dashboard so "Float" / "Absorb"
+    /// labels appear only when they describe a live charging state.
+    pub fn active_phase(&self) -> Option<Phase> {
+        matches!(self.latch, LatchState::Active { .. }).then_some(self.phase)
     }
 
     fn target_voltage(&self) -> f32 {

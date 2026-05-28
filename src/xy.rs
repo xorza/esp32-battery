@@ -424,6 +424,14 @@ fn supervise_loop<D: XyDevice>(
             return;
         }
         apply_action(xy, supervisor, action, recorder);
+        // Publish supervisor state for /api + LCD. `phase()` is only
+        // meaningful once Active; Pending/Tripped surface as None so
+        // dashboards can distinguish "not yet charging" from a real phase.
+        {
+            let mut sd = sensor_data.lock().unwrap();
+            sd.charge_phase = supervisor.active_phase();
+            sd.charge_fault = supervisor.fault();
+        }
         thread::sleep(POLL_INTERVAL);
     }
 }
@@ -607,6 +615,10 @@ fn apply_action<D: XyDevice>(
         Action::DisableOutput(reason) => match xy.set_output(false) {
             Ok(()) => {
                 error!("CHARGE FAULT ({reason}): PS output DISABLED");
+                // Record once per latch episode: ack_disable transitions
+                // out of `Tripped { acked: false }`, so subsequent ticks
+                // stop re-emitting DisableOutput for the same fault.
+                recorder.record(Event::Xy(XyError::ChargeFaultLatched));
                 supervisor.ack_disable();
             }
             Err(e) => {

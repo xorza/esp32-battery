@@ -53,6 +53,11 @@ pub enum XyError {
     ProtectOwh,
     ProtectIcp,
     ProtectUnknown,
+    /// Supervisor latched a fault and disabled the buck output. The specific
+    /// `FaultReason` is exposed live via `SensorData::charge_fault` — this
+    /// event records that *a* latch happened (and when), so the historical
+    /// `recent` ring shows the latch episode even after the fault clears.
+    ChargeFaultLatched,
 }
 
 impl XyError {

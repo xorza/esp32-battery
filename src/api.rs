@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use esp32_battery_logic::data::{Sample, SensorData};
 
+const FAULT_DISPLAY_CAP: usize = 64;
+
 use crate::PACK_PROFILE;
 use crate::clock::uptime;
 use crate::http::mount_json_get;
@@ -91,6 +93,14 @@ pub struct ApiResponse<'a> {
     /// `true` while the DC supply is disconnected (buck input UVLO). Shown
     /// as a transient "PS offline" status; clears when the supply returns.
     pub ps_offline: bool,
+    /// `"absorb"` / `"float"` while the supervisor is actively regulating,
+    /// `null` in Pending (still bringing up) or Tripped (latched off).
+    pub phase: Option<&'static str>,
+    /// Snake_case identifier of the latched fault, or `null` if none.
+    /// Stable for dashboards to switch on; `fault_message` is the
+    /// human-readable form (with cause for `OutputUnexpectedlyOff`).
+    pub fault: Option<&'static str>,
+    pub fault_message: Option<&'a str>,
     pub history: HistoryView<'a>,
 }
 
@@ -104,6 +114,10 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
         let ps = store.ps_reading().unwrap_or_default();
         let mut profile = heapless::String::<32>::new();
         let _ = write!(profile, "{PACK_PROFILE}");
+        let mut fault_message = heapless::String::<FAULT_DISPLAY_CAP>::new();
+        if let Some(reason) = store.charge_fault {
+            let _ = write!(fault_message, "{reason}");
+        }
         let response = ApiResponse {
             uptime: uptime().as_secs() as u32,
             rssi: sta_rssi(),
@@ -125,6 +139,9 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
             model_code: store.model_code,
             profile: &profile,
             ps_offline: store.ps_offline,
+            phase: store.charge_phase.map(|p| p.label()),
+            fault: store.charge_fault.map(|f| f.label()),
+            fault_message: (!fault_message.is_empty()).then_some(fault_message.as_str()),
             history: HistoryView(store.history()),
         };
         let history_len = response.history.0.len();

@@ -8,6 +8,7 @@ mod history;
 
 pub use history::HISTORY_CAPACITY;
 
+use crate::charging::{FaultReason, Phase};
 use history::History;
 
 // --- Sample shapes ----------------------------------------------------------
@@ -141,6 +142,13 @@ pub struct SensorData {
     /// benign "PS offline" status rather than a fault, since it recovers on
     /// its own without operator action.
     pub ps_offline: bool,
+    /// Current charging phase, or `None` while the supervisor is still in
+    /// Pending bring-up / latched off. Written by the XY supervisor each tick.
+    pub charge_phase: Option<Phase>,
+    /// Latched supervisor fault, if any. `None` during normal operation;
+    /// `Some(reason)` while the buck is being held off. The fault stays set
+    /// until a reboot (or, for recoverable causes, a successful restart).
+    pub charge_fault: Option<FaultReason>,
 }
 
 impl Default for SensorData {
@@ -156,6 +164,8 @@ impl SensorData {
             history: History::new(),
             model_code: 0,
             ps_offline: false,
+            charge_phase: None,
+            charge_fault: None,
         }
     }
 
