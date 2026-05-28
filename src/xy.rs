@@ -510,13 +510,20 @@ fn poll<D: XyDevice>(
     // self-disabled this session (boot_sequence wiped 0x0010).
     let (setpoints, output) = match xy.read_status() {
         Ok(s) => {
-            sensor_data.lock().unwrap().update_ps(PsReading {
-                voltage: s.v_out,
-                current: s.i_out,
-                power: s.p_out,
-                v_set: s.v_set,
-                i_set: s.i_set,
-            });
+            // Input UVLO = the DC supply was disconnected / sagged. Treat it
+            // as a benign, self-clearing "PS offline" status, not a fault.
+            let ps_offline = !s.output_on && s.protection == ProtectionStatus::Lvp;
+            {
+                let mut sd = sensor_data.lock().unwrap();
+                sd.update_ps(PsReading {
+                    voltage: s.v_out,
+                    current: s.i_out,
+                    power: s.p_out,
+                    v_set: s.v_set,
+                    i_set: s.i_set,
+                });
+                sd.ps_offline = ps_offline;
+            }
             let setpoints = Some(Setpoints {
                 v_set: s.v_set,
                 i_set: s.i_set,
@@ -525,9 +532,13 @@ fn poll<D: XyDevice>(
                 *last_protection = ProtectionStatus::Normal;
                 BuckOutput::On
             } else {
-                // Record once per latch episode (rising edge / cause change),
-                // not every poll — the warn! stays per-poll for log visibility.
-                if let Some(ev) = XyError::from_protection(s.protection) {
+                // LVP is surfaced as "PS offline" above and recovers on its
+                // own — don't pollute the event log with it. Other causes
+                // record once per latch episode (rising edge / cause change);
+                // the warn! stays per-poll for log visibility.
+                if s.protection != ProtectionStatus::Lvp
+                    && let Some(ev) = XyError::from_protection(s.protection)
+                {
                     warn!("XY PROTECT latched: {}", s.protection);
                     if *last_protection != s.protection {
                         recorder.record(Event::Xy(ev));

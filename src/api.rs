@@ -88,6 +88,9 @@ pub struct ApiResponse<'a> {
     pub model_code: u16,
     /// Static pack identity, e.g. `LFP 4S 50Ah`.
     pub profile: &'a str,
+    /// `true` while the DC supply is disconnected (buck input UVLO). Shown
+    /// as a transient "PS offline" status; clears when the supply returns.
+    pub ps_offline: bool,
     pub history: HistoryView<'a>,
 }
 
@@ -121,6 +124,7 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
             },
             model_code: store.model_code,
             profile: &profile,
+            ps_offline: store.ps_offline,
             history: HistoryView(store.history()),
         };
         let history_len = response.history.0.len();

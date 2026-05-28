@@ -135,6 +135,12 @@ pub struct SensorData {
     /// XY `MODEL` register (`0x0016`) read once at boot. `0` = not yet read.
     /// Diagnostic only — confirms the configured `Model`'s scale family.
     pub model_code: u16,
+    /// `true` while the buck reports input UVLO (`ProtectionStatus::Lvp`) —
+    /// the DC supply was disconnected or sagged. Set live each XY poll, so
+    /// it self-clears when the supply returns. Surfaced to LCD/web as a
+    /// benign "PS offline" status rather than a fault, since it recovers on
+    /// its own without operator action.
+    pub ps_offline: bool,
 }
 
 impl Default for SensorData {
@@ -149,6 +155,7 @@ impl SensorData {
             live: LiveReadings::new(),
             history: History::new(),
             model_code: 0,
+            ps_offline: false,
         }
     }
 

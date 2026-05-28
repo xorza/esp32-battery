@@ -210,16 +210,26 @@ enum LowerKey {
     Host {
         ip: Option<Ipv4Addr>,
         has_errors: bool,
+        ps_offline: bool,
     },
 }
 
 impl LowerKey {
-    fn from_inputs(net: NetStatus, ip: Option<Ipv4Addr>, has_errors: bool) -> Self {
+    fn from_inputs(
+        net: NetStatus,
+        ip: Option<Ipv4Addr>,
+        has_errors: bool,
+        ps_offline: bool,
+    ) -> Self {
         match net {
             NetStatus::Captive => Self::Captive { trying: false },
             NetStatus::CaptiveTrying => Self::Captive { trying: true },
             NetStatus::Connecting => Self::Connecting,
-            NetStatus::Host => Self::Host { ip, has_errors },
+            NetStatus::Host => Self::Host {
+                ip,
+                has_errors,
+                ps_offline,
+            },
         }
     }
 }
@@ -397,7 +407,11 @@ where
         match &key {
             LowerKey::Captive { trying } => self.draw_captive(*trying),
             LowerKey::Connecting => self.draw_connecting(),
-            LowerKey::Host { ip, has_errors } => self.draw_host(*ip, *has_errors),
+            LowerKey::Host {
+                ip,
+                has_errors,
+                ps_offline,
+            } => self.draw_host(*ip, *has_errors, *ps_offline),
         }
         self.last_lower = Some(key);
     }
@@ -418,8 +432,16 @@ where
         self.title_row(LOWER_ROW2_TOP, "Connecting...", Rgb565::WHITE, None);
     }
 
-    fn draw_host(&mut self, ip: Option<Ipv4Addr>, has_errors: bool) {
-        let badge = has_errors.then_some(("ERR!", COLOR_WARNING));
+    fn draw_host(&mut self, ip: Option<Ipv4Addr>, has_errors: bool, ps_offline: bool) {
+        // PS-offline (benign, self-clearing) and errors are independent —
+        // show whichever are active, both if need be. Error color wins when
+        // combined since it's the more severe of the two.
+        let badge = match (ps_offline, has_errors) {
+            (true, true) => Some(("PS OFF ERR!", COLOR_WARNING)),
+            (true, false) => Some(("PS OFFLINE", COLOR_DISCHARGING)),
+            (false, true) => Some(("ERR!", COLOR_WARNING)),
+            (false, false) => None,
+        };
         self.title_row(LOWER_TITLE_TOP, "Connected", Rgb565::WHITE, badge);
 
         let mut buf = heapless::String::<32>::new();
@@ -522,15 +544,18 @@ fn run(
             .flatten();
         let has_errors = !event_log.lock().unwrap().is_empty();
 
-        let (bat, ps) = {
+        let (bat, ps, ps_offline) = {
             let sd = sensor_data.lock().unwrap();
             (
                 sd.battery_reading().unwrap_or_default(),
                 sd.ps_reading().unwrap_or_default(),
+                sd.ps_offline,
             )
         };
 
         ui.draw_upper(bat, ps, crate::clock::uptime());
-        ui.draw_lower(LowerKey::from_inputs(net_status, ip, has_errors));
+        ui.draw_lower(LowerKey::from_inputs(
+            net_status, ip, has_errors, ps_offline,
+        ));
     }
 }

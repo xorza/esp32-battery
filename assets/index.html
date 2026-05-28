@@ -8,6 +8,12 @@
         <link rel="icon" href="/favicon.ico" type="image/x-icon" />
     </head>
     <body style="opacity:0;transition:opacity .15s">
+        <div
+            id="ps_offline_banner"
+            style="display:none;background:var(--c-discharging);color:#111;font-weight:600;text-align:center;padding:10px;border-radius:8px;margin-bottom:12px"
+        >
+            ⚠ Power supply offline
+        </div>
         <div class="card hero">
             <div class="hero-status" id="s1_status_row">
                 <span class="status-dot"></span>
@@ -199,6 +205,10 @@
                             updateStats(hist);
                             drawChart(hist);
                         }
+
+                        $("ps_offline_banner").style.display = d.ps_offline
+                            ? "block"
+                            : "none";
 
                         // Footer
                         $("profile").textContent = d.profile;
