@@ -30,6 +30,14 @@ use crate::{PACK_PROFILE, SAFETY};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// Quiet window between disabling output and writing the new V_SET on a
+/// step-down. Lets the inductor current decay and the buck's internal
+/// regulator state quiesce so the next register write lands in a clean
+/// state. Modbus latency usually covers this on its own (~50 ms
+/// inter-frame + ~500 ms response timeout), but the explicit sleep
+/// removes the dependence on transport timing.
+const STEP_DOWN_SETTLE: Duration = Duration::from_millis(100);
+
 /// Buck variant on this board. Sets the per-register scales (I-OUT,
 /// POWER, S-OCP, S-OPP) — wrong family silently shifts readings by 10×,
 /// so this also drives the boot-time `verify_model` check and the fake
@@ -527,6 +535,70 @@ fn poll<D: XyDevice>(
     }
 }
 
+/// Write V_SET, optionally cycling output around the write for safety on
+/// step-downs. Stepping V_SET down with output enabled drives reverse
+/// current through the XY7025's synchronous low-side FET and can blow
+/// it (and propagate upstream — neither port has anti-backup
+/// protection). For step-ups the cycle is unnecessary; we write live.
+///
+/// Partial failure leaves the buck OFF and lets the supervisor latch
+/// naturally on the next tick (SettingsDrift if V_SET committed but the
+/// re-enable failed, OutputUnexpectedlyOff otherwise). A reboot is the
+/// recovery path either way — the buck is safe, just not regulating.
+fn apply_update_voltage<D: XyDevice>(
+    xy: &mut D,
+    supervisor: &mut ChargeSupervisor,
+    target_v: f32,
+    cycle_output: bool,
+    recorder: &EventRecorder,
+) {
+    if !cycle_output {
+        match xy.set_voltage(target_v) {
+            Ok(()) => {
+                supervisor.ack_voltage_update();
+                info!(
+                    "charge phase → {}: V_set = {target_v:.2} V",
+                    supervisor.phase().label()
+                );
+            }
+            Err(e) => {
+                warn!("XY set_voltage({target_v}): {e} — supervisor will retry next tick");
+                recorder.record(Event::Xy(XyError::SetVoltage));
+            }
+        }
+        return;
+    }
+
+    info!("charge phase step-down → V_set = {target_v:.2} V (cycling output)");
+    if let Err(e) = xy.set_output(false) {
+        warn!("XY safe-step-down set_output(false): {e} — will retry next tick");
+        recorder.record(Event::Xy(XyError::SetOutput));
+        return;
+    }
+    // Let inductor current decay and the buck's internal state quiesce
+    // before reprogramming V_SET. Modbus latency would usually cover
+    // this, but an explicit sleep removes the dependence on timing.
+    thread::sleep(STEP_DOWN_SETTLE);
+    if let Err(e) = xy.set_voltage(target_v) {
+        warn!("XY safe-step-down set_voltage({target_v}): {e} — buck stays OFF, will retry");
+        recorder.record(Event::Xy(XyError::SetVoltage));
+        return;
+    }
+    // V_SET is now on the buck — commit the phase so the next tick's
+    // drift check sees matching setpoints. If the re-enable below fails,
+    // the supervisor will latch on output-off, which is the safe outcome.
+    supervisor.ack_voltage_update();
+    if let Err(e) = xy.set_output(true) {
+        error!("XY safe-step-down set_output(true): {e} — buck OFF after voltage commit");
+        recorder.record(Event::Xy(XyError::SetOutput));
+        return;
+    }
+    info!(
+        "charge phase → {}: V_set = {target_v:.2} V (step-down complete)",
+        supervisor.phase().label()
+    );
+}
+
 fn apply_action<D: XyDevice>(
     xy: &mut D,
     supervisor: &mut ChargeSupervisor,
@@ -545,19 +617,10 @@ fn apply_action<D: XyDevice>(
                 }
             }
         }
-        Action::UpdateVoltage { target_v } => match xy.set_voltage(target_v) {
-            Ok(()) => {
-                supervisor.ack_voltage_update();
-                info!(
-                    "charge phase → {}: V_set = {target_v:.2} V",
-                    supervisor.phase().label()
-                );
-            }
-            Err(e) => {
-                warn!("XY set_voltage({target_v}): {e} — supervisor will retry next tick");
-                recorder.record(Event::Xy(XyError::SetVoltage));
-            }
-        },
+        Action::UpdateVoltage {
+            target_v,
+            cycle_output,
+        } => apply_update_voltage(xy, supervisor, target_v, cycle_output, recorder),
         Action::DisableOutput(reason) => match xy.set_output(false) {
             Ok(()) => {
                 error!("CHARGE FAULT ({reason}): PS output DISABLED");

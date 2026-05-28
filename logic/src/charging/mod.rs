@@ -251,8 +251,20 @@ pub enum Action {
     /// successfully written yet — re-emits each tick until acked, so a
     /// transient Modbus glitch on the write retries instead of latching
     /// `SettingsDrift`.
+    ///
+    /// `cycle_output: true` means `target_v` is *below* the current
+    /// V_SET. The caller MUST disable output before writing V_SET and
+    /// re-enable after, in that order. Stepping V_SET down with output
+    /// enabled drives reverse current through the buck's synchronous
+    /// low-side FET (the battery sources back into the buck as the
+    /// control loop tries to pull V_OUT down to the new setpoint),
+    /// which can destroy the FET and propagate upstream through the
+    /// input rail — the XY7025 has no anti-backup protection on either
+    /// the output or the input. `false` means a step-up, which is safe
+    /// to do live.
     UpdateVoltage {
         target_v: f32,
+        cycle_output: bool,
     },
     DisableOutput(FaultReason),
 }
@@ -456,6 +468,18 @@ impl ChargeSupervisor {
         match phase {
             Phase::Float => self.profile.float_v,
             Phase::Absorb => self.profile.absorb_v,
+        }
+    }
+
+    /// Build the `UpdateVoltage` action for a phase transition to `next`.
+    /// `cycle_output` is set when the new V_SET is below the current
+    /// one — see `Action::UpdateVoltage` for why. Stable across re-emits
+    /// because `self.phase` only changes on `ack_voltage_update`.
+    fn update_voltage_for(&self, next: Phase) -> Action {
+        let target_v = self.voltage_for_phase(next);
+        Action::UpdateVoltage {
+            target_v,
+            cycle_output: target_v < self.voltage_for_phase(self.phase),
         }
     }
 
@@ -693,9 +717,7 @@ impl ChargeSupervisor {
             pending_voltage: Some(next),
         } = self.latch
         {
-            return Action::UpdateVoltage {
-                target_v: self.voltage_for_phase(next),
-            };
+            return self.update_voltage_for(next);
         }
 
         // Charging current as a positive number.
@@ -716,9 +738,7 @@ impl ChargeSupervisor {
             self.latch = LatchState::Active {
                 pending_voltage: Some(next),
             };
-            return Action::UpdateVoltage {
-                target_v: self.voltage_for_phase(next),
-            };
+            return self.update_voltage_for(next);
         }
 
         // Clock the absorb timeout only while the pack sits at the CV plateau.

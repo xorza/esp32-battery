@@ -1053,7 +1053,7 @@ fn low_pack_resumes_absorb_after_bringup() {
     assert!(matches!(s.phase(), Phase::Float)); // not committed until V_SET write
     let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
     assert!(
-        matches!(a, Action::UpdateVoltage { target_v } if approx(target_v, lfp_4s().absorb_v)),
+        matches!(a, Action::UpdateVoltage { target_v, .. } if approx(target_v, lfp_4s().absorb_v)),
         "expected UpdateVoltage to absorb_v, got {a:?}",
     );
     assert!(matches!(s.phase(), Phase::Absorb));
@@ -1169,7 +1169,7 @@ fn update_voltage_retries_until_acked() {
     // the failed write would leave behind.
     let p = expected_poll(&s, b(OK_V, -4.0));
 
-    let Action::UpdateVoltage { target_v: t1 } = s.tick(p, TICK) else {
+    let Action::UpdateVoltage { target_v: t1, .. } = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage");
     };
     assert!(approx(t1, profile.absorb_v));
@@ -1179,7 +1179,7 @@ fn update_voltage_retries_until_acked() {
     // No ack — second tick re-emits UpdateVoltage, same target. No
     // SettingsDrift even though setpoints (Float) lag the pending phase
     // (Absorb), because expected_setpoints still uses the old phase.
-    let Action::UpdateVoltage { target_v: t2 } = s.tick(p, TICK) else {
+    let Action::UpdateVoltage { target_v: t2, .. } = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage retry");
     };
     assert!(approx(t2, profile.absorb_v));
@@ -1189,6 +1189,57 @@ fn update_voltage_retries_until_acked() {
     // Now ack — phase commits, debouncers reset, normal operation.
     s.ack_voltage_update();
     assert!(matches!(s.phase(), Phase::Absorb));
+}
+
+#[test]
+fn float_to_absorb_emits_step_up_no_output_cycle() {
+    // V_SET goes up; safe to write live, no output cycling needed.
+    // The caller can keep regulating through the transition.
+    let profile = lfp_4s();
+    let mut s = active(profile);
+    let p = expected_poll(&s, b(OK_V, -4.0));
+    let Action::UpdateVoltage {
+        target_v,
+        cycle_output,
+    } = s.tick(p, TICK)
+    else {
+        panic!("expected UpdateVoltage");
+    };
+    assert!(approx(target_v, profile.absorb_v));
+    assert!(!cycle_output, "Float→Absorb is a step UP — must not cycle");
+}
+
+#[test]
+fn absorb_to_float_emits_step_down_with_output_cycle() {
+    // V_SET goes down. The caller MUST disable output around the write
+    // — stepping V_SET below V_OUT with output enabled drives reverse
+    // current through the buck's synchronous low-side FET (the battery
+    // sources back in), which can blow the FET and propagate upstream.
+    // The XY7025 has no anti-backup protection on either port.
+    let profile = lfp_4s();
+    let mut s = active(profile);
+    enter_absorb(&mut s); // now in Absorb at absorb_v
+
+    // Hold at CV plateau with tapered current long enough to trip the
+    // exit debouncer. Drive the supervisor manually (not via ok_tick)
+    // so we can inspect the transition tick before it auto-acks.
+    let tapered = b(CV_V, -(profile.exit_absorb_a - 0.1));
+    let p = expected_poll(&s, tapered);
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(s.tick(p, TICK), Action::None));
+    }
+    let Action::UpdateVoltage {
+        target_v,
+        cycle_output,
+    } = s.tick(p, TICK)
+    else {
+        panic!("expected Absorb→Float UpdateVoltage after EXIT_DEBOUNCE");
+    };
+    assert!(approx(target_v, profile.float_v));
+    assert!(
+        cycle_output,
+        "Absorb→Float is a step DOWN — caller must cycle output"
+    );
 }
 
 #[test]
@@ -1279,7 +1330,7 @@ fn pending_does_not_enter_absorb_even_at_high_charge_current() {
     // Active) is the one that emits the transition.
     s.ack_enable(false);
     let a = s.tick(expected_poll(&s, battery), TICK);
-    assert!(matches!(a, Action::UpdateVoltage { target_v } if approx(target_v, profile.absorb_v)));
+    assert!(matches!(a, Action::UpdateVoltage { target_v, .. } if approx(target_v, profile.absorb_v)));
 }
 
 #[test]
@@ -1365,7 +1416,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
         battery: drained,
     };
     let a = s.tick(p_active, TICK);
-    assert!(matches!(a, Action::UpdateVoltage { target_v } if approx(target_v, profile.absorb_v)));
+    assert!(matches!(a, Action::UpdateVoltage { target_v, .. } if approx(target_v, profile.absorb_v)));
 }
 
 #[test]
