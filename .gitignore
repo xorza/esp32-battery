@@ -11,3 +11,4 @@
 /.zed/settings.json
 
 monitoring/volumes/
+.tmp/

@@ -1148,7 +1148,7 @@ fn should_restart_after_healthy_window() {
     // Action::RestartSupervisor (caller's cue to throw this supervisor
     // away and re-run boot_sequence).
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Otp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         // Recovery accumulates via tick; pre-threshold ticks return None.
@@ -1165,7 +1165,7 @@ fn should_restart_after_healthy_window() {
 #[test]
 fn should_restart_resets_on_overvoltage() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Otp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1184,7 +1184,7 @@ fn should_restart_resets_on_overvoltage() {
 #[test]
 fn should_restart_resets_on_modbus_down() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Otp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1201,7 +1201,7 @@ fn should_restart_resets_on_modbus_down() {
 #[test]
 fn should_restart_resets_on_missing_battery() {
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Otp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1216,7 +1216,7 @@ fn should_restart_resets_on_unexpected_output_on() {
     // Buck spontaneously came back on (panel toggle, EMC, whatever) —
     // we want a stable OFF state before signalling restart.
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Otp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1236,7 +1236,7 @@ fn should_restart_repeats_across_cycles() {
     // supervisor will happily emit RestartSupervisor over and over if its
     // latch keeps re-asserting (no flap budget at this layer).
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Otp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..OUTPUT_RECOVERY_HEALTHY.as_secs() {
         restart_ready(&mut s, p, TICK);
@@ -1438,7 +1438,7 @@ fn restart_resets_on_nan_battery() {
     // `should_restart_resets_on_missing_battery` but with NaN/Inf, which
     // a misbehaving INA228 might emit. Resets the clock identically.
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(ProtectionStatus::Lvp));
+    latch_self_disable(&mut s, Some(ProtectionStatus::Otp));
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..(OUTPUT_RECOVERY_HEALTHY.as_secs() - 1) {
         assert!(!restart_ready(&mut s, p, TICK));
@@ -1453,4 +1453,105 @@ fn restart_resets_on_nan_battery() {
     assert!(!restart_ready(&mut s, p_nan, TICK));
     // One more healthy call must NOT cross — clock is back to 1.
     assert!(!restart_ready(&mut s, p, TICK));
+}
+
+#[test]
+fn active_lvp_drops_to_pending_without_latch() {
+    // Input UVLO is benign: the buck self-disabled because the DC supply
+    // dropped, not because of a pack-side fault. The supervisor must
+    // transition back to Pending without latching, so no DisableOutput
+    // is emitted and the caller's restart budget is preserved across
+    // arbitrarily long outages.
+    let mut s = active(lfp_4s());
+    let p_lvp = PollResult {
+        output: Some(BuckOutput::Off {
+            cause: Some(ProtectionStatus::Lvp),
+        }),
+        ..expected_poll(&s, b(OK_V, -0.1))
+    };
+    let a = s.tick(p_lvp, TICK);
+    assert!(matches!(a, Action::None));
+    assert!(s.fault().is_none());
+    assert!(matches!(s.latch, LatchState::Pending));
+}
+
+#[test]
+fn pending_waits_for_lvp_to_clear_before_enable() {
+    // While LVP persists, the Pending bring-up must NOT emit EnableOutput
+    // — writing set_output(true) into a buck in input UVLO would just
+    // flap. Once LVP clears (buck reports Off with no cause), the
+    // normal Pending → Active path emits EnableOutput.
+    let mut s = active(lfp_4s());
+    let p_lvp = PollResult {
+        output: Some(BuckOutput::Off {
+            cause: Some(ProtectionStatus::Lvp),
+        }),
+        ..expected_poll(&s, b(OK_V, -0.1))
+    };
+    // Drop Active → Pending via LVP.
+    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    // Many ticks of sustained LVP: stays Pending, no actions, no fault.
+    for _ in 0..120 {
+        assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    }
+    assert!(s.fault().is_none());
+    // LVP clears: buck back to Off with no protection cause. Pending
+    // bring-up energises on the next tick.
+    let p_clear = expected_poll(&s, b(OK_V, -0.1));
+    assert!(matches!(s.tick(p_clear, TICK), Action::EnableOutput));
+    s.ack_enable();
+    assert!(matches!(s.latch, LatchState::Active { .. }));
+}
+
+#[test]
+fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
+    // Pack drains during the input outage to below the CV plateau —
+    // when LVP clears, the bring-up's resting-voltage check must resume
+    // Absorb (not stall in Float).
+    let profile = lfp_4s();
+    let mut s = active(profile);
+    let p_lvp = PollResult {
+        output: Some(BuckOutput::Off {
+            cause: Some(ProtectionStatus::Lvp),
+        }),
+        ..expected_poll(&s, b(OK_V, -0.1))
+    };
+    s.tick(p_lvp, TICK);
+    // Pack rests well below absorb_v - ABSORB_CV_BAND_V (= 14.3).
+    let drained = b(13.0, 0.0);
+    let p_clear = PollResult {
+        output: Some(BuckOutput::Off { cause: None }),
+        setpoints: Some(s.expected_setpoints()),
+        battery: drained,
+    };
+    assert!(matches!(s.tick(p_clear, TICK), Action::EnableOutput));
+    s.ack_enable();
+    // ack_enable resumed Absorb via pending_voltage, so the next Active
+    // tick steps V_SET float_v → absorb_v.
+    let p_active = PollResult {
+        output: Some(BuckOutput::On),
+        setpoints: Some(s.expected_setpoints()),
+        battery: drained,
+    };
+    let a = s.tick(p_active, TICK);
+    assert!(matches!(a, Action::UpdateVoltage { target_v } if approx(target_v, profile.absorb_v)));
+}
+
+#[test]
+fn pending_at_boot_with_lvp_waits() {
+    // Fresh supervisor + buck reports Off(Lvp) at boot (DC supply not
+    // yet present). Must not emit EnableOutput; must not latch.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p_lvp = PollResult {
+        output: Some(BuckOutput::Off {
+            cause: Some(ProtectionStatus::Lvp),
+        }),
+        setpoints: Some(s.expected_setpoints()),
+        battery: b(OK_V, -0.1),
+    };
+    for _ in 0..30 {
+        assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    }
+    assert!(s.fault().is_none());
+    assert!(matches!(s.latch, LatchState::Pending));
 }

@@ -155,9 +155,13 @@ pub enum BuckOutput {
 /// Reboot-required for those.
 fn is_recoverable(cause: ProtectionStatus) -> bool {
     match cause {
-        // Input-side and over-temp issues that genuinely clear with
-        // time (AC sag returns, fan cools the case).
-        ProtectionStatus::Lvp | ProtectionStatus::Otp => true,
+        // Over-temp clears on its own once the case cools. (LVP is
+        // handled in-place by `tick` — input UVLO never reaches the
+        // tripped state, so it doesn't appear here.)
+        ProtectionStatus::Otp => true,
+        // Input UVLO is intercepted before it can latch; the supervisor
+        // drops back to Pending and waits. See `tick`.
+        ProtectionStatus::Lvp => false,
         // Output went off but the device reports no protection.
         // Means a front-panel toggle, external Modbus write, or
         // EMI on the panel button GPIO — all human/environmental
@@ -251,10 +255,9 @@ impl std::fmt::Display for FaultReason {
 impl FaultReason {
     /// How long the world must look healthy before the caller may restart
     /// the supervise loop. `None` means reboot-only recovery; only
-    /// `OutputUnexpectedlyOff` is currently recoverable since its common
-    /// causes (input LVP, over-temp, transient panel toggle) genuinely
-    /// clear without operator intervention. Hard safety faults (OV, drift,
-    /// absorb timeout) stay reboot-only.
+    /// `OutputUnexpectedlyOff(Otp)` is currently recoverable (over-temp
+    /// cooldown). LVP is intercepted in `tick` and never latches; hard
+    /// safety faults (OV, drift, absorb timeout) stay reboot-only.
     pub fn recovery_healthy_for(self) -> Option<Duration> {
         match self {
             // Only recover when the device-reported cause is one we
@@ -607,7 +610,20 @@ impl ChargeSupervisor {
         // Pending expects OFF: any ON means our boot disable / S_INI=0
         // didn't stick — fail closed and reboot rather than trust
         // unknown regulation.
+        //
+        // LVP (input UVLO) is the one exception: the buck is healthy,
+        // the DC supply just dropped. Drop back to Pending and wait for
+        // input to return — re-enable via the normal Pending bring-up
+        // when LVP clears. A multi-hour outage would otherwise burn
+        // through the caller's restart budget in minutes and leave the
+        // pack uncharged until manual reboot.
         match (pre_enable, p.output) {
+            (false, Some(BuckOutput::Off { cause: Some(ProtectionStatus::Lvp) })) => {
+                self.latch = LatchState::Pending;
+                self.absorb.elapsed = Duration::ZERO;
+                self.exit.elapsed = Duration::ZERO;
+                return Action::None;
+            }
             (false, Some(BuckOutput::Off { cause })) => {
                 return self.latch(FaultReason::OutputUnexpectedlyOff(cause));
             }
@@ -664,6 +680,18 @@ impl ChargeSupervisor {
         // emitting EnableOutput in the meantime.
         if pre_enable {
             if p.setpoints.is_none() {
+                return Action::None;
+            }
+            // Don't try to enable while the buck is still in input UVLO —
+            // set_output(true) would succeed at the Modbus layer but the
+            // buck would stay off, and we'd flap EnableOutput on every
+            // poll. Wait for LVP to clear first.
+            if matches!(
+                p.output,
+                Some(BuckOutput::Off {
+                    cause: Some(ProtectionStatus::Lvp)
+                })
+            ) {
                 return Action::None;
             }
             // Output has been OFF through Pending, so `b.voltage` is the
