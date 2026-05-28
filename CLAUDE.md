@@ -39,13 +39,15 @@ source. Design implications:
 - Flash: `MCU=esp32c6 ./flash.sh` — uses `espflash flash --monitor --non-interactive`, so boot logs stream to stdout without needing a TTY. Always wrap in `timeout 30` — that's enough to flash + see initial boot output. Never use the default 2-minute Bash timeout, and never the 5–10 min upper bound. If the flash itself fails, it fails fast; long timeouts only burn wall time waiting on a successful boot's monitor stream.
 - Monitor only (no flash): `espflash monitor --non-interactive --port /dev/ttyACM0`.
 
-## Pre-allowed commands (`.claude/settings.local.json`)
+## Pre-allowed commands
 
-These run without a permission prompt — prefer them over alternatives that would prompt:
+The actual allow list lives in `.claude/settings.local.json` and accumulates
+over sessions. If a command would prompt, first reshape it to match an
+existing pattern (e.g. reuse `./run_tests.sh` instead of typing the inner
+cargo invocations, wrap flash calls as `timeout N bash -c "MCU=… ./flash.sh"`).
+If a shape is genuinely needed and recurring, invoke `/fewer-permission-prompts`
+to extend the allow list rather than burning prompts each session.
 
-- Cargo: `cargo build|check|clippy|fmt|test|nextest|run|search|tree …`, `cargo +stable nextest …`, `cargo c6 …`, `cargo c3 …` (also accepted with a leading `MCU=…` env).
-- Flash/deploy (any chip via `MCU=…`, optional `INA_FAKE=1 XY_FAKE=1`): `MCU=… ./flash.sh …`, `MCU=… ./deploy.sh …`. Wrap with `timeout * bash -c '…'` for the documented `flash.sh` / `deploy.sh` invocations — any timeout duration is fine.
-- espflash: `espflash flash|monitor|erase-flash …`; `timeout * espflash monitor …` is also pre-allowed.
-- Misc: `WebFetch`, `WebSearch`, `curl -ks --max-time 8 https://192.168.0.116/api/log`.
-
-Anything outside these patterns (other shell tools, ad-hoc `bash -c …` wrappers, different env layouts) will prompt — adjust the command to match a pre-allowed shape when possible.
+For device HTTP probing, no fixed IP is canonical — units live on the LAN
+under their assigned addresses (e.g. `https://<device>/api`, `/api/errors`,
+`/api/log`). Use whichever device you're debugging.
