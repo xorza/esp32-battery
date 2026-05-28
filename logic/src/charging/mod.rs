@@ -351,9 +351,28 @@ pub struct BatterySample {
 ///   timer and, once met, returns `Action::RestartSupervisor` from
 ///   `tick`. Non-recoverable faults stay parked in `Action::None`.
 enum LatchState {
-    Pending,
+    Pending { reason: PendingReason },
     Active { pending_voltage: Option<Phase> },
     Tripped { reason: FaultReason, acked: bool },
+}
+
+/// Why the supervisor is in `Pending`. Determines how an unexpected
+/// `buck output ON in Pending` is handled.
+///
+/// - `Boot`: cold start. `boot_sequence` just wrote `set_output(false)`
+///   and verified `OUTPUT_EN=0`. If a poll then shows On, something is
+///   genuinely off (firmware/EMI/panel) — latch immediately.
+/// - `LvpRecovery`: the supervisor was Active when the buck self-disabled
+///   on input UVLO; we dropped here to wait for input to return. The
+///   XY7025 auto-re-enables `OUTPUT_EN` when LVP clears (its internal
+///   behavior, independent of S_INI), so seeing buck=On is the *expected*
+///   recovery — transition straight back to Active rather than latching.
+///   Setpoints are still what we programmed before LVP, so drift check
+///   covers regulation safety.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PendingReason {
+    Boot,
+    LvpRecovery,
 }
 
 /// Time-based debouncer: counts elapsed while `cond` holds, resets when it
@@ -476,7 +495,9 @@ impl ChargeSupervisor {
             exit: Debounce::default(),
             battery_missing: Debounce::default(),
             modbus_err: Debounce::default(),
-            latch: LatchState::Pending,
+            latch: LatchState::Pending {
+                reason: PendingReason::Boot,
+            },
             recovery: Debounce::default(),
             enable_into_absorb: false,
         }
@@ -552,7 +573,7 @@ impl ChargeSupervisor {
     /// `EnableOutput` so a failed enable write gets retried.
     pub fn ack_enable(&mut self) {
         match self.latch {
-            LatchState::Pending => {
+            LatchState::Pending { .. } => {
                 // If the pack came up below the CV plateau it isn't full;
                 // resume Absorb via the pending-voltage path (V_SET steps
                 // float_v → absorb_v on the first Active tick, no drift).
@@ -604,7 +625,7 @@ impl ChargeSupervisor {
     /// stuck sensor mask overvoltage. Routes through the same
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
-        let pre_enable = match self.latch {
+        let pending_reason = match self.latch {
             LatchState::Tripped {
                 reason,
                 acked: true,
@@ -613,9 +634,10 @@ impl ChargeSupervisor {
                 reason,
                 acked: false,
             } => return Action::DisableOutput(reason),
-            LatchState::Pending => true,
-            LatchState::Active { .. } => false,
+            LatchState::Pending { reason } => Some(reason),
+            LatchState::Active { .. } => None,
         };
+        let pre_enable = pending_reason.is_some();
 
         if let Some(sp) = p.setpoints {
             let want = self.expected_setpoints();
@@ -639,17 +661,41 @@ impl ChargeSupervisor {
         // when LVP clears. A multi-hour outage would otherwise burn
         // through the caller's restart budget in minutes and leave the
         // pack uncharged until manual reboot.
-        match (pre_enable, p.output) {
-            (false, Some(BuckOutput::Off { cause: Some(ProtectionStatus::Lvp) })) => {
-                self.latch = LatchState::Pending;
+        match (pending_reason, p.output) {
+            (None, Some(BuckOutput::Off { cause: Some(ProtectionStatus::Lvp) })) => {
+                self.latch = LatchState::Pending {
+                    reason: PendingReason::LvpRecovery,
+                };
                 self.absorb.elapsed = Duration::ZERO;
                 self.exit.elapsed = Duration::ZERO;
                 return Action::None;
             }
-            (false, Some(BuckOutput::Off { cause })) => {
+            (None, Some(BuckOutput::Off { cause })) => {
                 return self.latch(FaultReason::OutputUnexpectedlyOff(cause));
             }
-            (true, Some(BuckOutput::On)) => {
+            // Buck reports ON while we're waiting in Pending. The XY7025
+            // auto-re-enables OUTPUT_EN on LVP clear (input-side
+            // protection, not a true latch), so seeing On in
+            // `PendingReason::LvpRecovery` is the expected recovery —
+            // transition straight back to Active. Setpoints are
+            // unchanged since the LVP intercept (drift check above just
+            // verified them), so regulation is at known targets.
+            //
+            // From `PendingReason::Boot` it's a real fault: boot_sequence
+            // wrote set_output(false) and verified OUTPUT_EN=0, so an
+            // ON reading means the disable didn't stick (firmware bug,
+            // panel toggle, EMI on the button GPIO) — latch and fail
+            // closed.
+            (Some(PendingReason::LvpRecovery), Some(BuckOutput::On)) => {
+                // Output came back on with our setpoints intact. Skip
+                // the EnableOutput round-trip; supervisor's already
+                // regulating the right values.
+                self.latch = LatchState::Active {
+                    pending_voltage: None,
+                };
+                return Action::None;
+            }
+            (Some(PendingReason::Boot), Some(BuckOutput::On)) => {
                 return self.latch(FaultReason::OutputOnInPending);
             }
             _ => {}

@@ -1472,7 +1472,7 @@ fn active_lvp_drops_to_pending_without_latch() {
     let a = s.tick(p_lvp, TICK);
     assert!(matches!(a, Action::None));
     assert!(s.fault().is_none());
-    assert!(matches!(s.latch, LatchState::Pending));
+    assert!(matches!(s.latch, LatchState::Pending { .. }));
 }
 
 #[test]
@@ -1553,5 +1553,56 @@ fn pending_at_boot_with_lvp_waits() {
         assert!(matches!(s.tick(p_lvp, TICK), Action::None));
     }
     assert!(s.fault().is_none());
-    assert!(matches!(s.latch, LatchState::Pending));
+    assert!(matches!(s.latch, LatchState::Pending { .. }));
+}
+
+#[test]
+fn lvp_recovery_accepts_buck_auto_re_enable() {
+    // After LVP intercept drops the supervisor to Pending, the XY7025
+    // typically auto-re-enables OUTPUT_EN once input voltage returns
+    // (LVP is a transient input-side protection, not a permanent latch).
+    // The supervisor must accept that as recovery — transition back to
+    // Active without latching OutputOnInPending — because setpoints are
+    // still the values it programmed before LVP, so regulation is at
+    // known targets.
+    let mut s = active(lfp_4s());
+    let p_lvp = PollResult {
+        output: Some(BuckOutput::Off {
+            cause: Some(ProtectionStatus::Lvp),
+        }),
+        ..expected_poll(&s, b(OK_V, -0.1))
+    };
+    s.tick(p_lvp, TICK);
+    assert!(matches!(s.latch, LatchState::Pending { .. }));
+    // Input returns and the buck brings its own output back on.
+    let p_recovered = PollResult {
+        output: Some(BuckOutput::On),
+        ..expected_poll(&s, b(OK_V, -0.1))
+    };
+    let a = s.tick(p_recovered, TICK);
+    assert!(matches!(a, Action::None));
+    assert!(s.fault().is_none());
+    assert!(matches!(
+        s.latch,
+        LatchState::Active {
+            pending_voltage: None
+        }
+    ));
+}
+
+#[test]
+fn boot_pending_with_buck_on_still_latches() {
+    // At cold boot, boot_sequence already wrote set_output(false) and
+    // verified OUTPUT_EN=0 — so a poll showing buck=On is a genuine
+    // anomaly (firmware bug / panel toggle / EMI). Stays the immediate
+    // latch it always was; only LvpRecovery gets the soft transition.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p_on = PollResult {
+        output: Some(BuckOutput::On),
+        ..expected_poll(&s, b(OK_V, -0.1))
+    };
+    assert!(matches_disable(
+        &s.tick(p_on, TICK),
+        FaultReason::OutputOnInPending
+    ));
 }
