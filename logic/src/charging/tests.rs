@@ -41,7 +41,7 @@ fn expected_poll(s: &ChargeSupervisor, battery: Option<BatterySample>) -> PollRe
     let output = if matches!(s.latch, LatchState::Active { .. }) {
         BuckOutput::On
     } else {
-        BuckOutput::Off { cause: None }
+        BuckOutput::Off { cause: ProtectionStatus::Normal }
     };
     PollResult {
         setpoints: Some(s.expected_setpoints()),
@@ -114,7 +114,7 @@ fn enter_absorb(s: &mut ChargeSupervisor) {
 /// Drive `s` from Active into `Tripped(OutputUnexpectedlyOff(cause), acked: true)`.
 /// Cause must be non-recoverable (i.e. not Lvp/Otp, which are handled
 /// in-place and never latch).
-fn latch_self_disable(s: &mut ChargeSupervisor, cause: Option<ProtectionStatus>) {
+fn latch_self_disable(s: &mut ChargeSupervisor, cause: ProtectionStatus) {
     let p = PollResult {
         output: Some(BuckOutput::Off { cause }),
         ..expected_poll(s, b(OK_V, -0.1))
@@ -1126,12 +1126,12 @@ fn buck_self_disable_in_active_latches() {
     // tripped, or panel toggled) → latch OutputUnexpectedlyOff.
     let mut s = active(lfp_4s());
     let p = PollResult {
-        output: Some(BuckOutput::Off { cause: None }),
+        output: Some(BuckOutput::Off { cause: ProtectionStatus::Normal }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
     assert!(matches_disable(
         &s.tick(p, TICK),
-        FaultReason::OutputUnexpectedlyOff(None)
+        FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Normal)
     ));
 }
 
@@ -1143,14 +1143,14 @@ fn latched_fault_stays_parked_in_none() {
     // reboot is the only way out (LVP/OTP are intercepted before
     // latching and don't reach here).
     let mut s = active(lfp_4s());
-    latch_self_disable(&mut s, Some(ProtectionStatus::Ocp));
+    latch_self_disable(&mut s, ProtectionStatus::Ocp);
     let p = expected_poll(&s, b(OK_V, -0.1));
     for _ in 0..600 {
         assert!(matches!(s.tick(p, TICK), Action::None));
     }
     assert!(matches!(
         s.fault(),
-        Some(FaultReason::OutputUnexpectedlyOff(Some(ProtectionStatus::Ocp)))
+        Some(FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ocp))
     ));
 }
 
@@ -1343,7 +1343,7 @@ fn active_lvp_drops_to_pending_without_latch() {
     let mut s = active(lfp_4s());
     let p_lvp = PollResult {
         output: Some(BuckOutput::Off {
-            cause: Some(ProtectionStatus::Lvp),
+            cause: ProtectionStatus::Lvp,
         }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
@@ -1362,7 +1362,7 @@ fn pending_waits_for_lvp_to_clear_before_enable() {
     let mut s = active(lfp_4s());
     let p_lvp = PollResult {
         output: Some(BuckOutput::Off {
-            cause: Some(ProtectionStatus::Lvp),
+            cause: ProtectionStatus::Lvp,
         }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
@@ -1390,7 +1390,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
     let mut s = active(profile);
     let p_lvp = PollResult {
         output: Some(BuckOutput::Off {
-            cause: Some(ProtectionStatus::Lvp),
+            cause: ProtectionStatus::Lvp,
         }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
@@ -1398,7 +1398,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
     // Pack rests well below absorb_v - ABSORB_CV_BAND_V (= 14.3).
     let drained = b(13.0, 0.0);
     let p_clear = PollResult {
-        output: Some(BuckOutput::Off { cause: None }),
+        output: Some(BuckOutput::Off { cause: ProtectionStatus::Normal }),
         setpoints: Some(s.expected_setpoints()),
         battery: drained,
     };
@@ -1426,7 +1426,7 @@ fn pending_at_boot_with_lvp_waits() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     let p_lvp = PollResult {
         output: Some(BuckOutput::Off {
-            cause: Some(ProtectionStatus::Lvp),
+            cause: ProtectionStatus::Lvp,
         }),
         setpoints: Some(s.expected_setpoints()),
         battery: b(OK_V, -0.1),
@@ -1450,7 +1450,7 @@ fn lvp_recovery_accepts_buck_auto_re_enable() {
     let mut s = active(lfp_4s());
     let p_lvp = PollResult {
         output: Some(BuckOutput::Off {
-            cause: Some(ProtectionStatus::Lvp),
+            cause: ProtectionStatus::Lvp,
         }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
@@ -1497,7 +1497,7 @@ fn active_otp_drops_to_pending_without_latch() {
     let mut s = active(lfp_4s());
     let p_otp = PollResult {
         output: Some(BuckOutput::Off {
-            cause: Some(ProtectionStatus::Otp),
+            cause: ProtectionStatus::Otp,
         }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };
@@ -1515,7 +1515,7 @@ fn otp_recovery_accepts_buck_auto_re_enable() {
     let mut s = active(lfp_4s());
     let p_otp = PollResult {
         output: Some(BuckOutput::Off {
-            cause: Some(ProtectionStatus::Otp),
+            cause: ProtectionStatus::Otp,
         }),
         ..expected_poll(&s, b(OK_V, -0.1))
     };

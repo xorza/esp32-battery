@@ -125,16 +125,16 @@ pub struct PollResult {
 /// What the buck's OUTPUT_EN register reported this poll, plus the
 /// PROTECT (0x0010) cause when output is off. The two were separate
 /// fields once but they covary: PROTECT is necessarily Normal while
-/// output is on, and is read only when output is off — so the relation
-/// belongs in the type.
+/// output is on, and is read in the same bulk transaction as OUTPUT_EN,
+/// so the relation belongs in the type. `cause: Normal` covers the
+/// "output is off and the buck reports no protection cause" case
+/// (e.g. fresh-off after boot, post-disable, panel toggle).
 #[derive(Copy, Clone)]
 pub enum BuckOutput {
     /// OUTPUT_EN reads 1.
     On,
-    /// OUTPUT_EN reads 0. `cause` carries the PROTECT register value if
-    /// we managed to read it; `None` means the PROTECT read itself
-    /// failed.
-    Off { cause: Option<ProtectionStatus> },
+    /// OUTPUT_EN reads 0; PROTECT register value carried inline.
+    Off { cause: ProtectionStatus },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, IntoStaticStr)]
@@ -153,8 +153,8 @@ impl Phase {
 /// Why the supervisor latched the buck off. Once latched, only a reboot
 /// clears it — auto-recovery on a battery charger means trying again
 /// under the same conditions. `OutputUnexpectedlyOff` carries the
-/// device-reported protection cause when we managed to read it (`None`
-/// means the PROTECT register read itself failed).
+/// device-reported PROTECT cause that was active when the buck
+/// self-disabled (or `Normal` if no cause was set).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FaultReason {
     /// No fresh battery reading for `BATTERY_MISSING_TIMEOUT.as_secs()` consecutive ticks.
@@ -179,10 +179,11 @@ pub enum FaultReason {
     /// a transport glitch.
     SettingsDrift,
     /// Buck's OUTPUT_EN register read 0 while the supervisor was Active.
-    /// The buck self-disabled — its own hardware OVP / OCP / LVP /
-    /// over-temp tripped, or someone toggled the front panel. Payload is
-    /// the cause from PROTECT (0x0010); `None` if that read failed.
-    OutputUnexpectedlyOff(Option<ProtectionStatus>),
+    /// The buck self-disabled — its own hardware OVP / OCP / over-temp
+    /// tripped, or someone toggled the front panel (in which case PROTECT
+    /// reads `Normal`). LVP/OTP are intercepted earlier and don't reach
+    /// here. Payload is the cause from PROTECT (0x0010).
+    OutputUnexpectedlyOff(ProtectionStatus),
     /// Buck's OUTPUT_EN register read 1 while the supervisor was Pending —
     /// output is supposed to be off until the supervisor itself enables it.
     /// Means the boot disable / S_INI=0 didn't stick or the front panel
@@ -199,8 +200,7 @@ impl std::fmt::Display for FaultReason {
             Self::Overvoltage => f.write_str("pack overvoltage"),
             Self::AbsorbTimeout => f.write_str("absorb time cap reached"),
             Self::SettingsDrift => f.write_str("setpoint readback drift"),
-            Self::OutputUnexpectedlyOff(Some(s)) => write!(f, "buck self-disabled ({s})"),
-            Self::OutputUnexpectedlyOff(None) => f.write_str("buck self-disabled (cause unread)"),
+            Self::OutputUnexpectedlyOff(s) => write!(f, "buck self-disabled ({s})"),
             Self::OutputOnInPending => f.write_str("buck output on while supervisor pending"),
         }
     }
@@ -589,7 +589,6 @@ impl ChargeSupervisor {
             LatchState::Pending { reason } => Some(reason),
             LatchState::Active { .. } => None,
         };
-        let pre_enable = pending_reason.is_some();
 
         if let Some(sp) = p.setpoints {
             let want = self.expected_setpoints();
@@ -619,7 +618,7 @@ impl ChargeSupervisor {
         // (drift check above just verified them), so regulation is at
         // known targets either way.
         match (pending_reason, p.output) {
-            (None, Some(BuckOutput::Off { cause: Some(Lvp | Otp) })) => {
+            (None, Some(BuckOutput::Off { cause: Lvp | Otp })) => {
                 self.latch = LatchState::Pending {
                     reason: PendingReason::ProtectRecovery,
                 };
@@ -674,7 +673,7 @@ impl ChargeSupervisor {
         // step the debouncer so its state stays coherent for Active.
         let ov = b.voltage > self.profile.absorb_v + OV_MARGIN_V;
         let ov_debounced = self.ov.step(ov, elapsed, OV_DURATION);
-        if (pre_enable && ov) || ov_debounced {
+        if ov_debounced || (pending_reason.is_some() && ov) {
             return self.latch(FaultReason::Overvoltage);
         }
 
@@ -690,7 +689,7 @@ impl ChargeSupervisor {
         // The modbus_err debounce above eventually fails closed on
         // sustained read failures, but takes 5 s; this gate avoids
         // emitting EnableOutput in the meantime.
-        if pre_enable {
+        if pending_reason.is_some() {
             if p.setpoints.is_none() {
                 return Action::None;
             }
@@ -698,7 +697,7 @@ impl ChargeSupervisor {
             // transient protection — set_output(true) would succeed at
             // the Modbus layer but the buck would stay off, and we'd
             // flap EnableOutput on every poll. Wait for LVP/OTP to clear.
-            if matches!(p.output, Some(BuckOutput::Off { cause: Some(Lvp | Otp) })) {
+            if matches!(p.output, Some(BuckOutput::Off { cause: Lvp | Otp })) {
                 return Action::None;
             }
             // Output has been OFF through Pending, so `b.voltage` is the

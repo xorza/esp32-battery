@@ -59,7 +59,11 @@ trait XyDevice {
     /// Write 0 to PROTECT (0x0010) to clear a latched protection cause.
     fn clear_protection_status(&mut self) -> Result<(), RtuError>;
     fn set_output(&mut self, on: bool) -> Result<(), RtuError>;
-    fn set_power_on_default_off(&mut self) -> Result<(), RtuError>;
+    /// Program S_INI (power-on default of OUTPUT_EN). We always pass
+    /// `false` so a brown-out / unrelated reset brings the buck back
+    /// disabled — the supervisor's bring-up is the only thing allowed
+    /// to enable output.
+    fn set_power_on_default(&mut self, on: bool) -> Result<(), RtuError>;
 }
 
 /// Boot-time failure: either the Modbus transport gave up, or a register
@@ -186,8 +190,8 @@ mod real {
             self.0.set_output(on)
         }
 
-        fn set_power_on_default_off(&mut self) -> Result<(), RtuError> {
-            self.0.set_power_on_output(false)
+        fn set_power_on_default(&mut self, on: bool) -> Result<(), RtuError> {
+            self.0.set_power_on_output(on)
         }
     }
 }
@@ -300,7 +304,7 @@ mod fake {
             self.output_on = on;
             Ok(())
         }
-        fn set_power_on_default_off(&mut self) -> Result<(), RtuError> {
+        fn set_power_on_default(&mut self, _on: bool) -> Result<(), RtuError> {
             Ok(())
         }
     }
@@ -336,7 +340,7 @@ fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<u16, BootError> {
     // outages and unrelated crashes leave 0x0010 set, and we don't want
     // that stale value contaminating the per-tick read in `poll`.
     xy.clear_protection_status()?;
-    xy.set_power_on_default_off()?;
+    xy.set_power_on_default(false)?;
     xy.set_protection(SAFETY)?;
     xy.set_voltage(PACK_PROFILE.float_v)?;
     xy.set_current_limit(PACK_PROFILE.regulation_a)?;
@@ -509,7 +513,7 @@ fn poll<D: XyDevice>(
                 }
                 *last_protection = s.protection;
                 BuckOutput::Off {
-                    cause: Some(s.protection),
+                    cause: s.protection,
                 }
             });
             (setpoints, output)
