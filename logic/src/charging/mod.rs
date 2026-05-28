@@ -24,6 +24,9 @@ use strum::IntoStaticStr;
 use crate::battery::{self, Chemistry};
 
 pub use xy_modbus::{ProtectionStatus, SafetyLimits, Setpoints};
+// Imported by name for terse pattern matching on the buck's PROTECT register —
+// LVP and OTP are the only causes the supervisor handles in-place.
+use ProtectionStatus::{Lvp, Otp};
 
 // ─── Tunables ────────────────────────────────────────────────────────────────
 
@@ -90,19 +93,6 @@ const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 /// quirks on values like 14.4 V whose binary repr isn't exact.
 const SETPOINT_DRIFT_TOL: f32 = 0.02;
 
-/// How long the world must look healthy after `OutputUnexpectedlyOff`
-/// before the supervisor signals the caller to restart. Long enough for
-/// transient causes (input LVP from AC sag, over-temp cooldown) to
-/// genuinely clear; short enough that operationally a brief input glitch
-/// doesn't require a manual reboot.
-const OUTPUT_RECOVERY_HEALTHY: Duration = Duration::from_secs(60);
-/// Total recoveries from `OutputUnexpectedlyOff` allowed since boot. After
-/// this many flap cycles, the caller stops restarting and leaves the buck
-/// off — flapping is a real signal that something underlying is wrong.
-/// Tracked by the caller (the supervisor is recreated on each restart and
-/// can't carry the count itself).
-pub const OUTPUT_RECOVERY_MAX_ATTEMPTS: u32 = 3;
-
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug)]
@@ -145,42 +135,6 @@ pub enum BuckOutput {
     /// we managed to read it; `None` means the PROTECT read itself
     /// failed.
     Off { cause: Option<ProtectionStatus> },
-}
-
-/// Policy: whether a self-disable for a given protection cause is safe
-/// to auto-recover from. Conservative — only causes that are *likely*
-/// transient and pose no fresh risk if they re-fire after a wait.
-/// OCP/OPP can signal a real downstream fault (short, sticky FET); OVP
-/// means pack-side trouble; energy/time limits hit programmed budgets.
-/// Reboot-required for those.
-fn is_recoverable(cause: ProtectionStatus) -> bool {
-    match cause {
-        // Over-temp clears on its own once the case cools. (LVP is
-        // handled in-place by `tick` — input UVLO never reaches the
-        // tripped state, so it doesn't appear here.)
-        ProtectionStatus::Otp => true,
-        // Input UVLO is intercepted before it can latch; the supervisor
-        // drops back to Pending and waits. See `tick`.
-        ProtectionStatus::Lvp => false,
-        // Output went off but the device reports no protection.
-        // Means a front-panel toggle, external Modbus write, or
-        // EMI on the panel button GPIO — all human/environmental
-        // causes that warrant someone looking. Auto-recovering
-        // would just burn the restart budget on something that
-        // didn't fix itself.
-        ProtectionStatus::Normal => false,
-        // Output / pack / load problems that need someone to look.
-        ProtectionStatus::Ovp
-        | ProtectionStatus::Ocp
-        | ProtectionStatus::Opp
-        | ProtectionStatus::Oah
-        | ProtectionStatus::Ohp
-        | ProtectionStatus::Oep
-        | ProtectionStatus::Owh
-        | ProtectionStatus::Icp => false,
-        // Off-spec read — don't trust ourselves.
-        ProtectionStatus::Unknown(_) => false,
-    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, IntoStaticStr)]
@@ -253,27 +207,6 @@ impl std::fmt::Display for FaultReason {
 }
 
 impl FaultReason {
-    /// How long the world must look healthy before the caller may restart
-    /// the supervise loop. `None` means reboot-only recovery; only
-    /// `OutputUnexpectedlyOff(Otp)` is currently recoverable (over-temp
-    /// cooldown). LVP is intercepted in `tick` and never latches; hard
-    /// safety faults (OV, drift, absorb timeout) stay reboot-only.
-    pub fn recovery_healthy_for(self) -> Option<Duration> {
-        match self {
-            // Only recover when the device-reported cause is one we
-            // believe is transient (LVP/OTP). OCP/OVP/etc. would be
-            // re-energizing into a possibly-still-tripped condition.
-            // Normal means human/environmental cause (panel toggle,
-            // external write, EMI on the button GPIO) — not transient
-            // in the sense that matters. Cause=None (PROTECT read
-            // failed): conservative, treat as non-recoverable.
-            Self::OutputUnexpectedlyOff(Some(cause)) if is_recoverable(cause) => {
-                Some(OUTPUT_RECOVERY_HEALTHY)
-            }
-            _ => None,
-        }
-    }
-
     /// Stable snake_case identifier — what API consumers and dashboards
     /// match on. The `Display` impl is the human-readable form for logs.
     pub fn label(self) -> &'static str {
@@ -297,15 +230,21 @@ impl FaultReason {
 /// `EnableOutput` and stays Pending until the caller `ack_enable`s. After
 /// that it transitions to active operation: phase machine + drift +
 /// fault paths. After a fault latches, only `DisableOutput` is ever
-/// emitted until the disable is ACKed. Once acked, recoverable faults
-/// accumulate a healthy window and eventually emit `RestartSupervisor`.
+/// emitted until the disable is ACKed; the supervisor then sits in
+/// `Action::None` indefinitely (reboot-only recovery — transient
+/// protection causes LVP/OTP are handled in-place without latching).
 #[derive(Debug)]
 pub enum Action {
     None,
-    /// Caller should write `set_output(true)`. V_SET is untouched —
-    /// `boot_sequence` already programmed it to `float_v`, which is
-    /// always the supervisor's target voltage in Pending.
-    EnableOutput,
+    /// Caller should write `set_output(true)` then call
+    /// `ack_enable(resume_absorb)`. `resume_absorb` reports whether the
+    /// supervisor will jump straight to Absorb on the first Active tick
+    /// (pack rests below the CV plateau, so it isn't full) or park in
+    /// Float. Surfacing it here keeps the bring-up decision visible at
+    /// the call site instead of buried in supervisor state.
+    EnableOutput {
+        resume_absorb: bool,
+    },
     /// Caller should write V_SET to `target_v` then call
     /// `ack_voltage_update`. Emitted while the phase machine wants to
     /// transition Float ↔ Absorb but the new voltage hasn't been
@@ -316,14 +255,6 @@ pub enum Action {
         target_v: f32,
     },
     DisableOutput(FaultReason),
-    /// Latched fault is recoverable, the world has looked healthy
-    /// (Modbus up, output off, finite battery below OV) for the
-    /// fault's `recovery_healthy_for` window. Caller should tear this
-    /// supervisor down, re-run `boot_sequence`, and construct a fresh
-    /// `ChargeSupervisor`. Re-emits each tick while the conditions
-    /// hold; the caller's per-boot restart budget is what stops a flap
-    /// loop, not the supervisor.
-    RestartSupervisor,
 }
 
 /// Latest fresh battery reading fed to the supervisor. Voltage is used for
@@ -346,10 +277,8 @@ pub struct BatterySample {
 ///   `SettingsDrift`), and `target_voltage` keeps reporting the **old**
 ///   phase's voltage until `ack_voltage_update` commits the transition.
 /// - `Tripped { acked: false }`: a fault latched; emit `DisableOutput`.
-/// - `Tripped { acked: true }`: caller successfully disabled. For
-///   recoverable faults the supervisor accumulates a healthy-window
-///   timer and, once met, returns `Action::RestartSupervisor` from
-///   `tick`. Non-recoverable faults stay parked in `Action::None`.
+/// - `Tripped { acked: true }`: caller successfully disabled. Reboot-only
+///   recovery — `tick` returns `Action::None` from here on.
 enum LatchState {
     Pending { reason: PendingReason },
     Active { pending_voltage: Option<Phase> },
@@ -362,17 +291,18 @@ enum LatchState {
 /// - `Boot`: cold start. `boot_sequence` just wrote `set_output(false)`
 ///   and verified `OUTPUT_EN=0`. If a poll then shows On, something is
 ///   genuinely off (firmware/EMI/panel) — latch immediately.
-/// - `LvpRecovery`: the supervisor was Active when the buck self-disabled
-///   on input UVLO; we dropped here to wait for input to return. The
-///   XY7025 auto-re-enables `OUTPUT_EN` when LVP clears (its internal
-///   behavior, independent of S_INI), so seeing buck=On is the *expected*
-///   recovery — transition straight back to Active rather than latching.
-///   Setpoints are still what we programmed before LVP, so drift check
-///   covers regulation safety.
+/// - `ProtectRecovery`: the supervisor was Active when the buck
+///   self-disabled on a transient protection (input UVLO / over-temp);
+///   we dropped here to wait for the condition to clear. The XY7025
+///   may auto-re-enable `OUTPUT_EN` when the cause clears (LVP/OTP are
+///   sensor-driven, not true latches), so seeing buck=On is the
+///   *expected* recovery — transition straight back to Active rather
+///   than latching. Setpoints are still what we programmed before the
+///   self-disable, so drift check covers regulation safety.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PendingReason {
     Boot,
-    LvpRecovery,
+    ProtectRecovery,
 }
 
 /// Time-based debouncer: counts elapsed while `cond` holds, resets when it
@@ -406,17 +336,6 @@ pub struct ChargeSupervisor {
     battery_missing: Debounce,
     modbus_err: Debounce,
     latch: LatchState,
-    /// Healthy-state debouncer advanced only by `tick_recovery`. Reset on
-    /// each new latch. Only meaningful when the latched fault has a
-    /// recovery policy.
-    recovery: Debounce,
-    /// Decided during Pending bring-up: the pack's resting voltage (output
-    /// has been OFF) was below the CV plateau, so it isn't full and the
-    /// supervisor should resume Absorb instead of parking in Float.
-    /// Consumed by `ack_enable`. Without it, a pack power-cycled above
-    /// ~75% rests too near `float_v` to ever draw `enter_absorb_a`, so it
-    /// would stall at the float level and never finish charging.
-    enable_into_absorb: bool,
 }
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
@@ -498,9 +417,16 @@ impl ChargeSupervisor {
             latch: LatchState::Pending {
                 reason: PendingReason::Boot,
             },
-            recovery: Debounce::default(),
-            enable_into_absorb: false,
         }
+    }
+
+    /// Float→Absorb and the LVP/OTP intercept both clear these so the
+    /// next CV-plateau dwell starts fresh and the exit-taper isn't
+    /// pre-armed from a load transient that happened before the
+    /// transition.
+    fn reset_phase_timers(&mut self) {
+        self.absorb.elapsed = Duration::ZERO;
+        self.exit.elapsed = Duration::ZERO;
     }
 
     pub fn phase(&self) -> Phase {
@@ -571,13 +497,18 @@ impl ChargeSupervisor {
     /// Transitions Pending → Active; the supervisor's phase machine starts
     /// running on the next tick. Until acked, the supervisor keeps emitting
     /// `EnableOutput` so a failed enable write gets retried.
-    pub fn ack_enable(&mut self) {
+    ///
+    /// `resume_absorb` echoes the bool from the `Action::EnableOutput` the
+    /// caller is acking — `true` means the pack rested below the CV plateau
+    /// so it isn't full and the first Active tick should step V_SET
+    /// float_v → absorb_v (otherwise the supervisor parks in Float). A pack
+    /// power-cycled above ~75% rests too near `float_v` to ever draw
+    /// `enter_absorb_a`, so without this it would stall there and never
+    /// finish charging.
+    pub fn ack_enable(&mut self, resume_absorb: bool) {
         match self.latch {
             LatchState::Pending { .. } => {
-                // If the pack came up below the CV plateau it isn't full;
-                // resume Absorb via the pending-voltage path (V_SET steps
-                // float_v → absorb_v on the first Active tick, no drift).
-                let pending_voltage = self.enable_into_absorb.then_some(Phase::Absorb);
+                let pending_voltage = resume_absorb.then_some(Phase::Absorb);
                 self.latch = LatchState::Active { pending_voltage };
             }
             _ => panic!("ack_enable from non-Pending state"),
@@ -603,11 +534,10 @@ impl ChargeSupervisor {
         self.latch = LatchState::Active {
             pending_voltage: None,
         };
-        // Reset both timers explicitly: a Float→Absorb transition can
-        // immediately follow an Absorb→Float, with no intervening Float
-        // dwell to clear stale counts.
-        self.absorb.elapsed = Duration::ZERO;
-        self.exit.elapsed = Duration::ZERO;
+        // A Float→Absorb transition can immediately follow an
+        // Absorb→Float, with no intervening Float dwell to clear
+        // stale counts.
+        self.reset_phase_timers();
     }
 
     /// Drive one poll cycle. `p` carries the buck readback and latest fresh
@@ -628,12 +558,10 @@ impl ChargeSupervisor {
         let pending_reason = match self.latch {
             LatchState::Tripped {
                 reason,
-                acked: true,
-            } => return self.tick_recovery(reason, &p, elapsed),
-            LatchState::Tripped {
-                reason,
                 acked: false,
             } => return Action::DisableOutput(reason),
+            // Tripped+acked: reboot-only recovery, supervisor parks here.
+            LatchState::Tripped { acked: true, .. } => return Action::None,
             LatchState::Pending { reason } => Some(reason),
             LatchState::Active { .. } => None,
         };
@@ -650,51 +578,43 @@ impl ChargeSupervisor {
 
         // Mismatch between latch state and what the buck reports.
         // Active expects ON: any OFF means the buck self-disabled
-        // (hardware OVP/OCP/LVP, over-temp, panel toggle).
+        // (hardware OVP/OCP, panel toggle, missing PROTECT read).
         // Pending expects OFF: any ON means our boot disable / S_INI=0
-        // didn't stick — fail closed and reboot rather than trust
-        // unknown regulation.
+        // didn't stick — fail closed rather than trust unknown
+        // regulation.
         //
-        // LVP (input UVLO) is the one exception: the buck is healthy,
-        // the DC supply just dropped. Drop back to Pending and wait for
-        // input to return — re-enable via the normal Pending bring-up
-        // when LVP clears. A multi-hour outage would otherwise burn
-        // through the caller's restart budget in minutes and leave the
-        // pack uncharged until manual reboot.
+        // LVP (input UVLO) and OTP (over-temp) are exceptions: the buck
+        // is healthy, just waiting on a sensor-side condition to clear.
+        // Drop back to Pending and let the normal bring-up re-enable
+        // when the cause is gone. A multi-hour outage would otherwise
+        // require manual reboot. The XY7025 may also auto-re-enable
+        // OUTPUT_EN itself once the cause clears (these are sensor-driven
+        // protections, not true latches), so seeing On while waiting in
+        // ProtectRecovery is the expected recovery — snap to Active
+        // without latching. Setpoints are unchanged through the wait
+        // (drift check above just verified them), so regulation is at
+        // known targets either way.
         match (pending_reason, p.output) {
-            (None, Some(BuckOutput::Off { cause: Some(ProtectionStatus::Lvp) })) => {
+            (None, Some(BuckOutput::Off { cause: Some(Lvp | Otp) })) => {
                 self.latch = LatchState::Pending {
-                    reason: PendingReason::LvpRecovery,
+                    reason: PendingReason::ProtectRecovery,
                 };
-                self.absorb.elapsed = Duration::ZERO;
-                self.exit.elapsed = Duration::ZERO;
+                self.reset_phase_timers();
                 return Action::None;
             }
             (None, Some(BuckOutput::Off { cause })) => {
                 return self.latch(FaultReason::OutputUnexpectedlyOff(cause));
             }
-            // Buck reports ON while we're waiting in Pending. The XY7025
-            // auto-re-enables OUTPUT_EN on LVP clear (input-side
-            // protection, not a true latch), so seeing On in
-            // `PendingReason::LvpRecovery` is the expected recovery —
-            // transition straight back to Active. Setpoints are
-            // unchanged since the LVP intercept (drift check above just
-            // verified them), so regulation is at known targets.
-            //
-            // From `PendingReason::Boot` it's a real fault: boot_sequence
-            // wrote set_output(false) and verified OUTPUT_EN=0, so an
-            // ON reading means the disable didn't stick (firmware bug,
-            // panel toggle, EMI on the button GPIO) — latch and fail
-            // closed.
-            (Some(PendingReason::LvpRecovery), Some(BuckOutput::On)) => {
-                // Output came back on with our setpoints intact. Skip
-                // the EnableOutput round-trip; supervisor's already
-                // regulating the right values.
+            (Some(PendingReason::ProtectRecovery), Some(BuckOutput::On)) => {
                 self.latch = LatchState::Active {
                     pending_voltage: None,
                 };
                 return Action::None;
             }
+            // PendingReason::Boot + buck On: boot_sequence wrote
+            // set_output(false) and verified OUTPUT_EN=0, so an ON
+            // reading is a real anomaly (firmware bug, panel toggle,
+            // EMI on the button GPIO) — latch.
             (Some(PendingReason::Boot), Some(BuckOutput::On)) => {
                 return self.latch(FaultReason::OutputOnInPending);
             }
@@ -750,23 +670,18 @@ impl ChargeSupervisor {
             if p.setpoints.is_none() {
                 return Action::None;
             }
-            // Don't try to enable while the buck is still in input UVLO —
-            // set_output(true) would succeed at the Modbus layer but the
-            // buck would stay off, and we'd flap EnableOutput on every
-            // poll. Wait for LVP to clear first.
-            if matches!(
-                p.output,
-                Some(BuckOutput::Off {
-                    cause: Some(ProtectionStatus::Lvp)
-                })
-            ) {
+            // Don't try to enable while the buck is still holding on a
+            // transient protection — set_output(true) would succeed at
+            // the Modbus layer but the buck would stay off, and we'd
+            // flap EnableOutput on every poll. Wait for LVP/OTP to clear.
+            if matches!(p.output, Some(BuckOutput::Off { cause: Some(Lvp | Otp) })) {
                 return Action::None;
             }
             // Output has been OFF through Pending, so `b.voltage` is the
             // pack's resting voltage — the true SoC signal. Below the CV
-            // plateau ⇒ not full ⇒ `ack_enable` resumes Absorb.
-            self.enable_into_absorb = !self.at_cv_plateau(b.voltage);
-            return Action::EnableOutput;
+            // plateau ⇒ not full ⇒ caller acks with resume_absorb=true.
+            let resume_absorb = !self.at_cv_plateau(b.voltage);
+            return Action::EnableOutput { resume_absorb };
         }
 
         // Re-emit UpdateVoltage until the caller acks the previous one.
@@ -821,37 +736,7 @@ impl ChargeSupervisor {
             reason,
             acked: false,
         };
-        // New latch — reset recovery clock.
-        self.recovery.elapsed = Duration::ZERO;
         Action::DisableOutput(reason)
-    }
-
-    /// Recovery path for `Tripped { acked: true }` — accumulates a
-    /// healthy window and emits `RestartSupervisor` once the fault's
-    /// `recovery_healthy_for` budget is met. Non-recoverable faults
-    /// stay parked in `Action::None`. "Healthy" here: Modbus up, battery
-    /// present and finite, pack below the OV threshold, and the buck
-    /// still reporting output OFF (any spontaneous re-enable is
-    /// unmodeled — reset the clock until we see a clean stable state).
-    fn tick_recovery(&mut self, reason: FaultReason, p: &PollResult, elapsed: Duration) -> Action {
-        let Some(healthy_for) = reason.recovery_healthy_for() else {
-            return Action::None;
-        };
-        let battery_ok = p
-            .battery
-            .map(|b| {
-                b.voltage.is_finite()
-                    && b.current.is_finite()
-                    && b.voltage <= self.profile.absorb_v + OV_MARGIN_V
-            })
-            .unwrap_or(false);
-        let healthy =
-            p.setpoints.is_some() && matches!(p.output, Some(BuckOutput::Off { .. })) && battery_ok;
-        if self.recovery.step(healthy, elapsed, healthy_for) {
-            Action::RestartSupervisor
-        } else {
-            Action::None
-        }
     }
 }
 

@@ -15,7 +15,7 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    self, Action, BatterySample, BuckOutput, ChargeSupervisor, PollResult,
+    Action, BatterySample, BuckOutput, ChargeSupervisor, PollResult,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
@@ -399,102 +399,49 @@ fn boot_with_retries<D: XyDevice>(xy: &mut D, recorder: &EventRecorder) -> u16 {
     }
     error!("XY boot failed after {BOOT_RETRY_COUNT} attempts — rebooting MCU");
     recorder.record(Event::Xy(XyError::BootSequence));
-    shutdown_or_reboot(xy, "pre-reboot", true, recorder);
-    unreachable!("shutdown_or_reboot with force_reboot=true reboots the MCU");
+    // Best-effort disable before the reboot. S_INI=0 means the buck
+    // comes back up disabled even if this write fails, so we don't
+    // gate the reboot on it.
+    if let Err(e) = xy.set_output(false) {
+        error!("XY pre-reboot set_output(false) FAILED: {e}");
+        recorder.record(Event::Xy(XyError::SetOutput));
+    }
+    reboot::reboot_after("XY boot exhausted: rebooting now");
+    loop {
+        thread::park();
+    }
 }
 
-/// Inner supervise loop: poll → tick → apply, until tick emits
-/// `RestartSupervisor` (caller tears down + re-runs `boot_sequence`).
-/// Panics propagate.
-fn supervise_loop<D: XyDevice>(
-    xy: &mut D,
-    sensor_data: &Mutex<SensorData>,
-    recorder: &EventRecorder,
-    supervisor: &mut ChargeSupervisor,
-    wdt: &task_wdt::WdtToken,
-) {
+/// Supervisor thread entry: boot the buck, then poll → tick → apply
+/// forever. Transient buck protections (LVP/OTP) are handled in-place
+/// by the supervisor; permanent faults latch in `Action::None` and the
+/// loop keeps polling so observability and the LCD stay live until a
+/// reboot. Panics propagate (the panic hook reboots the MCU).
+fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
+    // !Send token stays bound to this FreeRTOS task for its lifetime.
+    let wdt = task_wdt::subscribe();
+
+    let model_code = boot_with_retries(&mut xy, &recorder);
+    sensor_data.lock().unwrap().model_code = model_code;
+    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
+
     // Tracks the last-seen PROTECT cause so a latch is logged to the event
     // log once per episode, not on every poll while it stays latched.
     let mut last_protection = ProtectionStatus::Normal;
     loop {
         wdt.reset();
-        let p = poll(xy, sensor_data, recorder, &mut last_protection);
+        let p = poll(&mut xy, &sensor_data, &recorder, &mut last_protection);
         let action = supervisor.tick(p, POLL_INTERVAL);
-        if matches!(action, Action::RestartSupervisor) {
-            return;
-        }
-        apply_action(xy, supervisor, action, recorder);
-        // Publish supervisor state for /api + LCD. `phase()` is only
-        // meaningful once Active; Pending/Tripped surface as None so
-        // dashboards can distinguish "not yet charging" from a real phase.
+        apply_action(&mut xy, &mut supervisor, action, &recorder);
+        // Publish supervisor state for /api + LCD. `active_phase()` is
+        // only Some while regulating; Pending/Tripped surface as None
+        // so dashboards distinguish "not yet charging" from a real phase.
         {
             let mut sd = sensor_data.lock().unwrap();
             sd.charge_phase = supervisor.active_phase();
             sd.charge_fault = supervisor.fault();
         }
         thread::sleep(POLL_INTERVAL);
-    }
-}
-
-fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
-    // Subscribe once for the lifetime of this thread. Restarts of the
-    // supervise loop (below) keep feeding the same WDT subscription.
-    // The token is `!Send`, so it stays bound to this FreeRTOS task.
-    let wdt = task_wdt::subscribe();
-
-    // Outer loop = recovery restarts. Each iteration re-runs boot_sequence
-    // (which reprograms + verifies OVP/OCP/LVP/V_SET/I_SET) and constructs
-    // a fresh ChargeSupervisor. Bounded by OUTPUT_RECOVERY_MAX_ATTEMPTS;
-    // exhaustion → leave the buck off and exit the thread.
-    for restart in 0..=charging::OUTPUT_RECOVERY_MAX_ATTEMPTS {
-        if restart > 0 {
-            info!(
-                "XY supervisor restart {restart}/{} (recovering from buck self-disable)",
-                charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
-            );
-        }
-        let model_code = boot_with_retries(&mut xy, &recorder);
-        sensor_data.lock().unwrap().model_code = model_code;
-        let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
-
-        supervise_loop(&mut xy, &sensor_data, &recorder, &mut supervisor, &wdt);
-    }
-
-    error!(
-        "XY recovery budget exhausted ({} attempts) — forcing output OFF",
-        charging::OUTPUT_RECOVERY_MAX_ATTEMPTS
-    );
-    drop(wdt);
-    shutdown_or_reboot(&mut xy, "recovery-exhausted", false, &recorder);
-}
-
-/// Best-effort `set_output(false)` then either exit (buck is OFF) or
-/// reboot. Reboot is forced when the caller can't continue regardless
-/// (boot failure), or triggered by a failed disable — leaving the buck
-/// sourcing with no supervisor and no WDT is the one thing we never want.
-/// S_INI=0 ensures the buck comes back OFF after the reboot.
-fn shutdown_or_reboot<D: XyDevice>(
-    xy: &mut D,
-    ctx: &'static str,
-    force_reboot: bool,
-    recorder: &EventRecorder,
-) {
-    let disable_ok = match xy.set_output(false) {
-        Ok(()) => {
-            error!("XY {ctx} set_output(false) succeeded — buck is OFF");
-            true
-        }
-        Err(e) => {
-            error!("XY {ctx} set_output(false) FAILED: {e}");
-            recorder.record(Event::Xy(XyError::SetOutput));
-            false
-        }
-    };
-    if force_reboot || !disable_ok {
-        reboot::reboot_after("XY shutdown: rebooting now");
-        loop {
-            thread::park();
-        }
     }
 }
 
@@ -587,12 +534,11 @@ fn apply_action<D: XyDevice>(
     recorder: &EventRecorder,
 ) {
     match action {
-        // Filtered out by `run`'s inner loop before this is called.
-        Action::None | Action::RestartSupervisor => {}
-        Action::EnableOutput => {
-            info!("supervisor enabling output");
+        Action::None => {}
+        Action::EnableOutput { resume_absorb } => {
+            info!("supervisor enabling output (resume_absorb={resume_absorb})");
             match xy.set_output(true) {
-                Ok(()) => supervisor.ack_enable(),
+                Ok(()) => supervisor.ack_enable(resume_absorb),
                 Err(e) => {
                     warn!("XY set_output(true): {e} — supervisor stays Pending, will retry");
                     recorder.record(Event::Xy(XyError::SetOutput));
