@@ -38,7 +38,7 @@ use ProtectionStatus::{Lvp, Otp};
 
 /// CC charge rate as a fraction of pack capacity. 0.2C is the
 /// longevity-tuned value; manufacturer max is 0.5C. Stay conservative.
-pub const REGULATION_C: f32 = 0.2;
+pub const REGULATION_C: f32 = 0.15;
 /// Tail-current threshold for ending Absorb, as a fraction of capacity.
 /// 0.05C (= C/20) is the cell-manufacturer-standard termination current
 /// for LFP — consensus across Battle Born, Victron, and Nordkyn Design
