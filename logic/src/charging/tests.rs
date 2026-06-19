@@ -390,21 +390,65 @@ fn exits_absorb_when_load_pulls_current() {
 }
 
 #[test]
-fn brief_taper_dip_does_not_exit_absorb() {
-    // Pack flickers below the tail current for half the debounce window,
-    // then comes back. Counter must reset — no transition.
+fn sustained_recharge_drains_exit_gate() {
+    // The gate is leaky: a *sustained* return to real charging must drain it
+    // back down and block the exit (the pack is genuinely taking charge, not
+    // just pulsing). Fill it to one tick shy of the window, then charge above
+    // tail for a full window — symmetric drain empties it — and confirm it
+    // then takes a fresh full window below tail to actually exit.
     let mut s = active(lfp_4s());
-    ok_tick(&mut s, b(OK_V, -4.0), TICK);
-    for _ in 0..(EXIT_DEBOUNCE.as_secs() / 2) {
-        assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
-    }
-    // Sag recovers — current back above the tail.
-    assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
-    // Must now sit through another full debounce window without transitioning.
+    ok_tick(&mut s, b(OK_V, -4.0), TICK); // → Absorb
     for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
     }
+    // Sustained recharge above tail for the full window drains the gate to 0.
+    for _ in 0..EXIT_DEBOUNCE.as_secs() {
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -4.0), TICK), Action::None));
+    }
     assert!(matches!(s.phase(), Phase::Absorb));
+    // A fresh full window below tail is now required to exit.
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
+    }
+    assert!(matches!(
+        ok_tick(&mut s, b(OK_V, -2.4), TICK),
+        Action::UpdateVoltage { .. }
+    ));
+    assert!(matches!(s.phase(), Phase::Float));
+}
+
+#[test]
+fn pulsing_current_still_exits_absorb() {
+    // Regression for the real-hardware bug: at a full pack the XY7025 delivers
+    // burst pulses — instantaneous current spikes well above the tail every few
+    // seconds but averages near zero. The old hard-reset gate re-armed the full
+    // window on every spike and never exited, pinning the supervisor in Absorb
+    // (load silently running on a "full" pack). The leaky gate must accept the
+    // taper because the *average* charging current is below the 2.5 A tail.
+    let mut s = active(lfp_4s());
+    ok_tick(&mut s, b(OK_V, -4.0), TICK); // → Absorb
+    // One 6 A spike (each would reset a hard-reset debounce) per three near-zero
+    // ticks: average charging current ≈ 1.5 A, comfortably below the 2.5 A tail.
+    let pattern = [-6.0, -0.1, 0.2, -0.1];
+    let mut exited_at = None;
+    'outer: for cycle in 0..60 {
+        for &i in &pattern {
+            if matches!(
+                ok_tick(&mut s, b(OK_V, i), TICK),
+                Action::UpdateVoltage { .. }
+            ) {
+                exited_at = Some(cycle);
+                break 'outer;
+            }
+        }
+    }
+    // Net fill is +2 ticks per 4-tick cycle, so ~30 cycles to cross the 60 s
+    // window. Assert it lands in that ballpark — not "eventually", and not so
+    // fast that the spikes were being ignored entirely.
+    let cycle = exited_at.expect("pulsing pack never exited Absorb");
+    assert!((25..40).contains(&cycle), "exited after {cycle} cycles");
+    assert!(matches!(s.phase(), Phase::Float));
+    assert!(approx(s.target_voltage(), 13.5));
 }
 
 #[test]

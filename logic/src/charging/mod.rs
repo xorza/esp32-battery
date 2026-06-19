@@ -38,7 +38,7 @@ use ProtectionStatus::{Lvp, Otp};
 
 /// CC charge rate as a fraction of pack capacity. 0.2C is the
 /// longevity-tuned value; manufacturer max is 0.5C. Stay conservative.
-pub const REGULATION_C: f32 = 0.15;
+pub const REGULATION_C: f32 = 0.2;
 /// Tail-current threshold for ending Absorb, as a fraction of capacity.
 /// 0.05C (= C/20) is the cell-manufacturer-standard termination current
 /// for LFP — consensus across Battle Born, Victron, and Nordkyn Design
@@ -82,9 +82,12 @@ const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
 /// arms the timer.
 const ABSORB_CV_BAND_V: f32 = 0.1;
 /// How long charging current must hold below `exit_absorb_a` before the
-/// supervisor accepts the taper as real and drops back to Float. Filters
-/// brief sags from switching noise or transient loads that would otherwise
-/// finish absorb prematurely.
+/// supervisor accepts the taper as real and drops back to Float. Applied as a
+/// *leaky* window (`Debounce::step_leaky`): above-tail pulses drain it rather
+/// than resetting it, so the gate fires once the net time below tail crosses
+/// this — i.e. once the average charging current sits below the tail. Filters
+/// both brief sags (under the old hard reset) and the buck's burst pulses at a
+/// full pack (which the hard reset could never get past).
 const EXIT_DEBOUNCE: Duration = Duration::from_secs(60);
 /// How long `battery.is_none()` must persist before we fail closed.
 /// Counts *after* the data layer has already flipped to `None` per its
@@ -342,6 +345,26 @@ impl Debounce {
             self.elapsed = Duration::ZERO;
             false
         }
+    }
+
+    /// Like `step`, but a false `cond` *drains* the accumulator by `dt`
+    /// (floored at zero) instead of zeroing it. Firing at `>= timeout` then
+    /// means "net time-true exceeded the window" — equivalently, `cond` held
+    /// for more than half the recent window on average. Used for the
+    /// Absorb-exit taper gate: a nearly-full pack drives the XY7025 into burst
+    /// pulses (0 → several amps every few seconds), so the instantaneous
+    /// charging current keeps poking back above the tail threshold. Under a
+    /// hard reset each pulse re-arms the full window forever and pins the
+    /// supervisor in Absorb; draining lets the mostly-below-tail average still
+    /// reach the timeout, while a genuine *sustained* return to charging
+    /// drains it back to zero and blocks the exit.
+    fn step_leaky(&mut self, cond: bool, dt: Duration, timeout: Duration) -> bool {
+        if cond {
+            self.elapsed = self.elapsed.saturating_add(dt);
+        } else {
+            self.elapsed = self.elapsed.saturating_sub(dt);
+        }
+        self.elapsed >= timeout
     }
 }
 
@@ -728,7 +751,10 @@ impl ChargeSupervisor {
         // Charging current as a positive number.
         let charging_a = -b.current;
         let below_exit = self.phase == Phase::Absorb && charging_a < self.profile.exit_absorb_a;
-        let exit_done = self.exit.step(below_exit, elapsed, EXIT_DEBOUNCE);
+        // Leaky, not hard-reset: a full pack makes the buck pulse current in
+        // bursts that briefly exceed the tail threshold; those pulses must
+        // shave the gate, not re-arm it from scratch (see `step_leaky`).
+        let exit_done = self.exit.step_leaky(below_exit, elapsed, EXIT_DEBOUNCE);
 
         let next = match self.phase {
             Phase::Float if charging_a > self.profile.enter_absorb_a => Phase::Absorb,
