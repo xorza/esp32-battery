@@ -32,7 +32,7 @@ xy-fake = []
 
 [dependencies]
 esp32-battery-logic = { path = "logic" }
-xy-modbus = { git = "https://github.com/xorza/xy-modbus", branch = "master", features = ["esp-idf-hal"] }
+xy-modbus = { git = "https://github.com/xorza/xy-modbus.git", branch = "master", features = ["esp-idf-hal"] }
 log = "*"
 esp-idf-svc = "*"
 esp-idf-hal = "*"

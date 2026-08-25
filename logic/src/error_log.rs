@@ -52,7 +52,6 @@ pub enum XyError {
     ProtectOep,
     ProtectOwh,
     ProtectIcp,
-    ProtectUnknown,
     /// Supervisor latched a fault and disabled the buck output. The specific
     /// `FaultReason` is exposed live via `SensorData::charge_fault` — this
     /// event records that *a* latch happened (and when), so the historical
@@ -85,7 +84,6 @@ impl XyError {
             ProtectionStatus::Oep => Self::ProtectOep,
             ProtectionStatus::Owh => Self::ProtectOwh,
             ProtectionStatus::Icp => Self::ProtectIcp,
-            ProtectionStatus::Unknown(_) => Self::ProtectUnknown,
         })
     }
 }
@@ -337,11 +335,6 @@ mod tests {
             (ProtectionStatus::Oep, XyError::ProtectOep, "protect_oep"),
             (ProtectionStatus::Owh, XyError::ProtectOwh, "protect_owh"),
             (ProtectionStatus::Icp, XyError::ProtectIcp, "protect_icp"),
-            (
-                ProtectionStatus::Unknown(99),
-                XyError::ProtectUnknown,
-                "protect_unknown",
-            ),
         ];
         for (status, expected, name) in cases {
             assert_eq!(XyError::from_protection(status), Some(expected));
