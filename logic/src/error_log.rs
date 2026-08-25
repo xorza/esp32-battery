@@ -52,11 +52,39 @@ pub enum XyError {
     ProtectOep,
     ProtectOwh,
     ProtectIcp,
-    /// Supervisor latched a fault and disabled the buck output. The specific
-    /// `FaultReason` is exposed live via `SensorData::charge_fault` — this
-    /// event records that *a* latch happened (and when), so the historical
-    /// `recent` ring shows the latch episode even after the fault clears.
-    ChargeFaultLatched,
+}
+
+/// Supervisor latch-state transitions. Recorded on every change so the
+/// log shows the *route* into a state, not just the destination: "flapped
+/// protect-hold four times in ninety seconds, then latched" reads very
+/// differently from a bare latch. The specific `FaultReason` behind a
+/// `Latched` is live on `SensorData::charge_fault`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, EnumCount, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum ChargeTransition {
+    /// Bring-up committed — the buck is on and the phase machine starts.
+    Energised,
+    /// A regulating buck self-disabled on a self-clearing protection
+    /// (input UVLO / over-temp); the supervisor stepped back to bring-up
+    /// to wait it out.
+    ProtectHold,
+    /// The protection cause cleared and the buck came back on by itself.
+    ProtectCleared,
+    /// A fault latched. Reboot-only recovery from here.
+    Latched,
+}
+
+impl ChargeTransition {
+    /// Stable index 0..COUNT — relies on declaration order being the
+    /// numeric discriminant order (true for unit-only enums in Rust).
+    #[inline]
+    pub fn index(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    pub fn name(self) -> &'static str {
+        self.into()
+    }
 }
 
 impl XyError {
@@ -92,6 +120,7 @@ impl XyError {
 pub enum Event {
     Ina(InaError),
     Xy(XyError),
+    Charge(ChargeTransition),
 }
 
 #[derive(Copy, Clone)]
@@ -114,6 +143,7 @@ pub struct EventLog {
     recent: Deque<TimedEvent, CAPACITY>,
     ina_counts: [u32; <InaError as EnumCount>::COUNT],
     xy_counts: [u32; <XyError as EnumCount>::COUNT],
+    charge_counts: [u32; <ChargeTransition as EnumCount>::COUNT],
 }
 
 impl Default for EventLog {
@@ -130,6 +160,7 @@ impl EventLog {
             recent: Deque::new(),
             ina_counts: [0; <InaError as EnumCount>::COUNT],
             xy_counts: [0; <XyError as EnumCount>::COUNT],
+            charge_counts: [0; <ChargeTransition as EnumCount>::COUNT],
         }
     }
 
@@ -152,6 +183,10 @@ impl EventLog {
                 let i = k.index();
                 self.xy_counts[i] = self.xy_counts[i].saturating_add(1);
             }
+            Event::Charge(k) => {
+                let i = k.index();
+                self.charge_counts[i] = self.charge_counts[i].saturating_add(1);
+            }
         }
     }
 
@@ -168,6 +203,10 @@ impl EventLog {
         self.xy_counts[k.index()]
     }
 
+    pub fn charge_count(&self, k: ChargeTransition) -> u32 {
+        self.charge_counts[k.index()]
+    }
+
     /// Iterate `(name, count)` pairs for every INA error kind. Lets API
     /// callers serialize without depending on `strum` themselves.
     pub fn ina_counts_iter(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
@@ -176,6 +215,10 @@ impl EventLog {
 
     pub fn xy_counts_iter(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
         XyError::iter().map(|k| (k.name(), self.xy_count(k)))
+    }
+
+    pub fn charge_counts_iter(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
+        ChargeTransition::iter().map(|k| (k.name(), self.charge_count(k)))
     }
 
     pub fn len(&self) -> usize {
@@ -203,6 +246,9 @@ mod tests {
         for k in XyError::iter() {
             assert_eq!(log.xy_count(k), 0);
         }
+        for k in ChargeTransition::iter() {
+            assert_eq!(log.charge_count(k), 0);
+        }
     }
 
     #[test]
@@ -229,13 +275,20 @@ mod tests {
     }
 
     #[test]
-    fn ina_and_xy_counters_independent() {
+    fn counters_are_independent_per_source() {
         let mut log = EventLog::new();
         log.record(1, Event::Ina(InaError::CurrentRead));
         log.record(2, Event::Xy(XyError::ReadStatus));
         log.record(3, Event::Xy(XyError::ReadStatus));
+        log.record(4, Event::Charge(ChargeTransition::Energised));
+        log.record(5, Event::Charge(ChargeTransition::Energised));
+        log.record(6, Event::Charge(ChargeTransition::Latched));
         assert_eq!(log.ina_count(InaError::CurrentRead), 1);
         assert_eq!(log.xy_count(XyError::ReadStatus), 2);
+        assert_eq!(log.charge_count(ChargeTransition::Energised), 2);
+        assert_eq!(log.charge_count(ChargeTransition::Latched), 1);
+        // A kind that was never recorded stays at zero across sources.
+        assert_eq!(log.charge_count(ChargeTransition::ProtectHold), 0);
     }
 
     #[test]
@@ -287,12 +340,19 @@ mod tests {
     fn names_are_unique_across_sources() {
         let mut seen: heapless::Vec<
             &str,
-            { <InaError as EnumCount>::COUNT + <XyError as EnumCount>::COUNT },
+            {
+                <InaError as EnumCount>::COUNT
+                    + <XyError as EnumCount>::COUNT
+                    + <ChargeTransition as EnumCount>::COUNT
+            },
         > = heapless::Vec::new();
         for k in InaError::iter() {
             assert!(seen.push(k.name()).is_ok());
         }
         for k in XyError::iter() {
+            assert!(seen.push(k.name()).is_ok());
+        }
+        for k in ChargeTransition::iter() {
             assert!(seen.push(k.name()).is_ok());
         }
         for i in 0..seen.len() {
@@ -317,6 +377,13 @@ mod tests {
             xy_seen[k.index()] = true;
         }
         assert!(xy_seen.iter().all(|&b| b));
+
+        let mut charge_seen = [false; <ChargeTransition as EnumCount>::COUNT];
+        for k in ChargeTransition::iter() {
+            assert!(!charge_seen[k.index()], "duplicate index {}", k.index());
+            charge_seen[k.index()] = true;
+        }
+        assert!(charge_seen.iter().all(|&b| b));
     }
 
     #[test]
@@ -346,15 +413,16 @@ mod tests {
     fn mixed_workload_keeps_each_source_consistent() {
         let mut log = EventLog::new();
         for i in 0..50 {
-            if i % 3 == 0 {
-                log.record(i, Event::Ina(InaError::CurrentRead));
-            } else {
-                log.record(i, Event::Xy(XyError::ReadStatus));
+            match i % 3 {
+                0 => log.record(i, Event::Ina(InaError::CurrentRead)),
+                1 => log.record(i, Event::Xy(XyError::ReadStatus)),
+                _ => log.record(i, Event::Charge(ChargeTransition::ProtectHold)),
             }
         }
-        // 0,3,6,…,48 → 17 INA. 50 - 17 = 33 XY.
+        // 0,3,…,48 → 17 INA. 1,4,…,49 → 17 XY. 2,5,…,47 → 16 charge. 50 total.
         assert_eq!(log.ina_count(InaError::CurrentRead), 17);
-        assert_eq!(log.xy_count(XyError::ReadStatus), 33);
+        assert_eq!(log.xy_count(XyError::ReadStatus), 17);
+        assert_eq!(log.charge_count(ChargeTransition::ProtectHold), 16);
         assert_eq!(log.len(), EventLog::CAPACITY);
     }
 }

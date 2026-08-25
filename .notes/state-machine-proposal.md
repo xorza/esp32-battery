@@ -24,8 +24,8 @@ are fixable in isolation:
 
 Ranked by value: **P1 > P3 > P4 > P2 > P5 > P6 > P7**.
 
-**P2, P3, P4 and P7 are done** — 174 host tests green. The remaining
-open items are P1, P5 and P6.
+**P2, P3, P4, P5 and P7 are done** — 177 host tests green. The
+remaining open items are P1 and P6.
 
 ---
 
@@ -327,7 +327,7 @@ The residual asserts in `commit_*` are unreachable through the public
 API — a ticket only exists because a tick minted one — and remain only to
 catch a ticket deliberately stashed across ticks.
 
-## P5 — Invariants and a transition log
+## P5 — Invariants and a transition log — DONE
 
 Two cheap additions that turn field debugging from guesswork into
 reading.
@@ -353,6 +353,26 @@ on ModbusUnhealthy" and "it flapped ProtectRecovery four times in ninety
 seconds and then tripped on ModbusUnhealthy."
 
 ---
+
+### What shipped (P5)
+
+- `set_latch` now carries three `debug_assert!`s: nothing leaves
+  `Tripped`, a fresh `Tripped` is never pre-acked, and `Pending` is never
+  re-entered from `Pending` (which would silently rewrite the reason).
+- `Debounce::step_leaky` asserts the accumulator cannot run past
+  `timeout + dt` — i.e. that a fired gate was actually acted on.
+- New `ChargeTransition { Energised, ProtectHold, ProtectCleared,
+  Latched }` in `error_log.rs`, derived inside `set_latch` by comparing
+  the old and new `LatchState`, so there is exactly one recording site
+  and `Active → Active` (arming/committing `pending_voltage`) records
+  nothing.
+- The supervisor has no clock, so it buffers transitions in an 8-slot
+  ring and `pop_transition()` drains them; `xy.rs` timestamps each into
+  `EventLog`. `/api/errors` gains a `charge_counts` map and a `"charge"`
+  source in `recent`.
+- `XyError::ChargeFaultLatched` is deleted — `ChargeTransition::Latched`
+  supersedes it and fires when the fault latches rather than when the
+  disable write happens to land.
 
 ## P6 — Property tests over random input sequences
 
@@ -416,7 +436,7 @@ is not worth the purity.
 |---|---|---|
 | ~~P3 + P4~~ | **Done** | Landed as one pass: `Mode`, `Verdict`, `safety_verdict`, `set_latch`, `InhibitReason`, wired to `/api` |
 | ~~P2 + P7(a)~~ | **Done** | `EnableTicket` / `VoltageTicket` / `DisableTicket` + `commit_*`; `apply_update_voltage` takes a ticket and returns `VoltageWriteOutcome` |
-| P5 | Small | Needs P3's single setter to exist |
+| ~~P5~~ | **Done** | Three `debug_assert!`s in `set_latch` + one in `step_leaky`; `ChargeTransition` ring drained into `EventLog`, counts on `/api/errors` |
 | P6 | Small, needs dep approval | Needs the above to be worth proving |
 | P1 | Largest | Independent of the rest; schedule on its own |
 

@@ -28,11 +28,13 @@
 
 use std::time::Duration;
 
+use heapless::Deque;
+
 use log::{error, info, warn};
 use strum::IntoStaticStr;
 
 use crate::battery::{self, Chemistry};
-use crate::error_log::XyError;
+use crate::error_log::{ChargeTransition, XyError};
 
 // `XyError` is xy-modbus's top-level failure (input / bad register value /
 // transport). Renamed on import: `error_log::XyError` is this crate's
@@ -105,6 +107,12 @@ const EXIT_DEBOUNCE: Duration = Duration::from_secs(60);
 const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long Modbus reads to the XY can keep failing before we fail closed.
 const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many latch transitions the supervisor buffers between drains.
+/// Transitions are rare — a healthy unit produces one at bring-up and
+/// nothing else for hours — and the caller drains every tick, so this
+/// only has to cover a caller that stops draining briefly.
+const TRANSITION_BUFFER: usize = 8;
 
 /// Allowed drift between commanded and observed setpoint. One register
 /// quantum is 0.01; two-quantum slack absorbs IEEE-float round-trip
@@ -324,32 +332,19 @@ impl EnableTicket {
 /// back into the supervisor.
 #[derive(Debug)]
 pub struct VoltageTicket {
+    /// Phase this write transitions into once committed.
     phase: Phase,
     target_v: f32,
+    /// `true` when `target_v` is *below* the live V_SET, meaning
+    /// [`apply_update_voltage`] must disable output before writing V_SET
+    /// and re-enable after, in that order. Stepping V_SET down with
+    /// output enabled drives reverse current through the buck's
+    /// synchronous low-side FET (the battery sources back into the buck
+    /// as the control loop pulls V_OUT down to the new setpoint), which
+    /// can destroy the FET and propagate upstream through the input rail
+    /// — the XY7025 has no anti-backup protection on either port.
+    /// `false` means a step-up, safe to do live.
     cycle_output: bool,
-}
-
-impl VoltageTicket {
-    fn target_v(&self) -> f32 {
-        self.target_v
-    }
-
-    /// The phase this write transitions into once committed.
-    fn phase(&self) -> Phase {
-        self.phase
-    }
-
-    /// `true` when `target_v` is *below* the live V_SET. The caller MUST
-    /// disable output before writing V_SET and re-enable after, in that
-    /// order. Stepping V_SET down with output enabled drives reverse
-    /// current through the buck's synchronous low-side FET (the battery
-    /// sources back into the buck as the control loop pulls V_OUT down to
-    /// the new setpoint), which can destroy the FET and propagate
-    /// upstream through the input rail — the XY7025 has no anti-backup
-    /// protection on either port. `false` means a step-up, safe to do live.
-    fn cycle_output(&self) -> bool {
-        self.cycle_output
-    }
 }
 
 /// Proof that this tick latched a fault, and the key to
@@ -529,6 +524,14 @@ impl Debounce {
         } else {
             self.elapsed = self.elapsed.saturating_sub(dt);
         }
+        // Firing is supposed to make the caller transition and reset this,
+        // so the accumulator can overshoot by at most the tick that
+        // crossed the line. Running further means a fired gate went
+        // unacted-on and the window no longer means what it says.
+        debug_assert!(
+            self.elapsed <= timeout.saturating_add(dt),
+            "leaky debounce ran past its window — a fired gate went unhandled"
+        );
         self.elapsed >= timeout
     }
 }
@@ -543,6 +546,29 @@ pub struct ChargeSupervisor {
     modbus_err: Debounce,
     latch: LatchState,
     inhibit: Option<InhibitReason>,
+    transitions: Deque<ChargeTransition, TRANSITION_BUFFER>,
+}
+
+/// Classify a latch move for the event log. `None` for a move that isn't
+/// a state change — `Active → Active` is `pending_voltage` being armed or
+/// cleared, which the phase log already covers.
+fn transition_between(from: &LatchState, to: &LatchState) -> Option<ChargeTransition> {
+    match (from, to) {
+        (_, LatchState::Tripped { .. }) => Some(ChargeTransition::Latched),
+        (
+            LatchState::Pending {
+                reason: PendingReason::ProtectRecovery,
+            },
+            LatchState::Active { .. },
+        ) => Some(ChargeTransition::ProtectCleared),
+        (LatchState::Pending { .. }, LatchState::Active { .. }) => {
+            Some(ChargeTransition::Energised)
+        }
+        (LatchState::Active { .. }, LatchState::Pending { .. }) => {
+            Some(ChargeTransition::ProtectHold)
+        }
+        _ => None,
+    }
 }
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
@@ -625,6 +651,7 @@ impl ChargeSupervisor {
                 reason: PendingReason::Boot,
             },
             inhibit: None,
+            transitions: Deque::new(),
         }
     }
 
@@ -686,6 +713,13 @@ impl ChargeSupervisor {
     /// inhibit clears by itself when its cause does.
     pub fn inhibit(&self) -> Option<InhibitReason> {
         self.inhibit
+    }
+
+    /// Pop the oldest un-drained latch transition. The caller loops this
+    /// once per tick and writes each into its event log — the supervisor
+    /// has no clock of its own, so timestamping is the caller's job.
+    pub fn pop_transition(&mut self) -> Option<ChargeTransition> {
+        self.transitions.pop_front()
     }
 
     pub fn fault(&self) -> Option<FaultReason> {
@@ -1034,6 +1068,35 @@ impl ChargeSupervisor {
             !matches!(self.latch, LatchState::Tripped { .. }),
             "attempted to leave Tripped"
         );
+        // A freshly latched fault is never pre-acked — the caller has not
+        // written `set_output(false)` yet, and `DisableOutput` must be
+        // emitted at least once.
+        debug_assert!(
+            !matches!(next, LatchState::Tripped { acked: true, .. }),
+            "latched into Tripped already acked"
+        );
+        // Pending is only entered from Active (the LVP/OTP step-back).
+        // Pending → Pending would silently rewrite the reason and lose
+        // why we were waiting.
+        debug_assert!(
+            !matches!(
+                (&self.latch, &next),
+                (LatchState::Pending { .. }, LatchState::Pending { .. })
+            ),
+            "Pending re-entered from Pending"
+        );
+
+        if let Some(t) = transition_between(&self.latch, &next) {
+            // Oldest-out when full: a caller that stopped draining is
+            // better served by the recent history than the stale head.
+            if self.transitions.is_full() {
+                self.transitions.pop_front();
+            }
+            self.transitions
+                .push_back(t)
+                .ok()
+                .expect("ring has a free slot after pop_front");
+        }
         self.latch = next;
     }
 

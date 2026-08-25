@@ -87,9 +87,9 @@ fn ok_tick(s: &mut ChargeSupervisor, battery: Option<BatterySample>, elapsed: Du
     // the whole point of the type outside the crate.
     if let Action::UpdateVoltage(ticket) = a {
         let echo = VoltageTicket {
-            phase: ticket.phase(),
-            target_v: ticket.target_v(),
-            cycle_output: ticket.cycle_output(),
+            phase: ticket.phase,
+            target_v: ticket.target_v,
+            cycle_output: ticket.cycle_output,
         };
         s.commit_voltage(ticket);
         return Action::UpdateVoltage(echo);
@@ -1130,7 +1130,7 @@ fn low_pack_resumes_absorb_after_bringup() {
     assert!(matches!(s.phase(), Phase::Float)); // not committed until V_SET write
     let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
     assert!(
-        matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v(), lfp_4s().absorb_v)),
+        matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v, lfp_4s().absorb_v)),
         "expected UpdateVoltage to absorb_v, got {a:?}",
     );
     assert!(matches!(s.phase(), Phase::Absorb));
@@ -1324,7 +1324,7 @@ fn update_voltage_retries_until_acked() {
     let Action::UpdateVoltage(t1) = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage");
     };
-    assert!(approx(t1.target_v(), profile.absorb_v));
+    assert!(approx(t1.target_v, profile.absorb_v));
     assert!(matches!(s.phase(), Phase::Float)); // not yet committed
     assert!(s.fault().is_none());
 
@@ -1334,7 +1334,7 @@ fn update_voltage_retries_until_acked() {
     let Action::UpdateVoltage(t2) = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage retry");
     };
-    assert!(approx(t2.target_v(), profile.absorb_v));
+    assert!(approx(t2.target_v, profile.absorb_v));
     assert!(matches!(s.phase(), Phase::Float));
     assert!(s.fault().is_none());
 
@@ -1353,9 +1353,9 @@ fn float_to_absorb_emits_step_up_no_output_cycle() {
     let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage");
     };
-    assert!(approx(ticket.target_v(), profile.absorb_v));
+    assert!(approx(ticket.target_v, profile.absorb_v));
     assert!(
-        !ticket.cycle_output(),
+        !ticket.cycle_output,
         "Float→Absorb is a step UP — must not cycle"
     );
 }
@@ -1382,9 +1382,9 @@ fn absorb_to_float_emits_step_down_with_output_cycle() {
     let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
         panic!("expected Absorb→Float UpdateVoltage after EXIT_DEBOUNCE");
     };
-    assert!(approx(ticket.target_v(), profile.float_v));
+    assert!(approx(ticket.target_v, profile.float_v));
     assert!(
-        ticket.cycle_output(),
+        ticket.cycle_output,
         "Absorb→Float is a step DOWN — caller must cycle output"
     );
 }
@@ -1482,7 +1482,7 @@ fn pending_does_not_enter_absorb_even_at_high_charge_current() {
     // (now Active) is the one that emits the transition.
     accept_enable(&mut s, a);
     let a = s.tick(expected_poll(&s, battery), TICK);
-    assert!(matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v(), profile.absorb_v)));
+    assert!(matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v, profile.absorb_v)));
 }
 
 #[test]
@@ -1565,7 +1565,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
         battery: drained,
     };
     let a = s.tick(p_active, TICK);
-    assert!(matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v(), profile.absorb_v)));
+    assert!(matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v, profile.absorb_v)));
 }
 
 #[test]
@@ -1731,7 +1731,7 @@ fn drive_to_absorb_to_float_pending(s: &mut ChargeSupervisor) -> VoltageTicket {
     let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
         panic!("expected Absorb→Float UpdateVoltage after EXIT_DEBOUNCE");
     };
-    assert!(ticket.cycle_output(), "Absorb→Float is a step DOWN");
+    assert!(ticket.cycle_output, "Absorb→Float is a step DOWN");
     ticket
 }
 
@@ -1741,7 +1741,7 @@ fn drive_to_float_to_absorb_pending(s: &mut ChargeSupervisor) -> VoltageTicket {
     let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
         panic!("expected Float→Absorb UpdateVoltage");
     };
-    assert!(!ticket.cycle_output(), "Float→Absorb is a step UP");
+    assert!(!ticket.cycle_output, "Float→Absorb is a step UP");
     ticket
 }
 
@@ -1810,7 +1810,7 @@ fn apply_step_down_step1_failure_does_not_write_voltage() {
     // Supervisor re-emits UpdateVoltage on next tick for retry.
     let p = expected_poll(&s, b(CV_V, -(lfp_4s().exit_absorb_a - 0.1)));
     assert!(
-        matches!(s.tick(p, TICK), Action::UpdateVoltage(ref t) if t.cycle_output())
+        matches!(s.tick(p, TICK), Action::UpdateVoltage(ref t) if t.cycle_output)
     );
 }
 
@@ -1899,4 +1899,92 @@ fn apply_step_up_failure_does_not_touch_output() {
     assert_eq!(xy.set_voltage_calls, vec![lfp_4s().absorb_v]);
     assert_eq!(errs, vec![XyError::SetVoltage]);
     assert!(matches!(s.phase(), Phase::Float));
+}
+
+// --- Latch transition log ---------------------------------------------------
+
+/// A poll where the buck reports `output` and everything else is drift-free.
+/// Built from `expected_setpoints` rather than `expected_poll` so it stays
+/// valid across the latch-state changes these tests drive.
+fn poll_with_output(s: &ChargeSupervisor, output: BuckOutput) -> PollResult {
+    PollResult {
+        output: Some(output),
+        setpoints: Some(s.expected_setpoints()),
+        battery: b(OK_V, -0.1),
+    }
+}
+
+#[test]
+fn transitions_record_the_route_not_just_the_destination() {
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    assert_eq!(s.pop_transition(), None, "nothing before the first tick");
+
+    // Bring-up at the CV plateau: full pack, parks in Float.
+    let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
+    accept_enable(&mut s, a);
+    assert_eq!(s.pop_transition(), Some(ChargeTransition::Energised));
+    assert_eq!(s.pop_transition(), None, "drained");
+
+    // Input rail sags: the buck self-disables on LVP and we step back to
+    // bring-up rather than latching.
+    let p_lvp = poll_with_output(&s, BuckOutput::Off {
+        cause: ProtectionStatus::Lvp,
+    });
+    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    assert_eq!(s.pop_transition(), Some(ChargeTransition::ProtectHold));
+
+    // Rail returns and the buck re-enables itself.
+    let p_on = poll_with_output(&s, BuckOutput::On);
+    assert!(matches!(s.tick(p_on, TICK), Action::None));
+    assert_eq!(s.pop_transition(), Some(ChargeTransition::ProtectCleared));
+
+    // A non-recoverable self-disable latches.
+    let p_ovp = poll_with_output(&s, BuckOutput::Off {
+        cause: ProtectionStatus::Ovp,
+    });
+    assert!(matches_disable(
+        &s.tick(p_ovp, TICK),
+        FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ovp)
+    ));
+    assert_eq!(s.pop_transition(), Some(ChargeTransition::Latched));
+    assert_eq!(s.pop_transition(), None);
+}
+
+#[test]
+fn phase_changes_are_not_latch_transitions() {
+    // Arming and committing `pending_voltage` both go through `set_latch`
+    // (Active → Active), but neither is a latch-state change and neither
+    // may reach the log — otherwise every Float↔Absorb swing would drown
+    // the transitions that matter.
+    let mut s = active(lfp_4s());
+    while s.pop_transition().is_some() {}
+    enter_absorb(&mut s);
+    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.pop_transition(), None);
+}
+
+#[test]
+fn transition_ring_drops_oldest_when_undrained() {
+    let mut s = active(lfp_4s());
+    while s.pop_transition().is_some() {}
+    let p_lvp = poll_with_output(&s, BuckOutput::Off {
+        cause: ProtectionStatus::Lvp,
+    });
+    let p_on = poll_with_output(&s, BuckOutput::On);
+
+    // 5 hold/clear cycles = 10 transitions into an 8-slot ring.
+    for _ in 0..5 {
+        s.tick(p_lvp, TICK);
+        s.tick(p_on, TICK);
+    }
+    let mut drained = Vec::new();
+    while let Some(t) = s.pop_transition() {
+        drained.push(t);
+    }
+    assert_eq!(drained.len(), TRANSITION_BUFFER);
+    // The first hold/clear pair fell out, so what remains starts on a
+    // hold and still alternates.
+    assert_eq!(drained[0], ChargeTransition::ProtectHold);
+    assert_eq!(drained[1], ChargeTransition::ProtectCleared);
+    assert_eq!(drained[TRANSITION_BUFFER - 1], ChargeTransition::ProtectCleared);
 }

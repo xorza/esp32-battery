@@ -465,6 +465,11 @@ fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: Ev
         let p = poll(&mut xy, &sensor_data, &recorder, &mut last_protection);
         let action = supervisor.tick(p, POLL_INTERVAL);
         apply_action(&mut xy, &mut supervisor, action, &recorder);
+        // The supervisor has no clock, so it buffers latch transitions and
+        // we timestamp them here.
+        while let Some(t) = supervisor.pop_transition() {
+            recorder.record(Event::Charge(t));
+        }
         // Publish supervisor state for /api + LCD. `active_phase()` is
         // only Some while regulating; Pending/Tripped surface as None
         // so dashboards distinguish "not yet charging" from a real phase.
@@ -596,11 +601,10 @@ fn apply_action<D: XyDevice>(
             let reason = ticket.reason();
             match xy.set_output(false) {
                 Ok(()) => {
+                    // The latch itself is already in the event log as
+                    // `ChargeTransition::Latched`, recorded when the
+                    // supervisor tripped rather than when the write landed.
                     error!("CHARGE FAULT ({reason}): PS output DISABLED");
-                    // Record once per latch episode: committing the ticket
-                    // leaves `Tripped { acked: true }`, so subsequent ticks
-                    // stop re-emitting DisableOutput for the same fault.
-                    recorder.record(Event::Xy(XyError::ChargeFaultLatched));
                     supervisor.commit_disable(ticket);
                 }
                 Err(e) => {
