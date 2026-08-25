@@ -94,7 +94,7 @@ pub struct ApiResponse<'a> {
     /// as a transient "PS offline" status; clears when the supply returns.
     pub ps_offline: bool,
     /// `"absorb"` / `"float"` while the supervisor is actively regulating,
-    /// `null` in Pending (still bringing up) or Tripped (latched off).
+    /// `null` while still bringing up, or once a fault has latched the buck off.
     pub phase: Option<&'static str>,
     /// Snake_case identifier of the latched fault, or `null` if none.
     /// Stable for dashboards to switch on; `fault_message` is the

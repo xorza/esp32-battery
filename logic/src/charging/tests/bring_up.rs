@@ -1,5 +1,5 @@
-//! `Pending`: what blocks energising, what merely inhibits, and what the
-//! first Active tick inherits.
+//! Bring-up: what blocks energising, what merely inhibits, and what the
+//! first sourcing tick inherits.
 
 use super::*;
 
@@ -34,13 +34,15 @@ fn low_pack_resumes_absorb_after_bringup() {
     let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
     let resume_absorb = accept_enable(&mut s, a);
     assert!(resume_absorb, "pack below CV plateau ⇒ must request Absorb");
-    assert_eq!(s.phase(), Phase::Float); // not committed until V_SET write
+    // The step up is armed, not taken: `ToAbsorb` still holds float_v, so a
+    // failed write leaves the drift check matching the live V_SET.
+    assert_eq!(s.state(), ChargeState::ToAbsorb);
     let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
     assert!(
         matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v, lfp_4s().absorb_v)),
         "expected UpdateVoltage to absorb_v, got {a:?}",
     );
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 }
 
 #[test]
@@ -53,7 +55,7 @@ fn full_pack_stays_float_after_bringup() {
     assert!(!accept_enable(&mut s, a), "full pack must not resume Absorb");
     let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
     assert!(matches!(a, Action::None), "expected None, got {a:?}");
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
 }
 
 #[test]
@@ -182,8 +184,9 @@ fn pending_does_not_enable_without_setpoint_readback() {
 
 #[test]
 fn buck_output_off_in_pending_does_not_fault() {
-    // In Pending the buck IS supposed to be off — output_on=Some(false)
-    // is normal, must not latch. expected_poll for Pending returns Off.
+    // At boot the buck IS supposed to be off — output_on=Some(false) is
+    // normal, must not latch. expected_poll returns Off for a bring-up
+    // state.
     let mut s = ChargeSupervisor::new(lfp_4s());
     let a = s.tick(expected_poll(&s, b(OK_V, -0.1)), TICK);
     assert!(matches!(a, Action::EnableOutput { .. }));
@@ -204,21 +207,21 @@ fn commit_enable_from_tripped_panics() {
 
 #[test]
 fn pending_does_not_enter_absorb_even_at_high_charge_current() {
-    // Defensive: in Pending the buck is OFF, so any "charging current"
-    // sample is meaningless (no current is actually flowing). The phase
-    // machine MUST NOT advance on it — only `EnableOutput` may be emitted,
-    // and after the caller acks we transition to Active still in Float.
+    // Defensive: in a bring-up state the buck is OFF, so any "charging
+    // current" sample is meaningless (no current is actually flowing). The
+    // phase machine MUST NOT advance on it — only `EnableOutput` may be
+    // emitted, and after the caller acks we land in Float.
     let profile = lfp_4s();
     let mut s = ChargeSupervisor::new(profile);
     // Sample reports current well above enter_absorb_a (3 A). If the phase
-    // machine ran in Pending it would emit UpdateVoltage(absorb_v).
+    // machine ran during bring-up it would emit UpdateVoltage(absorb_v).
     let high_current = -10.0;
     let battery = b(profile.float_v, high_current);
     let a = s.tick(expected_poll(&s, battery), TICK);
-    assert_eq!(s.phase(), Phase::Float);
-    // After the commit, supervisor goes Active still in Float — the first
-    // real tick then runs the phase machine. Verify the very next tick
-    // (now Active) is the one that emits the transition.
+    assert_eq!(s.state(), ChargeState::Boot);
+    // After the commit, the supervisor lands in Float — the first real
+    // tick then runs the phase machine. Verify that tick is the one which
+    // emits the transition.
     accept_enable(&mut s, a);
     let a = s.tick(expected_poll(&s, battery), TICK);
     assert!(matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v, profile.absorb_v)));

@@ -7,6 +7,28 @@ use crate::charging::{
 };
 use xy_modbus::SafetyLimits;
 
+/// XY7025 register write ceilings, mirrored from `xy_modbus`'s private
+/// `input_spec` table.
+///
+/// The driver rejects an out-of-range write before it reaches the bus. At
+/// boot that means `boot_sequence` fails on every retry and
+/// `boot_with_retries` reboots straight back into the same failure — the
+/// buck never energises and, on a UPS, the load runs the pack flat. The
+/// asserts below turn a pack this hardware cannot charge into a build
+/// error instead: `for_pack` and `safety_limits` are `const fn`, and the
+/// firmware's `PACK_PROFILE` / `SAFETY` are `const`, so the check runs at
+/// compile time for the pack actually shipped.
+///
+/// Mirrored rather than imported because xy-modbus keeps the table
+/// private. `ModelCheck::limits_match` is the runtime counterpart — it
+/// says whether the connected device's own ceilings are the XY7025's.
+const V_SET_CEILING: f32 = 70.0;
+const I_SET_CEILING: f32 = 25.0;
+const OVP_CEILING: f32 = 72.0;
+const OCP_CEILING: f32 = 27.0;
+const LVP_FLOOR: f32 = 10.0;
+const LVP_CEILING: f32 = 95.0;
+
 #[derive(Copy, Clone, Debug)]
 pub struct Profile {
     pub chemistry: Chemistry,
@@ -32,13 +54,25 @@ impl Profile {
         assert!(capacity_ah > 0.0);
         let v = chemistry.charge_voltages();
         let s = cells as f32;
+        let absorb_v = v.absorb_v * s;
+        let regulation_a = capacity_ah * REGULATION_C;
+        // absorb_v is the higher of the two targets, so it alone bounds V_SET.
+        assert!(
+            absorb_v <= V_SET_CEILING,
+            "absorb target exceeds the buck's V_SET ceiling — too many cells in series"
+        );
+        assert!(
+            regulation_a <= I_SET_CEILING,
+            "charge current exceeds the buck's I_SET ceiling — pack capacity is too large \
+             for this hardware at REGULATION_C"
+        );
         Self {
             chemistry,
             cells,
             capacity_ah,
-            absorb_v: v.absorb_v * s,
+            absorb_v,
             float_v: v.float_v * s,
-            regulation_a: capacity_ah * REGULATION_C,
+            regulation_a,
             enter_absorb_a: capacity_ah * ENTER_ABSORB_C,
             exit_absorb_a: capacity_ah * EXIT_ABSORB_C,
         }
@@ -58,10 +92,28 @@ impl Profile {
     /// over the CC setpoint. LVP on the XY7025 is **input** UVLO, not a
     /// pack-side cutoff — it's tied to the supply rail, not the profile.
     pub const fn safety_limits(&self, input_nominal_v: f32) -> SafetyLimits {
+        let ovp_v = self.absorb_v + HARDWARE_OVP_MARGIN_V;
+        let ocp_a = self.regulation_a * 1.5;
+        let lvp_v = input_nominal_v - INPUT_LVP_MARGIN_V;
+        // OCP binds before I_SET does: at 1.5× the CC setpoint it reaches its
+        // 27 A ceiling while regulation_a is still only 18 A.
+        assert!(
+            ocp_a <= OCP_CEILING,
+            "derived OCP exceeds the buck's ceiling — pack capacity is too large for \
+             this hardware at REGULATION_C × 1.5"
+        );
+        assert!(
+            ovp_v <= OVP_CEILING,
+            "derived OVP exceeds the buck's ceiling — too many cells in series"
+        );
+        assert!(
+            lvp_v >= LVP_FLOOR && lvp_v <= LVP_CEILING,
+            "derived input UVLO is outside the buck's LVP range"
+        );
         SafetyLimits {
-            ovp_v: self.absorb_v + HARDWARE_OVP_MARGIN_V,
-            ocp_a: self.regulation_a * 1.5,
-            lvp_v: input_nominal_v - INPUT_LVP_MARGIN_V,
+            ovp_v,
+            ocp_a,
+            lvp_v,
         }
     }
 }

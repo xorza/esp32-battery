@@ -18,7 +18,7 @@ fn self_clearing_protection_drops_to_pending_without_latching() {
         let a = s.tick(poll_with_output(&s, BuckOutput::Off { cause }), TICK);
         assert!(matches!(a, Action::None), "{cause}");
         assert_eq!(s.fault(), None, "{cause}");
-        assert!(s.is_pending(), "{cause}");
+        assert!(s.state().bringing_up(), "{cause}");
     }
 }
 
@@ -32,36 +32,36 @@ fn self_clearing_protection_accepts_buck_auto_re_enable() {
     for cause in SELF_CLEARING {
         let mut s = active(lfp_4s());
         s.tick(poll_with_output(&s, BuckOutput::Off { cause }), TICK);
-        assert!(s.is_pending(), "{cause}");
+        assert!(s.state().bringing_up(), "{cause}");
 
         let a = s.tick(poll_with_output(&s, BuckOutput::On), TICK);
         assert!(matches!(a, Action::None), "{cause}");
         assert_eq!(s.fault(), None, "{cause}");
-        assert!(s.is_active(), "{cause}");
+        assert!(s.state().sourcing(), "{cause}");
     }
 }
 
 #[test]
 fn pending_waits_for_lvp_to_clear_before_enable() {
-    // While LVP persists, the Pending bring-up must NOT emit EnableOutput
+    // While LVP persists, the hold must NOT emit EnableOutput
     // — writing set_output(true) into a buck in input UVLO would just
     // flap. Once LVP clears (buck reports Off with no cause), the
-    // normal Pending → Active path emits EnableOutput.
+    // normal bring-up path emits EnableOutput.
     let mut s = active(lfp_4s());
     let p_lvp = poll_with_output(&s, BuckOutput::Off { cause: ProtectionStatus::Lvp });
-    // Drop Active → Pending via LVP.
+    // Drop out of Float into HoldFloat via LVP.
     assert!(matches!(s.tick(p_lvp, TICK), Action::None));
-    // Many ticks of sustained LVP: stays Pending, no actions, no fault.
+    // Many ticks of sustained LVP: stays in the hold, no actions, no fault.
     for _ in 0..120 {
         assert!(matches!(s.tick(p_lvp, TICK), Action::None));
     }
     assert_eq!(s.fault(), None);
-    // LVP clears: buck back to Off with no protection cause. Pending
-    // bring-up energises on the next tick.
+    // LVP clears: buck back to Off with no protection cause. Bring-up
+    // energises on the next tick.
     let p_clear = expected_poll(&s, b(OK_V, -0.1));
     let a = s.tick(p_clear, TICK);
     accept_enable(&mut s, a);
-    assert!(s.is_active());
+    assert!(s.state().sourcing());
 }
 
 #[test]
@@ -83,8 +83,8 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
     // Drained pack ⇒ the ticket carries resume_absorb = true.
     let a = s.tick(p_clear, TICK);
     assert!(accept_enable(&mut s, a));
-    // The commit resumed Absorb via pending_voltage, so the next Active
-    // tick steps V_SET float_v → absorb_v.
+    // The commit landed in ToAbsorb, so the next tick steps V_SET
+    // float_v → absorb_v.
     let p_active = PollResult {
         output: Some(BuckOutput::On),
         setpoints: Some(s.expected_setpoints()),
@@ -110,19 +110,19 @@ fn pending_at_boot_with_lvp_waits() {
         assert!(matches!(s.tick(p_lvp, TICK), Action::None));
     }
     assert_eq!(s.fault(), None);
-    assert!(s.is_pending());
+    assert!(s.state().bringing_up());
 }
 
 #[test]
 fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
-    // Long input outage while charging: the buck drops on LVP with the
-    // supervisor in Absorb, the pack drains below the CV plateau, and the
-    // rail returns. Bring-up wants Absorb — which is already the phase, and
-    // already the live V_SET — so there is nothing to write.
+    // Long input outage while charging: the buck drops on LVP out of
+    // Absorb, the pack drains below the CV plateau, and the rail returns.
+    // Bring-up wants Absorb — which `HoldAbsorb` is already holding as the
+    // live V_SET — so there is nothing to write.
     let profile = lfp_4s();
     let mut s = active(profile);
     enter_absorb(&mut s);
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 
     let p_lvp = poll_with_output(&s, BuckOutput::Off {
         cause: ProtectionStatus::Lvp,
@@ -153,7 +153,7 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
         !matches!(a, Action::UpdateVoltage(_)),
         "no-op voltage write emitted: {a:?}"
     );
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
     assert_approx(s.expected_setpoints().v_set, profile.absorb_v);
 }
 

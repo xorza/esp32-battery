@@ -118,6 +118,42 @@ fn zero_capacity_panics() {
 }
 
 #[test]
+fn largest_pack_the_buck_can_charge() {
+    // OCP is the binding ceiling, not I_SET: 27 A / (0.2 C × 1.5) = 90 Ah
+    // exactly, while I_SET's 25 A ceiling would allow 125 Ah. Both hand
+    // figures are pinned here so the next test's rejection is known to land
+    // one step past the real edge rather than somewhere short of it.
+    let p = Profile::for_pack(Chemistry::LiFePo4, 4, 90.0);
+    assert_approx(p.regulation_a, 18.0);
+    let s = p.safety_limits(INPUT_NOMINAL_V);
+    assert_approx(s.ocp_a, 27.0);
+}
+
+#[test]
+#[should_panic(expected = "derived OCP exceeds")]
+fn oversized_pack_rejected_by_derived_ocp() {
+    // 100 Ah → 20 A CC → 30 A OCP. The buck rejects the register write, and
+    // an unguarded profile turns that into a boot loop with the buck dark.
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 100.0).safety_limits(INPUT_NOMINAL_V);
+}
+
+#[test]
+#[should_panic(expected = "I_SET ceiling")]
+fn oversized_pack_rejected_by_charge_current() {
+    // 0.2 × 130 = 26 A, past the 25 A I_SET ceiling — caught in `for_pack`
+    // itself, before any safety limit is derived.
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 130.0);
+}
+
+#[test]
+#[should_panic(expected = "V_SET ceiling")]
+fn too_many_cells_rejected_by_v_set_ceiling() {
+    // 3.60 × 20 = 72 V, past the 70 V V_SET ceiling. 19S (68.4 V) is the
+    // most series cells this buck can take on LFP.
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 20, 50.0);
+}
+
+#[test]
 #[should_panic]
 fn new_rejects_absorb_not_above_float() {
     // The phase machine assumes absorb_v > float_v (Float→Absorb is "raise

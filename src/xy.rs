@@ -76,8 +76,8 @@ enum BootError {
     },
     /// OUTPUT_EN read back as 1 after we wrote 0 + S_INI=0. Either the
     /// disable didn't stick or the front panel re-enabled it. Refuse to
-    /// hand off to the supervisor — we'd be entering Pending with the
-    /// buck already sourcing.
+    /// hand off to the supervisor — we'd be entering its `Boot` state
+    /// with the buck already sourcing.
     OutputOn,
     /// Device's MODEL register reports a code whose register scales are
     /// not the ones xy-modbus decodes with. Readings (especially I-OUT)
@@ -405,7 +405,7 @@ const _: () = assert!(task_wdt::WDT_TIMEOUT.as_secs() > POLL_INTERVAL.as_secs() 
 /// Try `boot_sequence` up to `BOOT_RETRY_COUNT` times. On total failure,
 /// best-effort disable output and reboot the MCU — the alternative is
 /// falling through to a supervisor that immediately latches
-/// `ModbusUnhealthy` and stays Tripped forever. A reboot might clear
+/// `ModbusUnhealthy` and stays latched forever. A reboot might clear
 /// transient causes (XY7025 still powering up, UART state, ESP IDF
 /// driver wedged), and S_INI=OFF means the buck comes back disabled
 /// even if our set_output call below failed.
@@ -469,13 +469,14 @@ fn run<D: XyDevice>(
         }
         // One publish per tick, covering this cycle's buck reading and the
         // supervisor state derived from it — so /api and the LCD always see
-        // a coherent pair rather than a half-updated one. `active_phase()`
-        // is only Some while regulating; Pending/Tripped surface as None so
-        // dashboards distinguish "not yet charging" from a real phase.
+        // a coherent pair rather than a half-updated one. `phase()` is only
+        // Some while the buck is sourcing; bring-up and latched states
+        // surface as None so dashboards distinguish "not yet charging"
+        // from a real phase.
         {
             let mut status = charge_status.lock().unwrap();
             status.ps_offline = outcome.ps_offline;
-            status.phase = supervisor.active_phase();
+            status.phase = supervisor.phase();
             status.fault = supervisor.fault();
             status.inhibit = supervisor.inhibit();
         }
@@ -621,11 +622,11 @@ fn apply_action<D: XyDevice>(
             );
             match xy.set_output(true) {
                 // Dropping the ticket instead is what makes a failed
-                // write a retry: the supervisor stays Pending and
+                // write a retry: the supervisor stays in bring-up and
                 // re-emits EnableOutput next tick.
                 Ok(()) => supervisor.commit_enable(ticket),
                 Err(e) => {
-                    warn!("XY set_output(true): {e} — supervisor stays Pending, will retry");
+                    warn!("XY set_output(true): {e} — supervisor stays in bring-up, will retry");
                     recorder.record(Event::Xy(XyError::SetOutput));
                 }
             }

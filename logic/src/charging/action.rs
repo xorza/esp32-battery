@@ -27,7 +27,8 @@ impl EnableTicket {
 /// Proof that this tick asked for a V_SET change, and the key to
 /// [`ChargeSupervisor::commit_voltage`]. Carries the phase being moved
 /// to, so [`apply_update_voltage`] can name it in logs without reaching
-/// back into the supervisor.
+/// back into the supervisor, and so the commit can check the ticket
+/// against the retarget actually outstanding.
 #[derive(Debug)]
 pub struct VoltageTicket {
     /// Phase this write transitions into once committed.
@@ -59,15 +60,14 @@ impl DisableTicket {
 }
 /// What the poll loop should do this tick.
 ///
-/// The supervisor boots in a `Pending` latch state — output is OFF and we
-/// haven't decided it's safe to enable yet. Each tick re-runs the same
-/// safety checks as the active path; once all clear, the supervisor emits
-/// `EnableOutput` and stays Pending until the caller commits the ticket.
-/// After that it transitions to active operation: phase machine + drift +
-/// fault paths. After a fault latches, only `DisableOutput` is ever
-/// emitted until the disable is committed; the supervisor then sits in
-/// `Action::None` indefinitely (reboot-only recovery — transient
-/// protection causes LVP/OTP are handled in-place without latching).
+/// The supervisor boots output-OFF, having not yet decided it is safe to
+/// enable. Each tick re-runs the same safety checks as the sourcing path;
+/// once all clear it emits `EnableOutput` and stays where it is until the
+/// caller commits the ticket. After that the phase machine, drift check
+/// and fault paths run. After a fault latches, only `DisableOutput` is
+/// ever emitted until the disable is committed; the supervisor then sits
+/// in `Action::None` indefinitely (reboot-only recovery — transient
+/// protection causes LVP/OTP are waited out in a hold without latching).
 ///
 /// Every non-`None` variant carries a ticket. Perform the write, then
 /// commit the ticket only if the write succeeded: dropping it instead is

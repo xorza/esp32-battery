@@ -5,6 +5,7 @@ use super::*;
 
 use crate::battery::Chemistry;
 use crate::charging::action::{Action, DisableTicket, EnableTicket, VoltageTicket};
+use crate::charging::charge_state::ChargeState;
 use crate::charging::charge_supervisor::{ChargeSupervisor, internals::SupervisorInternals};
 use crate::charging::fault_reason::FaultReason;
 use crate::charging::inhibit_reason::InhibitReason;
@@ -81,22 +82,22 @@ fn accept_enable(s: &mut ChargeSupervisor, a: Action) -> bool {
     resume_absorb
 }
 
-/// Drift-free PollResult matching the supervisor's expected state. Active
-/// → output ON; Pending or Tripped → output OFF (no protection cause).
-/// Tests that need to perturb one field use spread syntax:
-/// `PollResult { output: Some(BuckOutput::On), ..expected_poll(&s, ...) }`.
+/// Drift-free PollResult matching the supervisor's expected state.
+/// Sourcing → output ON; bringing up or latched → output OFF (no
+/// protection cause). Tests that need to perturb one field use spread
+/// syntax: `PollResult { output: Some(BuckOutput::On), ..expected_poll(&s, ...) }`.
 fn expected_poll(s: &ChargeSupervisor, battery: Option<BatterySample>) -> PollResult {
     PollResult {
-        setpoints: Some(s.expected_setpoints()),
+        setpoints: Some(s.readback_setpoints()),
         output: Some(expected_output(s)),
         battery,
     }
 }
 
 /// The `OUTPUT_EN` a healthy buck reports for the supervisor's current
-/// latch state: on while regulating, off otherwise.
+/// state: on while sourcing, off otherwise.
 fn expected_output(s: &ChargeSupervisor) -> BuckOutput {
-    if s.is_active() {
+    if s.state().sourcing() {
         BuckOutput::On
     } else {
         BuckOutput::Off {
@@ -149,9 +150,9 @@ fn fail_tick(
     )
 }
 
-/// Build a supervisor and drive it through Pending → Active. Tests that
+/// Build a supervisor and drive it from `Boot` into `Float`. Tests that
 /// don't care about the bring-up dance use this; tests that exercise
-/// Pending behavior call `ChargeSupervisor::new` directly.
+/// bring-up call `ChargeSupervisor::new` directly.
 fn active(profile: Profile) -> ChargeSupervisor {
     // Bring up at the CV plateau (`absorb_v`, still under the OV trip) so
     // the pack reads as full and the supervisor lands in Float — the
@@ -161,7 +162,7 @@ fn active(profile: Profile) -> ChargeSupervisor {
     let mut s = ChargeSupervisor::new(profile);
     let a = ok_tick(&mut s, b(bring_up_v, -0.1), TICK);
     assert!(!accept_enable(&mut s, a), "full pack must not resume Absorb");
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
     s
 }
 
@@ -172,12 +173,12 @@ fn enter_absorb(s: &mut ChargeSupervisor) {
         ok_tick(s, b(OK_V, -4.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 }
 
 /// A poll where the buck reports `output` and everything else is drift-free.
 /// Built from `expected_setpoints` rather than `expected_poll` so it stays
-/// valid across the latch-state changes these tests drive.
+/// valid across the state changes these tests drive.
 fn poll_with_output(s: &ChargeSupervisor, output: BuckOutput) -> PollResult {
     PollResult {
         output: Some(output),

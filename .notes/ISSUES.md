@@ -1,24 +1,16 @@
 # Open issues
 
-- `Profile::for_pack` scales `regulation_a` from capacity and
-  `Profile::safety_limits` scales `ocp_a` from that, with no ceiling against
-  the XY7025's accepted register ranges (I_SET 25 A, OCP 27 A, V_SET 70 V,
-  OVP 72 V). Above ~90 Ah of pack capacity `boot_sequence`'s
-  `set_safety_limits` returns `OutOfRange`, and `boot_with_retries` turns that
-  into a permanent reboot loop with the buck never energised.
-
-- `LatchState::Tripped { acked: true }` returns `Action::None` on every
-  subsequent tick. If the buck's output comes back on after a latch
-  (front-panel toggle, a device-side re-enable), the supervisor never notices
-  and never re-disables.
+- `ChargeState::Latched` returns `Action::None` on every subsequent tick. If
+  the buck's output comes back on after a latch (front-panel toggle, a
+  device-side re-enable), the supervisor never notices and never re-disables.
 
 - `MAX_ABSORB` is clocked with `Debounce::step`, so any tick where the pack
   leaves the `ABSORB_CV_BAND_V` window zeroes the accumulator. A load that
   periodically pulls the buck out of CV keeps the absorb cap from firing.
   There is no cap on total time in Absorb, and none at all on the CC ramp.
 
-- Protection holds are unbounded: `Verdict::EnterProtectRecovery` and
-  `Verdict::ResumeRegulating` can alternate indefinitely. An input rail that
+- Protection holds are unbounded: `Verdict::SelfDisabled` and
+  `Verdict::SelfEnabled` can alternate indefinitely. An input rail that
   sags under charge current gives a repeating LVP hold/resume loop with no
   flap limit and no back-off on `regulation_a`.
 
@@ -32,9 +24,9 @@
   derivation. A load surge trips device OCP, which latches
   `OutputUnexpectedlyOff` and drops the load onto the pack until a reboot.
 
-- `Verdict::ResumeRegulating` is returned from check 2 of `safety_verdict`,
+- `Verdict::SelfEnabled` is returned from check 2 of `safety_verdict`,
   ahead of the modbus-health, battery-freshness and overvoltage checks, so the
-  supervisor re-enters `Active` for one tick without those having run.
+  supervisor resumes sourcing for one tick without those having run.
 
 - No pack temperature reaches the supervisor. Charging below 0 °C is not
   inhibited for any chemistry. The buck's OTP covers its own die only.

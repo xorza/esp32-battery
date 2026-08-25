@@ -32,14 +32,15 @@ pub enum FaultReason {
     /// caller already verified the read itself succeeded, so this isn't
     /// a transport glitch.
     SettingsDrift,
-    /// Buck's OUTPUT_EN register read 0 while the supervisor was Active.
+    /// Buck's OUTPUT_EN register read 0 while the supervisor was sourcing.
     /// The buck self-disabled — its own hardware OVP / OCP / over-temp
     /// tripped, or someone toggled the front panel (in which case PROTECT
     /// reads `Normal`). LVP/OTP are intercepted earlier and don't reach
     /// here. Payload is the cause from PROTECT (0x0010).
     OutputUnexpectedlyOff(ProtectionStatus),
-    /// Buck's OUTPUT_EN register read 1 while the supervisor was Pending —
-    /// output is supposed to be off until the supervisor itself enables it.
+    /// Buck's OUTPUT_EN register read 1 at cold boot — output is supposed
+    /// to be off until the supervisor itself enables it. A hold reading the
+    /// same thing is the recovery it is waiting for, not this.
     /// Means the boot disable / S_INI=0 didn't stick or the front panel
     /// toggled it on. We don't know what setpoints regulation is using;
     /// fail closed and reboot.

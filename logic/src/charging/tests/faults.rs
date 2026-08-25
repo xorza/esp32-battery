@@ -11,9 +11,9 @@ fn accept_disable(s: &mut ChargeSupervisor, a: Action) {
     s.commit_disable(ticket);
 }
 
-/// Drive `s` from Active into `Tripped(OutputUnexpectedlyOff(cause), acked: true)`.
-/// Cause must be non-recoverable (i.e. not Lvp/Otp, which are handled
-/// in-place and never latch).
+/// Drive `s` from a sourcing state into `Latched`, on
+/// `OutputUnexpectedlyOff(cause)`. Cause must be non-recoverable (i.e. not
+/// Lvp/Otp, which are waited out in a hold and never latch).
 fn latch_self_disable(s: &mut ChargeSupervisor, cause: ProtectionStatus) {
     let p = poll_with_output(s, BuckOutput::Off { cause });
     let a = s.tick(p, TICK);
@@ -68,7 +68,7 @@ fn nan_or_inf_in_sample_treated_as_missing() {
         assert!(matches!(ok_tick(&mut s, b(OK_V, v), TICK), Action::None));
         assert!(matches!(ok_tick(&mut s, b(v, -1.0), TICK), Action::None));
     }
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
     assert_eq!(s.fault(), None);
 }
 
@@ -242,7 +242,7 @@ fn latch_keeps_emitting_disable_until_acked() {
 }
 
 #[test]
-fn latched_supervisor_does_not_change_phase() {
+fn latched_supervisor_ignores_the_phase_machine() {
     let mut s = active(lfp_4s());
     for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
         fail_tick(&mut s, b(13.5, -0.1), TICK);
@@ -251,7 +251,7 @@ fn latched_supervisor_does_not_change_phase() {
     accept_disable(&mut s, a);
     // Heavy charging current would normally drive Float→Absorb.
     ok_tick(&mut s, b(13.5, -5.0), TICK);
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Latched);
 }
 
 #[test]
@@ -367,7 +367,7 @@ fn latched_fault_stays_parked_in_none() {
 
 #[test]
 fn buck_output_on_in_pending_latches() {
-    // Pending expects the buck OFF — boot_sequence wrote set_output(false)
+    // Boot expects the buck OFF — boot_sequence wrote set_output(false)
     // and S_INI=0. If OUTPUT_EN reads ON anyway, regulation is happening
     // under unknown conditions; latch immediately, no debounce.
     let mut s = ChargeSupervisor::new(lfp_4s());

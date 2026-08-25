@@ -53,34 +53,36 @@ fn update_voltage_retries_until_acked() {
     // failed), the next tick must re-emit UpdateVoltage with the same
     // target — and the drift check must NOT latch SettingsDrift, since
     // V_SET on the buck is still the old (Float) value matching the
-    // supervisor's still-Float `target_voltage`.
+    // target the supervisor is still holding.
     let profile = lfp_4s();
     let mut s = active(profile);
-    // expected_poll uses s.expected_setpoints(), which reflects the
-    // *current* phase (Float) — exactly the still-on-the-buck values
-    // the failed write would leave behind.
+    // expected_poll echoes the target the supervisor is holding (Float) —
+    // exactly the still-on-the-buck values a failed write would leave
+    // behind.
     let p = expected_poll(&s, b(OK_V, -4.0));
 
     let Action::UpdateVoltage(t1) = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage");
     };
     assert_approx(t1.target_v, profile.absorb_v);
-    assert_eq!(s.phase(), Phase::Float); // not yet committed
+    // `ToAbsorb` says both halves of the retry contract at once: a step to
+    // absorb is outstanding, and the device is still holding float_v.
+    assert_eq!(s.state(), ChargeState::ToAbsorb);
     assert_eq!(s.fault(), None);
 
     // No ack — second tick re-emits UpdateVoltage, same target. No
-    // SettingsDrift even though setpoints (Float) lag the pending phase
-    // (Absorb), because expected_setpoints still uses the old phase.
+    // SettingsDrift even though the setpoints (Float) lag the retarget
+    // (Absorb), because `ToAbsorb` still expects the old target.
     let Action::UpdateVoltage(t2) = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage retry");
     };
     assert_approx(t2.target_v, profile.absorb_v);
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::ToAbsorb);
     assert_eq!(s.fault(), None);
 
-    // Now commit — phase commits, debouncers reset, normal operation.
+    // Now commit — the retarget lands, debouncers reset, normal operation.
     s.commit_voltage(t2);
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 }
 
 #[test]
@@ -188,7 +190,7 @@ fn apply_step_up_happy_path() {
         "step-up must not touch output"
     );
     assert!(errs.is_empty());
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 }
 
 #[test]
@@ -204,7 +206,7 @@ fn apply_step_down_happy_path() {
     );
     assert_eq!(xy.set_voltage_calls, vec![lfp_4s().float_v]);
     assert!(errs.is_empty());
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
 }
 
 #[test]
@@ -219,8 +221,9 @@ fn apply_step_down_step1_failure_does_not_write_voltage() {
     assert_eq!(xy.set_output_calls, vec![false]);
     assert!(xy.set_voltage_calls.is_empty());
     assert_eq!(errs, vec![XyError::SetOutput]);
-    // Outcome was Retry, so the ticket went uncommitted.
-    assert_eq!(s.phase(), Phase::Absorb);
+    // Outcome was Retry, so the ticket went uncommitted: still holding
+    // absorb_v with the step down outstanding.
+    assert_eq!(s.state(), ChargeState::ToFloat);
     // Supervisor re-emits UpdateVoltage on next tick for retry.
     let p = expected_poll(&s, b(CV_V, -(lfp_4s().exit_absorb_a - 0.1)));
     assert!(
@@ -244,7 +247,7 @@ fn apply_step_down_step2_failure_restores_output() {
     );
     assert_eq!(xy.set_voltage_calls, vec![lfp_4s().float_v]);
     assert_eq!(errs, vec![XyError::SetVoltage]);
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::ToFloat);
 }
 
 #[test]
@@ -260,7 +263,7 @@ fn apply_step_down_step2_then_restore_both_fail_records_both() {
     let errs = apply_ticket(&mut s, &mut xy, ticket);
     assert_eq!(xy.set_output_calls, vec![false, true]);
     assert_eq!(errs, vec![XyError::SetVoltage, XyError::SetOutput]);
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::ToFloat);
 }
 
 #[test]
@@ -277,9 +280,9 @@ fn apply_step_down_step3_failure_retries_once_then_records() {
     assert_eq!(xy.set_output_calls, vec![false, true, true]);
     assert_eq!(xy.set_voltage_calls, vec![lfp_4s().float_v]);
     assert_eq!(errs, vec![XyError::SetOutput]);
-    // V_SET landed, so the outcome is Committed and the phase moves even
-    // though the buck is now dark — the next tick latches for that.
-    assert_eq!(s.phase(), Phase::Float);
+    // V_SET landed, so the outcome is Committed and the retarget lands
+    // even though the buck is now dark — the next tick latches for that.
+    assert_eq!(s.state(), ChargeState::Float);
 }
 
 #[test]
@@ -294,7 +297,7 @@ fn apply_step_down_step3_first_attempt_recovers_on_retry() {
     let errs = apply_ticket(&mut s, &mut xy, ticket);
     assert_eq!(xy.set_output_calls, vec![false, true, true]);
     assert!(errs.is_empty(), "transient single failure must not record");
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
 }
 
 #[test]
@@ -312,5 +315,5 @@ fn apply_step_up_failure_does_not_touch_output() {
     );
     assert_eq!(xy.set_voltage_calls, vec![lfp_4s().absorb_v]);
     assert_eq!(errs, vec![XyError::SetVoltage]);
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::ToAbsorb);
 }

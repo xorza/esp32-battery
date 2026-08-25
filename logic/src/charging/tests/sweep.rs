@@ -38,7 +38,7 @@ fn random_poll(rng: &mut Rng, s: &ChargeSupervisor) -> PollResult {
             v_set: 12.0,
             i_set: profile.regulation_a,
         }),
-        _ => Some(s.expected_setpoints()),
+        _ => Some(s.readback_setpoints()),
     };
     let battery = match rng.below(1000) {
         0..=19 => None,
@@ -110,12 +110,21 @@ fn invariants_hold_under_randomized_input() {
             let a = s.tick(p, TICK);
 
             // The drift check compares against the last *committed* target,
-            // which is the invariant SettingsDrift exists to police.
-            assert!(
-                approx(s.expected_setpoints().v_set, committed_v),
-                "seed {seed} tick {tick}: expected V_SET {} != committed {committed_v}",
-                s.expected_setpoints().v_set
-            );
+            // which is the invariant SettingsDrift exists to police. Once
+            // latched the supervisor stops comparing and keeps no
+            // expectation at all — and that it happens only there is the
+            // invariant worth asserting in its place.
+            match s.state().setpoint_phase() {
+                Some(_) => assert!(
+                    approx(s.expected_setpoints().v_set, committed_v),
+                    "seed {seed} tick {tick}: expected V_SET {} != committed {committed_v}",
+                    s.expected_setpoints().v_set
+                ),
+                None => assert!(
+                    latched || matches!(a, Action::DisableOutput(_)),
+                    "seed {seed} tick {tick}: setpoint expectation dropped without a latch"
+                ),
+            }
 
             // A latched fault is terminal and supersedes any inhibit.
             assert!(

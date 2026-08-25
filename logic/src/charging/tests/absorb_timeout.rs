@@ -34,7 +34,7 @@ fn float_does_not_accumulate_absorb_ticks() {
     for _ in 0..(MAX_ABSORB.as_secs() + 10) {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -0.1), TICK), Action::None));
     }
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
 }
 
 #[test]
@@ -55,7 +55,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
         ok_tick(&mut s, b(OK_V, -0.1), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
 
     // Re-enter Absorb and burn the original margin's worth of ticks.
     // No fault yet — counter started over.
@@ -78,7 +78,7 @@ fn cc_ramp_below_absorb_v_does_not_arm_timeout() {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
     }
     assert_eq!(s.fault(), None);
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 }
 
 #[test]

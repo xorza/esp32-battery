@@ -8,7 +8,10 @@ use super::*;
 #[test]
 fn starts_in_float_at_float_voltage() {
     let s = ChargeSupervisor::new(lfp_4s());
-    assert_eq!(s.phase(), Phase::Float);
+    // Boot is an output-off state, but it holds the float target that
+    // `boot_sequence` wrote — which is what the drift check compares
+    // against from the very first tick.
+    assert_eq!(s.state(), ChargeState::Boot);
     assert_approx(s.target_voltage(), 13.5);
 }
 
@@ -20,7 +23,7 @@ fn enters_absorb_when_charging_current_exceeds_threshold() {
         ok_tick(&mut s, b(OK_V, -4.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
     assert_approx(s.target_voltage(), 14.4);
 }
 
@@ -29,7 +32,7 @@ fn does_not_enter_absorb_at_exact_threshold() {
     // Strictly greater: 3.0 A must NOT trigger; 3.001 A must.
     let mut s = active(lfp_4s());
     assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -3.001), TICK),
         Action::UpdateVoltage { .. }
@@ -41,7 +44,7 @@ fn discharge_current_does_not_enter_absorb() {
     // 5 A discharge (positive). |I| > 3 A but it's NOT charging.
     let mut s = active(lfp_4s());
     assert!(matches!(ok_tick(&mut s, b(OK_V, 5.0), TICK), Action::None));
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
 }
 
 #[test]
@@ -53,7 +56,7 @@ fn stays_in_absorb_above_exit_threshold() {
     assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     // Strictly less-than, so 2.5 stays.
     assert!(matches!(ok_tick(&mut s, b(OK_V, -2.5), TICK), Action::None));
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 }
 
 #[test]
@@ -69,7 +72,7 @@ fn exits_absorb_when_taper_drops_below_threshold() {
         ok_tick(&mut s, b(OK_V, -2.4), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
     assert_approx(s.target_voltage(), 13.5);
 }
 
@@ -106,7 +109,7 @@ fn sustained_recharge_drains_exit_gate() {
     for _ in 0..EXIT_DEBOUNCE.as_secs() {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -4.0), TICK), Action::None));
     }
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
     // A fresh full window below tail is now required to exit.
     for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
@@ -115,7 +118,7 @@ fn sustained_recharge_drains_exit_gate() {
         ok_tick(&mut s, b(OK_V, -2.4), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
 }
 
 #[test]
@@ -148,7 +151,7 @@ fn pulsing_current_still_exits_absorb() {
     // fast that the spikes were being ignored entirely.
     let cycle = exited_at.expect("pulsing pack never exited Absorb");
     assert!((25..40).contains(&cycle), "exited after {cycle} cycles");
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
     assert_approx(s.target_voltage(), 13.5);
 }
 
@@ -169,7 +172,7 @@ fn exit_debounce_does_not_accumulate_in_float() {
         Action::UpdateVoltage { .. }
     ));
     assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 }
 
 #[test]
@@ -182,7 +185,7 @@ fn exit_debounce_honors_elapsed() {
         ok_tick(&mut s, b(OK_V, -2.4), EXIT_DEBOUNCE),
         Action::UpdateVoltage { .. }
     ));
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
     assert_approx(s.target_voltage(), 13.5);
 }
 
@@ -193,12 +196,12 @@ fn hysteresis_no_flap_between_thresholds() {
     for _ in 0..10 {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     }
-    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.state(), ChargeState::Float);
     ok_tick(&mut s, b(OK_V, -4.0), TICK);
     for _ in 0..10 {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     }
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
 }
 
 #[test]
@@ -260,7 +263,7 @@ fn supervisor_passes_setpoint_through_on_phase_transition() {
         ok_tick(&mut s, b(13.5, -4.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
     assert_approx(s.target_voltage(), 14.4);
     assert_eq!(s.fault(), None);
 }
@@ -286,7 +289,7 @@ fn steady_healthy_polls_never_leave_float() {
     for tick in 0..(2 * EXIT_DEBOUNCE.as_secs()) {
         let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
         assert!(matches!(a, Action::None), "tick {tick}: {a:?}");
-        assert_eq!(s.phase(), Phase::Float);
+        assert_eq!(s.state(), ChargeState::Float);
         assert_eq!(s.fault(), None);
     }
 }

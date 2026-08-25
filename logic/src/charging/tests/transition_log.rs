@@ -58,7 +58,7 @@ fn phase_changes_are_not_latch_transitions() {
     let mut s = active(lfp_4s());
     while s.pop_transition().is_some() {}
     enter_absorb(&mut s);
-    assert_eq!(s.phase(), Phase::Absorb);
+    assert_eq!(s.state(), ChargeState::Absorb);
     assert_eq!(s.pop_transition(), None);
 }
 

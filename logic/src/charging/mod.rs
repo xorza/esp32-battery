@@ -9,11 +9,16 @@
 //! overvoltage, stuck-absorb, missing-battery, or unhealthy-Modbus
 //! conditions. Once latched, only a reboot clears it.
 //!
+//! Both live in one flat state machine — see `charge_state.rs`, whose
+//! `TRANSITIONS` table is the whole of it: which V_SET the device holds,
+//! whether the buck is meant to be sourcing, and what each event does to
+//! either are all functions of a single payload-free enum.
+//!
 //! A fault latches only while the buck is actually sourcing. The same
-//! conditions detected during `Pending` bring-up *inhibit* instead: the
-//! output is already off, so latching would disable nothing while still
-//! costing a reboot to clear. Inhibits are reported via `inhibit()` and
-//! clear on their own when the condition does.
+//! conditions detected in a bring-up state *inhibit* instead: the output
+//! is already off, so latching would disable nothing while still costing
+//! a reboot to clear. Inhibits are reported via `inhibit()` and clear on
+//! their own when the condition does.
 //!
 //! Sign convention: battery current is **negative when charging** (matches
 //! the INA228 wiring on this board). The supervisor takes signed amps and
@@ -31,6 +36,7 @@ use std::time::Duration;
 use crate::data::STALE_WINDOW;
 
 pub(crate) mod action;
+pub(crate) mod charge_state;
 pub(crate) mod charge_supervisor;
 pub(crate) mod debounce;
 pub(crate) mod fault_reason;
