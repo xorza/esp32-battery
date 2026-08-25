@@ -28,7 +28,7 @@ use crate::board::XyPins;
 use crate::clock::{EventRecorder, LoopTimer};
 use crate::reboot;
 use crate::task_wdt;
-use crate::{BUCK, PACK_PROFILE};
+use crate::{BUCK, PACK_PROFILE, PACK_TEMP};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -450,7 +450,7 @@ fn run<D: XyDevice>(
 
     let model_code = boot_with_retries(&mut xy, &recorder);
     charge_status.lock().unwrap().model_code = model_code;
-    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE, BUCK.i_set_a);
+    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE, BUCK.i_set_a, PACK_TEMP);
 
     let mut protection = ProtectionLog::new();
     // Lapped after `poll`, so a tick is charged its own Modbus traffic as
@@ -603,6 +603,8 @@ fn poll<D: XyDevice>(
             setpoints: status.as_ref().map(|s| s.setpoints),
             output,
             battery,
+            // No sensor on this board — see `PACK_TEMP`.
+            pack_temp_c: None,
         },
         ps_offline,
     }

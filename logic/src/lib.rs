@@ -20,6 +20,7 @@ pub use charging::action::{Action, DisableTicket, EnableTicket, VoltageTicket};
 pub use charging::charge_supervisor::ChargeSupervisor;
 pub use charging::fault_reason::FaultReason;
 pub use charging::inhibit_reason::InhibitReason;
+pub use charging::pack_temp::PackTemp;
 pub use charging::phase::Phase;
 pub use charging::poll_result::{BatterySample, BuckOutput, PollResult};
 pub use charging::profile::{BuckSetup, Profile, SupplyBudget};

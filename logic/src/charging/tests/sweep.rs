@@ -87,6 +87,12 @@ fn random_poll(rng: &mut Rng, s: &ChargeSupervisor) -> PollResult {
         setpoints,
         output,
         battery,
+        // The sweep's supervisors are `PackTemp::Absent`, so this is
+        // ignored. Deliberate: a temperature latch takes the same path as
+        // every other latch the sweep already drives, and `pack_temp.rs`
+        // covers the gate directly — while randomising it here would end
+        // runs early and drift the coverage counts asserted below.
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     }
 }
 

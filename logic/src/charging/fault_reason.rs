@@ -46,6 +46,16 @@ pub enum FaultReason {
     /// Latches even though the output is already off — the point is to stop
     /// bringing it back up.
     ProtectionFlapping,
+    /// Pack was below `CHARGE_TEMP_MIN_C` while the buck was sourcing.
+    /// Charging a frozen cell plates lithium; the damage is cumulative and
+    /// invisible, so this refuses rather than warns.
+    PackTooCold,
+    /// Pack was above `CHARGE_TEMP_MAX_C` while the buck was sourcing.
+    PackTooHot,
+    /// A fitted pack-temperature sensor went unread for
+    /// `PACK_TEMP_STALE_TIMEOUT`. Same rule as a dead INA228: we do not
+    /// charge on a measurement we do not have.
+    PackTempStale,
     /// Pack drew more than `OVERCURRENT_TOL ×` the profile's charge rate for
     /// `OVERCURRENT_DURATION`. The buck's own CC loop and OCP bound *total*
     /// output current, which includes the UPS load; this is the only check
@@ -81,6 +91,9 @@ impl std::fmt::Display for FaultReason {
             Self::AbsorbTimeout => f.write_str("absorb time cap reached"),
             Self::ChargeTimeout => f.write_str("total charge time cap reached"),
             Self::ProtectionFlapping => f.write_str("buck protection flapping"),
+            Self::PackTooCold => f.write_str("pack too cold to charge"),
+            Self::PackTooHot => f.write_str("pack too hot to charge"),
+            Self::PackTempStale => f.write_str("pack temperature sensor stale"),
             Self::ChargeOvercurrent => f.write_str("pack charge overcurrent"),
             Self::SettingsDrift => f.write_str("setpoint readback drift"),
             Self::OutputUnexpectedlyOff(s) => write!(f, "buck self-disabled ({s})"),
@@ -119,7 +132,13 @@ impl FaultReason {
             | Self::SettingsDrift
             | Self::ProtectionFlapping
             | Self::OutputUnexpectedlyOff(_)
-            | Self::OutputOnInPending => FaultResponse::Disable,
+            | Self::OutputOnInPending
+            // Parking would not help: holding the float target still pushes
+            // current into a discharged pack, and it is the charging itself
+            // that damages a frozen cell. Only a dark output stops it.
+            | Self::PackTooCold
+            | Self::PackTooHot
+            | Self::PackTempStale => FaultResponse::Disable,
             Self::AbsorbTimeout | Self::ChargeTimeout | Self::ChargeOvercurrent => {
                 FaultResponse::Park
             }

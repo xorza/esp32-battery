@@ -4,14 +4,20 @@ use xy_modbus::{ProtectionStatus, Setpoints};
 
 /// One poll cycle's view of the world for the supervisor.
 /// `setpoints` is from the V_SET/I_SET readback; `setpoints.is_some()`
-/// doubles as the modbus-healthy signal. `battery` is independent —
-/// it's the latest fresh INA228 reading.
+/// doubles as the modbus-healthy signal. The other two are independent of
+/// it and of each other — `battery` is the latest fresh INA228 reading and
+/// `pack_temp_c` its own sensor — so a dead Modbus link says nothing about
+/// either, and each carries its own staleness window.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct PollResult {
     pub battery: Option<BatterySample>,
     pub setpoints: Option<Setpoints>,
     /// `None` means the OUTPUT_EN read itself failed.
     pub output: Option<BuckOutput>,
+    /// Pack temperature in °C, if this board has a sensor and it read.
+    /// Always `None` where `PackTemp::Absent` — the supervisor is told
+    /// which case it is at construction rather than guessing from this.
+    pub pack_temp_c: Option<f32>,
 }
 
 /// What the buck's OUTPUT_EN register reported this poll, plus the

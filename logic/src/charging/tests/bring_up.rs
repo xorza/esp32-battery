@@ -247,6 +247,7 @@ fn pending_does_not_enable_without_setpoint_readback() {
         setpoints: None,
         output: None,
         battery: b(OK_V, -0.1),
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     };
     // Below the modbus_err debounce window: no fault, no enable.
     for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {

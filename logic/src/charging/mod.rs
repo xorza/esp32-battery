@@ -46,6 +46,7 @@ pub(crate) mod debounce;
 pub(crate) mod fault_reason;
 pub(crate) mod hold_budget;
 pub(crate) mod inhibit_reason;
+pub(crate) mod pack_temp;
 pub(crate) mod phase;
 pub(crate) mod poll_result;
 pub(crate) mod profile;
@@ -175,6 +176,26 @@ const FLAP_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// compressor kicking in nearby, while still ending a genuine flap inside a
 /// handful of seconds rather than never.
 const MAX_HOLDS: u8 = 4;
+
+/// Ambient range within which the pack may be charged, in °C.
+///
+/// Below freezing, charging lithium plates metal onto the anode instead of
+/// intercalating it: capacity is lost permanently, the plating is
+/// invisible from outside, and enough of it shorts the cell. Discharging
+/// cold is fine, which is why this bounds charging only. The ceiling is the
+/// usual cell-spec figure, above which ageing accelerates sharply.
+///
+/// One pair rather than a per-chemistry curve because every chemistry this
+/// crate supports shares it — the plating mechanism is not specific to LFP
+/// or NMC. If one ever needs its own, this moves onto `Chemistry` beside
+/// `charge_voltages`.
+const CHARGE_TEMP_MIN_C: f32 = 0.0;
+const CHARGE_TEMP_MAX_C: f32 = 45.0;
+const _: () = assert!(CHARGE_TEMP_MIN_C < CHARGE_TEMP_MAX_C);
+/// How long a fitted pack-temperature sensor may go unread before the
+/// supervisor fails closed. Mirrors `BATTERY_MISSING_TIMEOUT`: the same
+/// argument applies, since neither reading can be substituted for.
+const PACK_TEMP_STALE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long Modbus reads to the XY can keep failing before we fail closed.
 const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);

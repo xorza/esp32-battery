@@ -151,6 +151,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
         output: Some(BuckOutput::Off { cause: ProtectionStatus::Normal }),
         setpoints: Some(s.expected_setpoints()),
         battery: drained,
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     };
     // Drained pack ⇒ the ticket carries resume_absorb = true.
     let a = s.tick(p_clear, TICK);
@@ -161,6 +162,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
         output: Some(BuckOutput::On),
         setpoints: Some(s.expected_setpoints()),
         battery: drained,
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     };
     let a = s.tick(p_active, TICK);
     assert!(matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v, profile.absorb_v)));
@@ -177,6 +179,7 @@ fn pending_at_boot_with_lvp_waits() {
         }),
         setpoints: Some(s.expected_setpoints()),
         battery: b(OK_V, -0.1),
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     };
     for _ in 0..30 {
         assert!(matches!(s.tick(p_lvp, TICK), Action::None));
@@ -206,6 +209,7 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
         }),
         setpoints: Some(s.expected_setpoints()),
         battery: drained,
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     };
     let a = s.tick(p_clear, TICK);
     assert!(accept_enable(&mut s, a), "drained pack must ask to resume Absorb");
@@ -216,6 +220,7 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
         output: Some(BuckOutput::On),
         setpoints: Some(s.expected_setpoints()),
         battery: drained,
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     };
     let a = s.tick(p_on, TICK);
     assert!(

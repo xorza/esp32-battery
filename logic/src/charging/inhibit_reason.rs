@@ -29,6 +29,14 @@ pub enum InhibitReason {
     /// one sample over the line is enough to refuse bring-up, where the
     /// same single sample is not enough to trip a regulating buck.
     Overvoltage,
+    /// Pack is below `CHARGE_TEMP_MIN_C`. Self-clearing in the most literal
+    /// sense — it warms up — so bring-up waits rather than refusing.
+    PackTooCold,
+    /// Pack is above `CHARGE_TEMP_MAX_C`.
+    PackTooHot,
+    /// A fitted pack-temperature sensor has not read for
+    /// `PACK_TEMP_STALE_TIMEOUT`.
+    PackTempStale,
     /// Buck is holding itself off on a cause
     /// [`crate::ProtectionPolicy::is_self_clearing`] accepts.
     /// `set_output(true)` would succeed at the Modbus layer and change
@@ -51,6 +59,9 @@ impl std::fmt::Display for InhibitReason {
             Self::BatterySensorStale => f.write_str("waiting: battery sensor stale"),
             Self::NoBatterySample => f.write_str("waiting: no battery sample"),
             Self::Overvoltage => f.write_str("waiting: pack overvoltage"),
+            Self::PackTooCold => f.write_str("waiting: pack too cold to charge"),
+            Self::PackTooHot => f.write_str("waiting: pack too hot to charge"),
+            Self::PackTempStale => f.write_str("waiting: pack temperature sensor stale"),
             Self::BuckProtection(s) => write!(f, "waiting: buck protection ({s})"),
         }
     }

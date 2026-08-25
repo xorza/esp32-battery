@@ -370,7 +370,7 @@ fn overcurrent_is_measured_on_the_pack_not_the_setpoint() {
     // A board budgeting a load programs a wider I_SET — here twice the
     // charge rate — and the pack's own limit must not move with it. That is
     // the whole point of measuring on the battery instead of the setpoint.
-    let wide = ChargeSupervisor::new(profile, profile.regulation_a * 2.0);
+    let wide = ChargeSupervisor::new(profile, profile.regulation_a * 2.0, PackTemp::Absent);
     let mut s = bring_up(wide, profile.absorb_v);
     for _ in 0..(OVERCURRENT_DURATION.as_secs() - 1) {
         ok_tick(&mut s, b(OK_V, -(trip + 0.1)), TICK);
@@ -412,6 +412,7 @@ fn output_disagreement_outranks_setpoint_drift() {
         }),
         setpoints: drifted,
         battery: b(OK_V, -0.1),
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     };
     assert!(matches_disable(
         &s.tick(p, TICK),
@@ -423,6 +424,7 @@ fn output_disagreement_outranks_setpoint_drift() {
         output: Some(BuckOutput::On),
         setpoints: drifted,
         battery: b(OK_V, -0.1),
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     };
     assert!(matches_disable(
         &s.tick(p, TICK),
@@ -535,7 +537,7 @@ fn labels_are_the_snake_case_wire_identifiers() {
     // `/api` publishes these verbatim and dashboards match on them, so the
     // strings are a wire format: pinned here against the literals rather
     // than re-derived from the same `IntoStaticStr` that produces them.
-    let faults: [(FaultReason, &str); 10] = [
+    let faults: [(FaultReason, &str); 13] = [
         (FaultReason::BatterySensorStale, "battery_sensor_stale"),
         (FaultReason::ModbusUnhealthy, "modbus_unhealthy"),
         (FaultReason::Overvoltage, "overvoltage"),
@@ -543,6 +545,9 @@ fn labels_are_the_snake_case_wire_identifiers() {
         (FaultReason::ChargeTimeout, "charge_timeout"),
         (FaultReason::ChargeOvercurrent, "charge_overcurrent"),
         (FaultReason::ProtectionFlapping, "protection_flapping"),
+        (FaultReason::PackTooCold, "pack_too_cold"),
+        (FaultReason::PackTooHot, "pack_too_hot"),
+        (FaultReason::PackTempStale, "pack_temp_stale"),
         (FaultReason::SettingsDrift, "settings_drift"),
         (
             FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ovp),
@@ -554,12 +559,15 @@ fn labels_are_the_snake_case_wire_identifiers() {
         assert_eq!(reason.label(), want, "{reason:?}");
     }
 
-    let inhibits: [(InhibitReason, &str); 6] = [
+    let inhibits: [(InhibitReason, &str); 9] = [
         (InhibitReason::SettingsDrift, "settings_drift"),
         (InhibitReason::ModbusUnhealthy, "modbus_unhealthy"),
         (InhibitReason::BatterySensorStale, "battery_sensor_stale"),
         (InhibitReason::NoBatterySample, "no_battery_sample"),
         (InhibitReason::Overvoltage, "overvoltage"),
+        (InhibitReason::PackTooCold, "pack_too_cold"),
+        (InhibitReason::PackTooHot, "pack_too_hot"),
+        (InhibitReason::PackTempStale, "pack_temp_stale"),
         (
             InhibitReason::BuckProtection(ProtectionStatus::Lvp),
             "buck_protection",

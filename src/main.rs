@@ -30,7 +30,7 @@ use log::warn;
 
 use esp32_battery_logic::Chemistry;
 use esp32_battery_logic::EventLog;
-use esp32_battery_logic::{BuckSetup, Profile, SupplyBudget};
+use esp32_battery_logic::{BuckSetup, PackTemp, Profile, SupplyBudget};
 use esp32_battery_logic::{ChargeStatus, SensorData};
 
 use esp32_battery_logic::{NetAction, NetPhase, NetPoll, NetSupervisor, WifiCredentials};
@@ -63,6 +63,17 @@ pub(crate) const SUPPLY: SupplyBudget = SupplyBudget {
     input_nominal_v: 24.0,
     load_a: 0.0,
 };
+
+/// Whether this board has a pack temperature sensor.
+///
+/// **`Absent` on this hardware.** The XY7025 reports only its own die
+/// temperature, so there is nothing on the bus that can see the pack, and
+/// the supervisor will charge a frozen pack without complaint. Fitting an
+/// I2C sensor alongside the INA228 and flipping this to `Fitted` is the
+/// whole change — the check is already written and tested. Until then the
+/// pack's BMS is the only thing enforcing its charge temperature window,
+/// which makes a BMS mandatory rather than advisable.
+pub(crate) const PACK_TEMP: PackTemp = PackTemp::Absent;
 
 /// CC setpoint and hard trip thresholds programmed into the XY at boot.
 /// Derived from the pack profile and the board budget together, so a

@@ -11,14 +11,16 @@ use crate::charging::debounce::Debounce;
 use crate::charging::fault_reason::{FaultReason, FaultResponse};
 use crate::charging::hold_budget::HoldBudget;
 use crate::charging::inhibit_reason::InhibitReason;
+use crate::charging::pack_temp::PackTemp;
 use crate::charging::phase::Phase;
 use crate::charging::poll_result::{BatterySample, BuckOutput, PollResult};
 use crate::charging::profile::Profile;
 use crate::charging::protection_policy::ProtectionPolicy;
 use crate::charging::{
-    ABSORB_CV_BAND_V, BATTERY_MISSING_TIMEOUT, EXIT_DEBOUNCE, MAX_ABSORB, MAX_CHARGE,
-    MODBUS_UNHEALTHY_TIMEOUT, OVERCURRENT_DURATION, OVERCURRENT_TOL, OV_DURATION, OV_MARGIN_V,
-    SETPOINT_DRIFT_TOL, TRANSITION_BUFFER,
+    ABSORB_CV_BAND_V, BATTERY_MISSING_TIMEOUT, CHARGE_TEMP_MAX_C, CHARGE_TEMP_MIN_C,
+    EXIT_DEBOUNCE, MAX_ABSORB, MAX_CHARGE, MODBUS_UNHEALTHY_TIMEOUT, OVERCURRENT_DURATION,
+    OVERCURRENT_TOL, OV_DURATION, OV_MARGIN_V, PACK_TEMP_STALE_TIMEOUT, SETPOINT_DRIFT_TOL,
+    TRANSITION_BUFFER,
 };
 use crate::error_log::ChargeTransition;
 use xy_modbus::Setpoints;
@@ -49,6 +51,10 @@ pub struct ChargeSupervisor {
     overcurrent: Debounce,
     /// Self-clearing holds lately, against `MAX_HOLDS` / `FLAP_WINDOW`.
     holds: HoldBudget,
+    /// Whether this board can see the pack's temperature at all.
+    pack_temp: PackTemp,
+    /// A fitted sensor going unread, against `PACK_TEMP_STALE_TIMEOUT`.
+    pack_temp_missing: Debounce,
     /// Time at the CV plateau, against `MAX_ABSORB`.
     absorb: Debounce,
     /// Time since entering Absorb, against `MAX_CHARGE`. Counts whatever the
@@ -69,7 +75,7 @@ impl ChargeSupervisor {
     /// `i_set_a` is [`BuckSetup::i_set_a`] — what the caller actually
     /// programmed, which the drift check has to match and which is *not*
     /// `profile.regulation_a` once the board budgets a load.
-    pub fn new(profile: Profile, i_set_a: f32) -> Self {
+    pub fn new(profile: Profile, i_set_a: f32, pack_temp: PackTemp) -> Self {
         assert!(profile.absorb_v > profile.float_v);
         assert!(i_set_a >= profile.regulation_a);
         // Boot conservative: output stays OFF until the first healthy tick,
@@ -85,6 +91,8 @@ impl ChargeSupervisor {
             ov: Debounce::default(),
             overcurrent: Debounce::default(),
             holds: HoldBudget::default(),
+            pack_temp,
+            pack_temp_missing: Debounce::default(),
             absorb: Debounce::default(),
             charge_total: Debounce::default(),
             exit: Debounce::default(),
@@ -586,7 +594,33 @@ impl ChargeSupervisor {
             return Verdict::Latch(FaultReason::ChargeOvercurrent);
         }
 
-        // 7. Bring-up-only gates. Not faults — they say "not yet", and only
+        // 7. Pack temperature. Charging lithium below freezing plates metal
+        //    onto the anode — permanent, invisible, and cumulative — so a
+        //    cold pack is refused outright rather than charged gently.
+        //    Skipped entirely where no sensor is fitted, which is a
+        //    declared board fact and not an absent reading: see `PackTemp`.
+        if self.pack_temp == PackTemp::Fitted {
+            if self.pack_temp_missing.step(
+                p.pack_temp_c.is_none(),
+                elapsed,
+                PACK_TEMP_STALE_TIMEOUT,
+            ) {
+                return self
+                    .fault_or_inhibit(FaultReason::PackTempStale, InhibitReason::PackTempStale);
+            }
+            if let Some(t) = p.pack_temp_c {
+                if t < CHARGE_TEMP_MIN_C {
+                    return self
+                        .fault_or_inhibit(FaultReason::PackTooCold, InhibitReason::PackTooCold);
+                }
+                if t > CHARGE_TEMP_MAX_C {
+                    return self
+                        .fault_or_inhibit(FaultReason::PackTooHot, InhibitReason::PackTooHot);
+                }
+            }
+        }
+
+        // 8. Bring-up-only gates. Not faults — they say "not yet", and only
         //    mean anything while the output is off.
         if self.state.bringing_up() {
             // Demand a fresh setpoint readback before energising.

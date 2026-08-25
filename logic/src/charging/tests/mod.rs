@@ -9,6 +9,7 @@ use crate::charging::charge_state::ChargeState;
 use crate::charging::charge_supervisor::{ChargeSupervisor, internals::SupervisorInternals};
 use crate::charging::fault_reason::FaultReason;
 use crate::charging::inhibit_reason::InhibitReason;
+use crate::charging::pack_temp::PackTemp;
 use crate::charging::phase::Phase;
 use crate::charging::poll_result::{BatterySample, BuckOutput, PollResult};
 use crate::charging::profile::{Profile, SupplyBudget};
@@ -19,6 +20,7 @@ use xy_modbus::{ProtectionStatus, RtuError, Setpoints, XyError as BusError};
 mod absorb_timeout;
 mod bring_up;
 mod faults;
+mod pack_temp;
 mod parked;
 mod phase_machine;
 mod profile;
@@ -46,7 +48,22 @@ const TEST_SUPPLY: SupplyBudget = SupplyBudget {
 /// A fresh supervisor for `profile`, programmed the way the firmware
 /// programs one.
 fn supervisor(profile: Profile) -> ChargeSupervisor {
-    ChargeSupervisor::new(profile, profile.buck_setup(TEST_SUPPLY).i_set_a)
+    ChargeSupervisor::new(
+        profile,
+        profile.buck_setup(TEST_SUPPLY).i_set_a,
+        PackTemp::Absent,
+    )
+}
+
+/// As `supervisor`, for a board that can see the pack's temperature. Only
+/// the temperature tests want this; everything else mirrors the shipped
+/// board, which has no sensor.
+fn supervisor_with_temp_sensor(profile: Profile) -> ChargeSupervisor {
+    ChargeSupervisor::new(
+        profile,
+        profile.buck_setup(TEST_SUPPLY).i_set_a,
+        PackTemp::Fitted,
+    )
 }
 
 fn approx(a: f32, b: f32) -> bool {
@@ -82,6 +99,11 @@ const CV_V: f32 = 14.4;
 /// the OCV curve instead of measuring distance to the CV plateau.
 const LOW_V: f32 = 13.0;
 
+/// A pack temperature comfortably inside the charge window, so the fixtures
+/// stay silent on temperature unless a test says otherwise. Ignored
+/// entirely by the `PackTemp::Absent` supervisors most tests build.
+const TEST_PACK_TEMP_C: f32 = 20.0;
+
 /// Wall time elapsed per simulated tick. Tests choose 1 s so iteration
 /// counts read as seconds when comparing against duration budgets.
 const TICK: Duration = Duration::from_secs(1);
@@ -115,6 +137,7 @@ fn expected_poll(s: &ChargeSupervisor, battery: Option<BatterySample>) -> PollRe
         setpoints: Some(s.readback_setpoints()),
         output: Some(expected_output(s)),
         battery,
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     }
 }
 
@@ -169,6 +192,7 @@ fn fail_tick(
             setpoints: None,
             output: None,
             battery,
+            pack_temp_c: Some(TEST_PACK_TEMP_C),
         },
         elapsed,
     )
@@ -270,5 +294,6 @@ fn poll_with_output(s: &ChargeSupervisor, output: BuckOutput) -> PollResult {
         output: Some(output),
         setpoints: Some(s.readback_setpoints()),
         battery: b(OK_V, -0.1),
+        pack_temp_c: Some(TEST_PACK_TEMP_C),
     }
 }
