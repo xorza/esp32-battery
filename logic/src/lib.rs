@@ -9,6 +9,7 @@ mod battery;
 mod charging;
 mod data;
 mod dns_packet;
+mod error;
 mod error_log;
 mod form;
 mod log_ring;
@@ -26,6 +27,7 @@ pub use charging::voltage_writer::{VoltageWriteOutcome, VoltageWriter, apply_upd
 pub use charging::INPUT_LVP_MARGIN_V;
 
 pub use data::{Ina228Reading, PsReading, Sample, SensorData};
+pub use error::CredentialsError;
 pub use error_log::{ChargeTransition, Event, EventLog, InaError, TimedEvent, XyError};
 
 pub use dns_packet::build_response;

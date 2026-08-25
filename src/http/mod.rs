@@ -175,10 +175,11 @@ pub(crate) fn json_ok(req: Request<&mut EspHttpConnection>) -> Result<(), EspErr
     json_reply(req, 200, br#"{"ok":true}"#)
 }
 
-/// Canonical error envelope: `{"error":"<msg>"}`. `msg` is JSON-escaped
-/// by the serializer; sized at 192 B so any reasonable status string
-/// fits — overrun panics, which is correct since these are
-/// developer-controlled static strings.
+/// Canonical error envelope: `{"error":"<msg>"}`. `msg` is JSON-escaped by
+/// the serializer; 192 B fits any message this firmware sends. An overrun
+/// degrades to a generic envelope rather than panicking — the status code is
+/// what the client acts on, and a panic here would reboot the device (see the
+/// hook in `main.rs`) while merely reporting some earlier error.
 pub(crate) fn json_err(
     req: Request<&mut EspHttpConnection>,
     status: u16,
@@ -189,9 +190,13 @@ pub(crate) fn json_err(
         error: &'a str,
     }
     let mut buf = [0u8; 192];
-    let len = serde_json_core::to_slice(&E { error: msg }, &mut buf)
-        .expect("json_err: msg too long for 192-byte buffer");
-    json_reply(req, status, &buf[..len])
+    match serde_json_core::to_slice(&E { error: msg }, &mut buf) {
+        Ok(len) => json_reply(req, status, &buf[..len]),
+        Err(_) => {
+            warn!("json_err: {status} message did not fit its buffer: {msg}");
+            json_reply(req, status, br#"{"error":"request failed"}"#)
+        }
+    }
 }
 
 /// Serialize a value into `buf` and write it as `application/json`. The

@@ -98,7 +98,17 @@ this phase changes live timing behaviour, not just its description.
 
 ---
 
-## Phase 2 — Stop untrusted input from bricking the unit
+## Phase 2 — Stop untrusted input from bricking the unit — **DONE**
+
+`CredentialsError` lives in a new `logic/src/error.rs` per the house rule that
+error types go there. It carries no payload: `message()` returns `&'static str`,
+so the HTTP error path needs no formatting buffer and `Display` is written in
+terms of it rather than as a second copy of the same strings.
+
+Step 14's device-side half is not covered by tests — `nvs_creds::load` and
+`/save` both need esp-idf and cannot run on the host. What is tested is the
+single validation point they now share, at every boundary. Confirming the
+corrupt-NVS path on hardware still wants a flash.
 
 10. **Give `WifiCredentials` a fallible constructor** and route the two
     untrusted producers (`nvs_creds::load`, `captive_api`'s `/save`) through it.

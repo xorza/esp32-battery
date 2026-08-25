@@ -7,7 +7,7 @@ use crate::net::net_supervisor::NetSupervisor;
 use crate::net::wifi_credentials::WifiCredentials;
 
 fn creds(ssid: &str) -> WifiCredentials {
-    WifiCredentials::new(ssid, "password1")
+    WifiCredentials::new(ssid, "password1").expect("test fixture credentials are valid")
 }
 
 /// One supervisor tick, matching the firmware's 1 Hz loop.

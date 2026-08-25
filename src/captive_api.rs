@@ -61,8 +61,9 @@ pub fn mount(
         };
 
         // Buffers sized one past the radio limit so an at-limit input fits
-        // and an oversize one still fills past the limit, getting rejected
-        // by the length check below rather than silently truncated.
+        // and an oversize one still decodes to something over the limit —
+        // `WifiCredentials::new` then rejects it, where a buffer sized to the
+        // limit exactly would have silently truncated it into a valid pair.
         let mut ssid_buf = [0u8; SSID_MAX + 1];
         let ssid_len = url_decode(ssid_raw, &mut ssid_buf);
         let Ok(ssid) = std::str::from_utf8(&ssid_buf[..ssid_len]) else {
@@ -75,15 +76,12 @@ pub fn mount(
             return json_err(req, 400, "Password is not valid UTF-8");
         };
 
-        if ssid.is_empty() || ssid.len() > SSID_MAX {
-            return json_err(req, 400, "Invalid SSID");
-        }
-        // WPA/WPA2: 8-63 chars, or empty for open networks.
-        if !password.is_empty() && !(8..=63).contains(&password.len()) {
-            return json_err(req, 400, "Password must be 8-63 characters");
-        }
-
-        let creds = WifiCredentials::new(ssid, password);
+        // Length and shape rules live in `WifiCredentials::new`, the one
+        // place every producer of credentials goes through.
+        let creds = match WifiCredentials::new(ssid, password) {
+            Ok(creds) => creds,
+            Err(e) => return json_err(req, 400, e.message()),
+        };
 
         // Latest-wins: a second /save before the supervisor drains
         // overwrites the first.

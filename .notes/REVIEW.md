@@ -4,29 +4,6 @@ Findings only — no fixes, no designs. **Delete an item once it is addressed**;
 this file lists open findings and nothing else. Groups are ordered by severity
 and benefit; items within a group share one root cause.
 
-## Untrusted input is validated by assertions, and a failed assertion reboots
-
-- [ ] `WifiCredentials::new` (`logic/src/net/wifi_credentials.rs:21`) validates
-      with `assert!`/`expect`. It is called on NVS blob content
-      (`src/nvs_creds.rs:26`) and on a decoded HTTP body
-      (`src/captive_api.rs:86`). A corrupt or hand-written NVS value therefore
-      panics, the `main.rs` panic hook reboots, and the captive portal never
-      starts — a boot loop with no way in. `src/nvs_creds.rs:13-15` states this
-      is intentional.
-- [ ] `src/nvs_creds.rs:19-20` `.unwrap()`s `get_str`, which errors when the
-      stored blob exceeds the buffer — the same boot-loop path, reached before
-      any length check runs.
-- [ ] Because the constructor asserts, `/save` re-implements every check before
-      calling it (`src/captive_api.rs:78-84`: empty SSID, `SSID_MAX`, the
-      `8..=63` password rule). The "centralised here so every site that
-      produces credentials gets the same checks" claim in
-      `logic/src/net/wifi_credentials.rs:16-20` holds only because the checks
-      are duplicated; the `8..=63` rule and its explanatory comment appear
-      verbatim in both files.
-- [ ] `http::json_err` (`src/http/mod.rs:193`) `.expect`s when a message
-      exceeds its 192-byte buffer — a panic, and therefore a device reboot, on
-      an HTTP error path.
-
 ## The network state is re-encoded five times along one path
 
 - [ ] `NetPhase` (5 variants, `logic/src/net/net_phase.rs:20`) →
@@ -229,6 +206,17 @@ and benefit; items within a group share one root cause.
 - [ ] `serve_static` (`:60`) rebuilds a 4-entry header vector with four
       `unwrap()`s on every request, though the header set is fully determined
       at mount time.
+
+## A failed credential save reboots the device
+
+- [ ] `nvs_creds::save` `.unwrap()`s both `set_str` calls (`src/nvs_creds.rs`).
+      It runs from `promote_to_sta` right after an association succeeds, so a
+      full or worn flash panics — the hook reboots, the credentials were never
+      persisted, and the unit comes back to the captive portal for the user to
+      try again, which fails the same way. Unlike `load`, this is an I/O
+      failure rather than untrusted data, so it wants the project's I/O rule
+      rather than the validation one. *(Noticed while doing Phase 2; the
+      `load` half of that path is fixed.)*
 
 ## Two canonical paths for the xy-modbus types
 
