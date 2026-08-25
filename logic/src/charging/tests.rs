@@ -163,8 +163,6 @@ fn latch_self_disable(s: &mut ChargeSupervisor, cause: ProtectionStatus) {
     accept_disable(s, a);
 }
 
-// --- Profile construction ---
-
 #[test]
 fn lfp_4s_50ah_matches_hand_calculation() {
     // Exhaustive check of the production profile's derived fields against
@@ -336,8 +334,6 @@ fn safety_limits_ovp_clears_supervisor_threshold() {
     }
 }
 
-// --- Phase machine ---
-//
 // All currents below are tuned to the 50 Ah pack: enter > 3 A, exit < 2.5 A.
 
 #[test]
@@ -678,8 +674,6 @@ fn full_charge_cycle() {
     }
 }
 
-// --- Elapsed honored, not tick count ---
-
 #[test]
 fn ov_fault_honors_sub_second_elapsed() {
     // 500 ms ticks. Five of them = 2.5 s — under the 3 s budget, no fault.
@@ -752,8 +746,6 @@ fn modbus_unhealthy_honors_elapsed() {
     let a = fail_tick(&mut s, b(13.5, -0.1), MODBUS_UNHEALTHY_TIMEOUT);
     assert!(matches_disable(&a, FaultReason::ModbusUnhealthy));
 }
-
-// --- Absorb time cap ---
 
 #[test]
 fn absorb_does_not_time_out_below_budget() {
@@ -840,8 +832,6 @@ fn absorb_timer_resets_on_cc_dip() {
     }
     assert!(s.fault().is_none());
 }
-
-// --- Supervisor faults & latching ---
 
 #[test]
 fn supervisor_passes_setpoint_through_on_phase_transition() {
@@ -1100,8 +1090,6 @@ fn setpoint_drift_does_not_overwrite_existing_latch() {
         FaultReason::ModbusUnhealthy
     ));
 }
-
-// --- Pending → Active bring-up ---
 
 #[test]
 fn pending_emits_enable_on_first_healthy_tick() {
@@ -1691,8 +1679,6 @@ fn otp_recovery_accepts_buck_auto_re_enable() {
     ));
 }
 
-// ─── apply_update_voltage (firmware-side sequencing) ────────────────────────
-
 /// Programmable mock for `VoltageWriter`. Records every call in order and
 /// can be primed to fail at a specific call index per method, exercising
 /// the partial-failure paths in `apply_update_voltage`.
@@ -1908,8 +1894,6 @@ fn apply_step_up_failure_does_not_touch_output() {
     assert!(matches!(s.phase(), Phase::Float));
 }
 
-// --- Latch transition log ---------------------------------------------------
-
 /// A poll where the buck reports `output` and everything else is drift-free.
 /// Built from `expected_setpoints` rather than `expected_poll` so it stays
 /// valid across the latch-state changes these tests drive.
@@ -1995,8 +1979,6 @@ fn transition_ring_drops_oldest_when_undrained() {
     assert_eq!(drained[1], ChargeTransition::ProtectCleared);
     assert_eq!(drained[TRANSITION_BUFFER - 1], ChargeTransition::ProtectCleared);
 }
-
-// --- Randomized invariant sweep ---------------------------------------------
 
 /// Deterministic xorshift64. Enough to shuffle the supervisor through state
 /// combinations no hand-written scenario reaches, while staying exactly

@@ -11,8 +11,6 @@ pub use history::HISTORY_CAPACITY;
 use crate::charging::{FaultReason, InhibitReason, Phase};
 use history::History;
 
-// --- Sample shapes ----------------------------------------------------------
-
 #[derive(Clone, Copy, Default)]
 pub struct Ina228Reading {
     pub voltage: f32,
@@ -42,8 +40,6 @@ pub struct Sample {
     /// 1.0 when power supply is online, 0.0 when offline. Averaged during compaction.
     pub power_online: f32,
 }
-
-// --- Live readings ----------------------------------------------------------
 
 /// Ticks a sensor's reading can go unrefreshed before `tick` treats it as
 /// absent. At 1 Hz ticks this is ~5 s — enough to ride out a single missed
@@ -117,8 +113,6 @@ impl LiveReadings {
         }
     }
 }
-
-// --- SensorData orchestrator ------------------------------------------------
 
 /// Central data store with adaptive-resolution history. Producer threads
 /// publish via `update_*`; the supervisor's 1 Hz `tick` drives commits.
@@ -300,8 +294,6 @@ mod tests {
         start_t + n
     }
 
-    // --- Default / basic update ---
-
     #[test]
     fn default_is_empty() {
         let sd = SensorData::new();
@@ -388,8 +380,6 @@ mod tests {
         assert_eq!(sd.history().len(), 10);
     }
 
-    // --- Power online tracking ---
-
     #[test]
     fn power_online_threshold() {
         let mut sd = SensorData::new();
@@ -417,8 +407,6 @@ mod tests {
             assert!((s.power_online - 0.5).abs() < 0.01);
         }
     }
-
-    // --- Ordering / no-NTP guards ---
 
     #[test]
     fn out_of_order_commits_are_rejected() {
@@ -450,10 +438,6 @@ mod tests {
         }
         assert!(sd.history().is_empty(), "no samples before NTP sync");
     }
-
-    // --- Restore-from-blob ---
-
-    // --- Producer-independence: a dead sensor must not halt history ---
 
     #[test]
     fn battery_only_still_commits_with_ps_zeros() {

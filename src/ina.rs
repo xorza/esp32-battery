@@ -50,8 +50,6 @@ trait InaDevice {
     fn read(&mut self) -> Result<Ina228Reading, InaError>;
 }
 
-// --- Real device ------------------------------------------------------------
-
 #[cfg(not(feature = "ina-fake"))]
 mod real {
     use std::thread;
@@ -118,8 +116,6 @@ mod real {
     }
 }
 
-// --- Fake device ------------------------------------------------------------
-
 #[cfg(feature = "ina-fake")]
 mod fake {
     use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
@@ -160,8 +156,6 @@ mod fake {
     }
 }
 
-// --- Shared thread loop -----------------------------------------------------
-
 fn run<D: InaDevice>(mut device: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
     loop {
         let mut bat_acc = ReadingAccum::default();
@@ -190,8 +184,6 @@ fn run<D: InaDevice>(mut device: D, sensor_data: Arc<Mutex<SensorData>>, recorde
             .update_battery(bat_acc.average(SAMPLES_PER_UPDATE));
     }
 }
-
-// --- Public entry point -----------------------------------------------------
 
 #[cfg(not(feature = "ina-fake"))]
 fn make_device(pins: I2cPins) -> real::Ina {

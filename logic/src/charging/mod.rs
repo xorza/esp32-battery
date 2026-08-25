@@ -45,8 +45,6 @@ pub use xy_modbus::{ProtectionStatus, RtuError, SafetyLimits, Setpoints, XyError
 // LVP and OTP are the only causes the supervisor handles in-place.
 use ProtectionStatus::{Lvp, Otp};
 
-// ─── Tunables ────────────────────────────────────────────────────────────────
-
 /// CC charge rate as a fraction of pack capacity. 0.2C is the
 /// longevity-tuned value; manufacturer max is 0.5C. Stay conservative.
 pub const REGULATION_C: f32 = 0.2;
@@ -118,8 +116,6 @@ const TRANSITION_BUFFER: usize = 8;
 /// quantum is 0.01; two-quantum slack absorbs IEEE-float round-trip
 /// quirks on values like 14.4 V whose binary repr isn't exact.
 const SETPOINT_DRIFT_TOL: f32 = 0.02;
-
-// ─── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug)]
 pub struct Profile {
@@ -570,8 +566,6 @@ fn transition_between(from: &LatchState, to: &LatchState) -> Option<ChargeTransi
         _ => None,
     }
 }
-
-// ─── Impls ───────────────────────────────────────────────────────────────────
 
 impl Profile {
     /// Build a pack-level profile from chemistry, series cell count, and
@@ -1118,8 +1112,6 @@ impl ChargeSupervisor {
         Action::DisableOutput(DisableTicket { reason })
     }
 }
-
-// ─── Firmware-side V_SET sequencing ──────────────────────────────────────────
 
 /// Minimal device interface used by [`apply_update_voltage`] — only the
 /// two writes the safe step-down sequence needs. Lives here (not in

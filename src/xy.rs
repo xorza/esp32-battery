@@ -125,8 +125,6 @@ impl std::fmt::Display for BootError {
     }
 }
 
-// --- Real device ------------------------------------------------------------
-
 #[cfg(not(feature = "xy-fake"))]
 mod real {
     use esp_idf_hal::uart::{UartDriver, config::Config};
@@ -201,8 +199,6 @@ mod real {
         }
     }
 }
-
-// --- Fake device ------------------------------------------------------------
 
 #[cfg(feature = "xy-fake")]
 mod fake {
@@ -319,8 +315,6 @@ mod fake {
         }
     }
 }
-
-// --- Shared thread loop -----------------------------------------------------
 
 /// Programs protection + setpoints and reads them back to confirm the
 /// device accepted the writes. Output stays OFF — bringing up the buck
@@ -615,8 +609,6 @@ fn apply_action<D: XyDevice>(
         }
     }
 }
-
-// --- Public entry point -----------------------------------------------------
 
 #[cfg(not(feature = "xy-fake"))]
 fn make_device(pins: XyPins) -> real::Xy<'static> {

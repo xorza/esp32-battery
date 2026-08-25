@@ -30,15 +30,11 @@ use esp32_battery_logic::net::NetStatus;
 
 use crate::net::NetStatusHandle;
 
-// === Hardware ======================================================
-
 const SPI_BUF_SIZE: usize = 32768;
 const DMA_BUF_SIZE: usize = 32768;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const BACKLIGHT_PERCENT: u32 = 50;
 
-// === Layout ========================================================
-//
 // 320×172 panel, landscape via Rotation::Deg270.
 //
 // Upper region (y < LOWER_Y): 2×2 grid of 150×22 value cells with
@@ -79,8 +75,6 @@ const LOWER_ROW3_TOP: i32 = 144;
 // Label up to 4 chars (FONT_10X20 → 40 px) + 10 px gap; values align here.
 const LOWER_VALUE_X: i32 = LOWER_LEFT_X + 4 * 10 + 10;
 
-// === Colors ========================================================
-
 const COLOR_BG: Rgb565 = Rgb565::BLACK;
 const COLOR_LABEL: Rgb565 = Rgb565::new(18, 36, 18);
 const COLOR_VOLTAGE: Rgb565 = Rgb565::new(0, 63, 0);
@@ -105,8 +99,6 @@ fn battery_current_color(current: f32) -> Rgb565 {
     }
 }
 
-// === Scratch framebuffer ===========================================
-//
 // Single 320×22 buffer (~14 KB BSS) used for flicker-free composition
 // of one row at a time. Baseline at y=16 leaves a FONT_10X20 line's
 // ascenders/descenders inside the band.
@@ -197,8 +189,6 @@ where
     scratch.blit(display, Point::new(0, top), SCRATCH_W, SCRATCH_H);
 }
 
-// === Lower-region state ============================================
-//
 // One value per visually distinct lower-region layout. The UI redraws
 // the lower region only when this changes, so `Eq` collapses the
 // previous three-field comparison (status / ip / has_errors) into one.
@@ -235,8 +225,6 @@ impl LowerKey {
         }
     }
 }
-
-// === UI ============================================================
 
 struct Ui<D> {
     display: D,
@@ -466,8 +454,6 @@ where
         self.kv_row(LOWER_ROW3_TOP, "PACK", &buf, COLOR_VOLTAGE);
     }
 }
-
-// === Thread entry point ============================================
 
 pub fn start(
     pins: LcdPins,

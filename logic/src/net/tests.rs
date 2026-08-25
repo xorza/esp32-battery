@@ -55,8 +55,6 @@ fn serving(ssid: &str) -> NetSupervisor {
     s
 }
 
-// --- Boot -------------------------------------------------------------------
-
 #[test]
 fn boot_without_creds_is_captive_and_boot_with_creds_connects() {
     assert_eq!(*captive().phase(), NetPhase::CaptiveIdle);
@@ -82,8 +80,6 @@ fn captive_idle_refreshes_scan_and_holds() {
     // attempt one with.
     assert!(!NetPhase::CaptiveIdle.polls_association());
 }
-
-// --- Captive submission -----------------------------------------------------
 
 #[test]
 fn save_applies_creds_and_starts_the_budget() {
@@ -166,8 +162,6 @@ fn association_beats_a_save_arriving_in_the_same_tick() {
         }
     );
 }
-
-// --- STA lifecycle ----------------------------------------------------------
 
 #[test]
 fn connecting_falls_back_only_after_the_full_grace() {
@@ -287,8 +281,6 @@ fn fallback_retrying_accepts_new_creds_over_the_carried_ones() {
     );
 }
 
-// --- /wifi-reset ------------------------------------------------------------
-
 #[test]
 fn reset_returns_sta_phases_to_a_bare_captive_ap() {
     for mut s in [serving("home"), NetSupervisor::new(Some(creds("home")), Duration::ZERO)] {
@@ -320,8 +312,6 @@ fn reset_from_a_captive_phase_is_a_no_op() {
     assert_eq!(s.tick(p), NetAction::RefreshScan);
     assert_eq!(*s.phase(), NetPhase::CaptiveIdle);
 }
-
-// --- Derived views ----------------------------------------------------------
 
 #[test]
 fn lcd_status_and_association_polling_track_the_phase() {
