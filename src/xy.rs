@@ -15,12 +15,12 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    self, Action, BatterySample, BuckOutput, ChargeSupervisor, PollResult, VoltageWriter,
+    self, Action, BatterySample, BuckOutput, BusError, ChargeSupervisor, PollResult, VoltageWriter,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
 
-use xy_modbus::{Model, ModelCheck, ProtectionStatus, RtuError, SafetyLimits, Setpoints, Status};
+use xy_modbus::{ModelCheck, ProtectionStatus, SafetyLimits, Status};
 
 use crate::board::XyPins;
 use crate::clock::EventRecorder;
@@ -38,11 +38,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// removes the dependence on transport timing.
 const STEP_DOWN_SETTLE: Duration = Duration::from_millis(100);
 
-/// Buck variant on this board. Sets the per-register scales (I-OUT,
-/// POWER, S-OCP, S-OPP) — wrong family silently shifts readings by 10×,
-/// so this also drives the boot-time `verify_model` check and the fake
-/// device's mock MODEL response.
-const PACK_MODEL: Model = Model::Xy7025;
+/// MODEL register value for the XY7025 — the variant this board carries
+/// and the one xy-modbus's register scales are written for. Drives the
+/// boot-time model gate's error payload and the fake device's mock
+/// MODEL response.
+const EXPECTED_MODEL_CODE: u16 = 0x6500;
 
 /// The set of operations the charging loop needs from the buck. Real
 /// builds get the `xy_modbus`-backed implementation; `xy-fake` builds
@@ -52,27 +52,27 @@ const PACK_MODEL: Model = Model::Xy7025;
 /// are defined exactly once and `charging::apply_update_voltage` can
 /// drive any `XyDevice` directly.
 trait XyDevice: VoltageWriter {
-    fn verify_model(&mut self) -> Result<ModelCheck, RtuError>;
+    fn check_model(&mut self) -> Result<ModelCheck, BusError>;
     /// Live + control snapshot (regs 0x0000–0x0012). One Modbus
     /// round-trip per supervisor tick.
-    fn read_status(&mut self) -> Result<Status, RtuError>;
-    fn read_protection(&mut self) -> Result<SafetyLimits, RtuError>;
-    fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError>;
-    fn set_protection(&mut self, limits: SafetyLimits) -> Result<(), RtuError>;
+    fn read_status(&mut self) -> Result<Status, BusError>;
+    fn read_safety_limits(&mut self) -> Result<SafetyLimits, BusError>;
+    fn set_current_limit(&mut self, amps: f32) -> Result<(), BusError>;
+    fn set_safety_limits(&mut self, limits: SafetyLimits) -> Result<(), BusError>;
     /// Write 0 to PROTECT (0x0010) to clear a latched protection cause.
-    fn clear_protection_status(&mut self) -> Result<(), RtuError>;
+    fn clear_protection_status(&mut self) -> Result<(), BusError>;
     /// Program S_INI (power-on default of OUTPUT_EN). We always pass
     /// `false` so a brown-out / unrelated reset brings the buck back
     /// disabled — the supervisor's bring-up is the only thing allowed
     /// to enable output.
-    fn set_power_on_default(&mut self, on: bool) -> Result<(), RtuError>;
+    fn set_power_on_default(&mut self, on: bool) -> Result<(), BusError>;
 }
 
 /// Boot-time failure: either the Modbus transport gave up, or a register
 /// read back a different value than we wrote (wrong slave, scale mismatch,
 /// write rejected, etc.). Either way, we must not enable output.
 enum BootError {
-    Rtu(RtuError),
+    Bus(BusError),
     Verify {
         what: &'static str,
         expected: f32,
@@ -83,25 +83,25 @@ enum BootError {
     /// hand off to the supervisor — we'd be entering Pending with the
     /// buck already sourcing.
     OutputOn,
-    /// Device's MODEL register reports a code mapped to a different
-    /// scale family than the configured `Model`. Readings (especially
-    /// I-OUT) would be off by 10×; refuse to proceed.
+    /// Device's MODEL register reports a code whose register scales are
+    /// not the ones xy-modbus decodes with. Readings (especially I-OUT)
+    /// would be off by 10×; refuse to proceed.
     ModelMismatch {
         expected_code: u16,
         device_code: u16,
     },
 }
 
-impl From<RtuError> for BootError {
-    fn from(e: RtuError) -> Self {
-        Self::Rtu(e)
+impl From<BusError> for BootError {
+    fn from(e: BusError) -> Self {
+        Self::Bus(e)
     }
 }
 
 impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rtu(e) => std::fmt::Display::fmt(e, f),
+            Self::Bus(e) => std::fmt::Display::fmt(e, f),
             Self::Verify {
                 what,
                 expected,
@@ -118,7 +118,7 @@ impl std::fmt::Display for BootError {
                 device_code,
             } => write!(
                 f,
-                "MODEL mismatch: configured family expects 0x{expected_code:04X}, device reports 0x{device_code:04X}"
+                "MODEL mismatch: driver scales expect 0x{expected_code:04X}, device reports 0x{device_code:04X}"
             ),
         }
     }
@@ -132,11 +132,11 @@ mod real {
     use esp_idf_hal::units::Hertz;
 
     use xy_modbus::esp_idf::EspIdfTransport;
-    use xy_modbus::{ModelCheck, RtuError, SafetyLimits, Status};
+    use xy_modbus::{ModelCheck, SafetyLimits, Status};
 
-    use esp32_battery_logic::charging::VoltageWriter;
+    use esp32_battery_logic::charging::{BusError, VoltageWriter};
 
-    use super::{PACK_MODEL, XyDevice};
+    use super::XyDevice;
     use crate::board::XyPins;
 
     const BAUD: u32 = 115200;
@@ -157,45 +157,45 @@ mod real {
             .expect("UART1 init");
             // Default XY-series timing baked in by `from_esp_uart`:
             // 500 ms response window, 50 ms inter-frame gap.
-            Self(xy_modbus::Xy::from_esp_uart(uart, PACK_MODEL))
+            Self(xy_modbus::Xy::from_esp_uart(uart))
         }
     }
 
     impl VoltageWriter for Xy<'_> {
-        fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
+        fn set_voltage(&mut self, volts: f32) -> Result<(), BusError> {
             self.0.set_voltage(volts)
         }
-        fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
+        fn set_output(&mut self, on: bool) -> Result<(), BusError> {
             self.0.set_output(on)
         }
     }
 
     impl XyDevice for Xy<'_> {
-        fn verify_model(&mut self) -> Result<ModelCheck, RtuError> {
-            self.0.verify_model()
+        fn check_model(&mut self) -> Result<ModelCheck, BusError> {
+            self.0.check_model()
         }
 
-        fn read_status(&mut self) -> Result<Status, RtuError> {
+        fn read_status(&mut self) -> Result<Status, BusError> {
             self.0.read_status()
         }
 
-        fn read_protection(&mut self) -> Result<SafetyLimits, RtuError> {
-            self.0.read_protection()
+        fn read_safety_limits(&mut self) -> Result<SafetyLimits, BusError> {
+            self.0.read_safety_limits()
         }
 
-        fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError> {
+        fn set_current_limit(&mut self, amps: f32) -> Result<(), BusError> {
             self.0.set_current_limit(amps)
         }
 
-        fn set_protection(&mut self, limits: SafetyLimits) -> Result<(), RtuError> {
-            self.0.set_protection(limits)
+        fn set_safety_limits(&mut self, limits: SafetyLimits) -> Result<(), BusError> {
+            self.0.set_safety_limits(limits)
         }
 
-        fn clear_protection_status(&mut self) -> Result<(), RtuError> {
+        fn clear_protection_status(&mut self) -> Result<(), BusError> {
             self.0.clear_protection_status()
         }
 
-        fn set_power_on_default(&mut self, on: bool) -> Result<(), RtuError> {
+        fn set_power_on_default(&mut self, on: bool) -> Result<(), BusError> {
             self.0.set_power_on_output(on)
         }
     }
@@ -208,10 +208,10 @@ mod fake {
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
-    use esp32_battery_logic::charging::VoltageWriter;
-    use xy_modbus::{ModelCheck, ProtectionStatus, RegMode, RtuError, SafetyLimits, Status};
+    use esp32_battery_logic::charging::{BusError, VoltageWriter};
+    use xy_modbus::{ModelCheck, ProtectionStatus, RegMode, SafetyLimits, Setpoints, Status};
 
-    use super::{PACK_MODEL, XyDevice};
+    use super::{EXPECTED_MODEL_CODE, XyDevice};
     use crate::board::XyPins;
 
     const BAUD: u32 = 115200;
@@ -260,35 +260,35 @@ mod fake {
     }
 
     impl VoltageWriter for Xy<'_> {
-        fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
+        fn set_voltage(&mut self, volts: f32) -> Result<(), BusError> {
             self.v_set = volts;
             Ok(())
         }
-        fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
+        fn set_output(&mut self, on: bool) -> Result<(), BusError> {
             self.output_on = on;
             Ok(())
         }
     }
 
     impl XyDevice for Xy<'_> {
-        fn verify_model(&mut self) -> Result<ModelCheck, RtuError> {
-            // Fake mirrors what a correctly-wired device would report:
-            // the family code that matches `PACK_MODEL`. `expect`
-            // rather than a fallback so switching `PACK_MODEL` to an
-            // unpinned variant (SK family / Custom) fails loudly here
-            // instead of silently masking the boot gate.
-            Ok(ModelCheck::Match {
-                device_code: PACK_MODEL
-                    .expected_model_code()
-                    .expect("PACK_MODEL must have a pinned family code"),
+        fn check_model(&mut self) -> Result<ModelCheck, BusError> {
+            // Mirrors what a correctly-wired XY7025 reports, so the fake
+            // clears the same boot gate the real device does instead of
+            // masking it.
+            Ok(ModelCheck {
+                device_code: EXPECTED_MODEL_CODE,
+                scales_match: true,
+                limits_match: true,
             })
         }
 
-        fn read_status(&mut self) -> Result<Status, RtuError> {
+        fn read_status(&mut self) -> Result<Status, BusError> {
             let v = if self.output_on { self.v_set } else { 0.0 };
             Ok(Status {
-                v_set: self.v_set,
-                i_set: self.i_set,
+                setpoints: Setpoints {
+                    v_set: self.v_set,
+                    i_set: self.i_set,
+                },
                 v_out: v,
                 i_out: 0.0,
                 p_out: 0.0,
@@ -298,22 +298,22 @@ mod fake {
                 output_on: self.output_on,
             })
         }
-        fn read_protection(&mut self) -> Result<SafetyLimits, RtuError> {
+        fn read_safety_limits(&mut self) -> Result<SafetyLimits, BusError> {
             Ok(self.protection)
         }
-        fn set_current_limit(&mut self, amps: f32) -> Result<(), RtuError> {
+        fn set_current_limit(&mut self, amps: f32) -> Result<(), BusError> {
             self.i_set = amps;
             Ok(())
         }
-        fn set_protection(&mut self, limits: SafetyLimits) -> Result<(), RtuError> {
+        fn set_safety_limits(&mut self, limits: SafetyLimits) -> Result<(), BusError> {
             self.protection = limits;
             Ok(())
         }
-        fn clear_protection_status(&mut self) -> Result<(), RtuError> {
+        fn clear_protection_status(&mut self) -> Result<(), BusError> {
             self.protection_status = ProtectionStatus::Normal;
             Ok(())
         }
-        fn set_power_on_default(&mut self, _on: bool) -> Result<(), RtuError> {
+        fn set_power_on_default(&mut self, _on: bool) -> Result<(), BusError> {
             Ok(())
         }
     }
@@ -327,37 +327,47 @@ mod fake {
 /// first tick. Readback catches dropped writes, scale mismatches, and
 /// wrong-slave wiring before the supervisor can ask for output enable.
 fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<u16, BootError> {
-    // Confirm we're talking to the family we think we're talking to —
-    // before any writes go out. Wrong-family configuration silently
-    // corrupts every subsequent reading by 10×, so we refuse to proceed
-    // on Mismatch. `Inconclusive` (SK family / Custom / undocumented
-    // code) is allowed through; verification just isn't possible.
-    let device_code = match xy.verify_model()? {
-        ModelCheck::Mismatch {
-            expected_code,
-            device_code,
-        } => {
-            return Err(BootError::ModelMismatch {
-                expected_code,
-                device_code,
-            });
-        }
-        ModelCheck::Match { device_code } | ModelCheck::Inconclusive { device_code } => device_code,
-    };
+    // Confirm we're talking to the device the register scales were
+    // written for, before any writes go out — a scale mismatch silently
+    // shifts every subsequent reading (notably I-OUT) by 10×.
+    //
+    // `scales_match` is false for an unrecognised MODEL code as well as a
+    // known-incompatible one, and we refuse either way. That is stricter
+    // than the old `Inconclusive`-passes behaviour: an undocumented code
+    // now blocks bring-up rather than being trusted on the assumption the
+    // scales happen to line up.
+    let check = xy.check_model()?;
+    if !check.scales_match {
+        return Err(BootError::ModelMismatch {
+            expected_code: EXPECTED_MODEL_CODE,
+            device_code: check.device_code,
+        });
+    }
+    // Scales decode correctly but the ceilings `set_voltage` and friends
+    // enforce were written for the XY7025. Worth saying out loud; not
+    // worth refusing over, since SAFETY is programmed into the device's
+    // own protection registers either way.
+    if !check.limits_match {
+        warn!(
+            "XY MODEL 0x{:04X}: scales match but limit ceilings differ from XY7025",
+            check.device_code
+        );
+    }
+    let device_code = check.device_code;
     xy.set_output(false)?;
     // Wipe any latched protection cause from a prior session — power
     // outages and unrelated crashes leave 0x0010 set, and we don't want
     // that stale value contaminating the per-tick read in `poll`.
     xy.clear_protection_status()?;
     xy.set_power_on_default(false)?;
-    xy.set_protection(SAFETY)?;
+    xy.set_safety_limits(SAFETY)?;
     xy.set_voltage(PACK_PROFILE.float_v)?;
     xy.set_current_limit(PACK_PROFILE.regulation_a)?;
 
     let s = xy.read_status()?;
-    verify("V_SET", PACK_PROFILE.float_v, s.v_set)?;
-    verify("I_SET", PACK_PROFILE.regulation_a, s.i_set)?;
-    let p = xy.read_protection()?;
+    verify("V_SET", PACK_PROFILE.float_v, s.setpoints.v_set)?;
+    verify("I_SET", PACK_PROFILE.regulation_a, s.setpoints.i_set)?;
+    let p = xy.read_safety_limits()?;
     verify("OVP", SAFETY.ovp_v, p.ovp_v)?;
     verify("OCP", SAFETY.ocp_a, p.ocp_a)?;
     verify("LVP", SAFETY.lvp_v, p.lvp_v)?;
@@ -495,15 +505,12 @@ fn poll<D: XyDevice>(
                     voltage: s.v_out,
                     current: s.i_out,
                     power: s.p_out,
-                    v_set: s.v_set,
-                    i_set: s.i_set,
+                    v_set: s.setpoints.v_set,
+                    i_set: s.setpoints.i_set,
                 });
                 sd.ps_offline = ps_offline;
             }
-            let setpoints = Some(Setpoints {
-                v_set: s.v_set,
-                i_set: s.i_set,
-            });
+            let setpoints = Some(s.setpoints);
             let output = Some(if s.output_on {
                 *last_protection = ProtectionStatus::Normal;
                 BuckOutput::On

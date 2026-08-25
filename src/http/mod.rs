@@ -23,15 +23,17 @@ const SERVER_CERT: X509<'static> =
     X509::pem_until_nul(include_bytes!("../../certs/selfsigned.crt"));
 const SERVER_KEY: X509<'static> = X509::pem_until_nul(include_bytes!("../../certs/selfsigned.key"));
 
+/// Published `esp-idf-svc` 0.52.1 exposes neither TCP keep-alive nor
+/// `SO_LINGER` on the server config, so neither is set here. Half-open
+/// sockets are reclaimed only by `lru_purge_enable` plus the 2 s session
+/// timeout, and closed sockets go through TIME_WAIT — which matters
+/// because `max_open_sockets` is 3 on the dashboard.
 pub(crate) fn create_server(
     stack_size: usize,
     wildcard: bool,
     max_sockets: usize,
-    so_linger: Option<Duration>,
     https: bool,
 ) -> EspHttpServer<'static> {
-    use esp_idf_svc::http::server::KeepAlive;
-
     let (cert, key) = if https {
         (Some(SERVER_CERT), Some(SERVER_KEY))
     } else {
@@ -45,12 +47,6 @@ pub(crate) fn create_server(
         uri_match_wildcard: wildcard,
         session_timeout: Duration::from_secs(2),
         lru_purge_enable: true,
-        keep_alive: Some(KeepAlive {
-            idle_secs: 3,
-            interval_secs: 3,
-            probe_count: 2,
-        }),
-        so_linger,
         server_certificate: cert,
         private_key: key,
         ..Default::default()

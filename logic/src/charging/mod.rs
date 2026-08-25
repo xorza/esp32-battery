@@ -29,7 +29,11 @@ use strum::IntoStaticStr;
 use crate::battery::{self, Chemistry};
 use crate::error_log::XyError;
 
-pub use xy_modbus::{ProtectionStatus, RtuError, SafetyLimits, Setpoints};
+// `XyError` is xy-modbus's top-level failure (input / bad register value /
+// transport). Renamed on import: `error_log::XyError` is this crate's
+// event kind and the two would otherwise collide in every module that
+// touches both.
+pub use xy_modbus::{ProtectionStatus, RtuError, SafetyLimits, Setpoints, XyError as BusError};
 // Imported by name for terse pattern matching on the buck's PROTECT register —
 // LVP and OTP are the only causes the supervisor handles in-place.
 use ProtectionStatus::{Lvp, Otp};
@@ -797,8 +801,8 @@ impl ChargeSupervisor {
 /// two writes the safe step-down sequence needs. Lives here (not in
 /// firmware) so the sequencing is host-testable with a mock.
 pub trait VoltageWriter {
-    fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError>;
-    fn set_output(&mut self, on: bool) -> Result<(), RtuError>;
+    fn set_voltage(&mut self, volts: f32) -> Result<(), BusError>;
+    fn set_output(&mut self, on: bool) -> Result<(), BusError>;
 }
 
 /// Execute one `Action::UpdateVoltage`. For `cycle_output: false` (step-up)

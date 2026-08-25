@@ -2,7 +2,6 @@
 //! fns; this file owns ordering and dependency wiring, nothing else.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
@@ -22,7 +21,7 @@ pub fn start(
     nvs: Arc<EspNvs<NvsDefault>>,
     reset: ResetSignal,
 ) -> EspHttpServer<'static> {
-    let mut server = create_server(10240, false, 3, Some(Duration::from_secs(0)), true);
+    let mut server = create_server(10240, false, 3, true);
 
     serve_common_assets(&mut server);
     serve_static(

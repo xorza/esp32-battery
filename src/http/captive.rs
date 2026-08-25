@@ -2,8 +2,6 @@
 //! assets, then registers the wildcard portal page LAST so named routes
 //! take precedence over the catch-all.
 
-use std::time::Duration;
-
 use log::info;
 
 use crate::captive_api;
@@ -18,7 +16,7 @@ pub fn start(scan_cache: ScanCache) -> CaptiveBundle {
     let mailbox = new_creds_mailbox();
     let status = SubmissionStatusHandle::new();
 
-    let mut server = create_server(8192, true, 4, Some(Duration::from_secs(2)), false);
+    let mut server = create_server(8192, true, 4, false);
 
     captive_api::mount(&mut server, scan_cache, mailbox.clone(), status.clone());
     serve_common_assets(&mut server);

@@ -1593,20 +1593,20 @@ struct MockWriter {
 }
 
 impl VoltageWriter for MockWriter {
-    fn set_voltage(&mut self, volts: f32) -> Result<(), RtuError> {
+    fn set_voltage(&mut self, volts: f32) -> Result<(), BusError> {
         let idx = self.set_voltage_calls.len();
         self.set_voltage_calls.push(volts);
         if self.fail_set_voltage_at.contains(&idx) {
-            Err(RtuError::Timeout)
+            Err(BusError::Rtu(RtuError::Timeout))
         } else {
             Ok(())
         }
     }
-    fn set_output(&mut self, on: bool) -> Result<(), RtuError> {
+    fn set_output(&mut self, on: bool) -> Result<(), BusError> {
         let idx = self.set_output_calls.len();
         self.set_output_calls.push(on);
         if self.fail_set_output_at.contains(&idx) {
-            Err(RtuError::Timeout)
+            Err(BusError::Rtu(RtuError::Timeout))
         } else {
             Ok(())
         }

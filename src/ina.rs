@@ -54,9 +54,11 @@ trait InaDevice {
 
 #[cfg(not(feature = "ina-fake"))]
 mod real {
-    use std::sync::OnceLock;
+    use std::thread;
+    use std::time::Duration;
 
-    use esp_idf_hal::i2c::{I2cBusDriver, I2cDriver, config::BusConfig, config::DeviceConfig};
+    use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
+    use esp_idf_hal::units::Hertz;
 
     use esp32_battery_logic::data::Ina228Reading;
     use esp32_battery_logic::error_log::InaError;
@@ -69,9 +71,13 @@ mod real {
     const SHUNT_RESISTANCE_OHM: f32 = 0.002;
     const MAX_CURRENT_A: f32 = 15.0;
 
-    type I2cDev = I2cDriver<'static, &'static I2cBusDriver<'static>>;
+    /// Oscillator/ADC settling window the INA228 needs after a soft reset.
+    /// The datasheet asks for 300 us and `Ina228::reset` deliberately does
+    /// not sleep on its own, so calibrating immediately would write
+    /// SHUNT_CAL while the device is still coming up.
+    const RESET_SETTLE: Duration = Duration::from_millis(1);
 
-    static I2C_BUS: OnceLock<I2cBusDriver<'static>> = OnceLock::new();
+    type I2cDev = I2cDriver<'static>;
 
     pub struct Ina {
         ina: ina228::Ina228<I2cDev>,
@@ -82,20 +88,13 @@ mod real {
         /// INA228. Panics on any init failure — the INA is soldered on,
         /// so a failure here is a hardware fault, not a runtime condition.
         pub fn new(pins: I2cPins) -> Self {
-            // Bus lives for the whole process lifetime; OnceLock gives the
-            // `'static` borrow without a leaked allocation. `set` rejects
-            // a second init so re-calling `Ina::new` panics rather than
-            // silently dropping new pins on the floor.
-            let bus = I2cBusDriver::new(pins.i2c, pins.sda, pins.scl, &BusConfig::new())
-                .expect("I2C bus init");
-            I2C_BUS.set(bus).ok().expect("I2C bus already initialized");
-            let i2c_bus: &'static I2cBusDriver<'static> = I2C_BUS.get().unwrap();
-            let dev_config = DeviceConfig::new().scl_speed_hz(I2C_SPEED_HZ);
-            let dev =
-                I2cDriver::new(i2c_bus, BATTERY_INA_ADDR, &dev_config).expect("I2C device init");
-            let mut ina = ina228::Ina228::new(dev, BATTERY_INA_ADDR);
-            ina.reset()
-                .expect("INA228 reset (sensor missing or wired wrong?)");
+            let config = I2cConfig::new().baudrate(Hertz(I2C_SPEED_HZ));
+            let dev = I2cDriver::new(pins.i2c, pins.sda, pins.scl, &config).expect("I2C init");
+            // `Ina228::new` reads CONFIG, so this is also the presence probe.
+            let mut ina = ina228::Ina228::new(dev, BATTERY_INA_ADDR)
+                .expect("INA228 probe (sensor missing or wired wrong?)");
+            ina.reset().expect("INA228 reset");
+            thread::sleep(RESET_SETTLE);
             ina.calibrate(MAX_CURRENT_A, SHUNT_RESISTANCE_OHM)
                 .expect("INA228 calibrate");
             Self { ina }
@@ -123,7 +122,8 @@ mod real {
 
 #[cfg(feature = "ina-fake")]
 mod fake {
-    use esp_idf_hal::i2c::{I2cBusDriver, config::BusConfig};
+    use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
+    use esp_idf_hal::units::Hertz;
 
     use esp32_battery_logic::data::Ina228Reading;
     use esp32_battery_logic::error_log::InaError;
@@ -131,19 +131,21 @@ mod fake {
     use super::InaDevice;
     use crate::board::I2cPins;
 
+    const I2C_SPEED_HZ: u32 = 400_000;
+
     pub struct Ina {
-        // Real I²C bus driver, constructed but never read. Held so the
+        // Real I²C driver, constructed but never read. Held so the
         // peripheral and its GPIOs are genuinely configured and claimed
         // for the program lifetime — pin/mux/clock conflicts surface on
         // the bench just as they would in a real build.
-        _bus: I2cBusDriver<'static>,
+        _i2c: I2cDriver<'static>,
     }
 
     impl Ina {
         pub fn new(pins: I2cPins) -> Self {
-            let bus = I2cBusDriver::new(pins.i2c, pins.sda, pins.scl, &BusConfig::new())
-                .expect("I2C bus init");
-            Self { _bus: bus }
+            let config = I2cConfig::new().baudrate(Hertz(I2C_SPEED_HZ));
+            let i2c = I2cDriver::new(pins.i2c, pins.sda, pins.scl, &config).expect("I2C init");
+            Self { _i2c: i2c }
         }
     }
 
