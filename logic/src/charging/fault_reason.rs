@@ -21,10 +21,12 @@ pub enum FaultReason {
     /// Pack voltage exceeded `absorb_v + OV_MARGIN_V` for `OV_DURATION.as_secs()` ticks.
     /// Catches drift below the XY's hardware OVP trip but above the profile target.
     Overvoltage,
-    /// Pack held at the CV plateau (`absorb_v`) for `MAX_ABSORB.as_secs()`
-    /// ticks without tapering out. Under a parasitic load pinning current
-    /// above `exit_absorb_a` we'd otherwise sit at CV forever. The CC ramp
-    /// up to `absorb_v` doesn't count — only time spent actually at CV.
+    /// Pack held at the CV plateau (`absorb_v`) for a net `MAX_ABSORB`
+    /// without tapering out. Under a parasitic load pinning current above
+    /// `exit_absorb_a` we'd otherwise sit at CV forever. The CC ramp up to
+    /// `absorb_v` doesn't count — only time spent actually at CV, and the
+    /// window is leaky, so time spent off the plateau subtracts rather
+    /// than erasing what came before.
     AbsorbTimeout,
     /// Pack spent `MAX_CHARGE.as_secs()` seconds continuously in Absorb
     /// without the taper ever ending the cycle. `AbsorbTimeout` clocks only
