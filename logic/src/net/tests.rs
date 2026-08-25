@@ -4,7 +4,8 @@ fn creds(ssid: &str) -> WifiCredentials {
     WifiCredentials::new(ssid, "password1")
 }
 
-const S: Duration = Duration::from_secs(1);
+/// One supervisor tick, matching the firmware's 1 Hz loop.
+const TICK: Duration = Duration::from_secs(1);
 
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
@@ -44,7 +45,7 @@ fn captive() -> NetSupervisor {
 /// Supervisor already serving the dashboard on `ssid`.
 fn serving(ssid: &str) -> NetSupervisor {
     let mut s = NetSupervisor::new(Some(creds(ssid)), Duration::ZERO);
-    assert_eq!(s.tick(assoc(S)), NetAction::StartMdns);
+    assert_eq!(s.tick(assoc(TICK)), NetAction::StartMdns);
     assert!(matches!(
         s.phase(),
         NetPhase::StaServing {
@@ -100,7 +101,7 @@ fn trying_times_out_at_exactly_the_budget() {
     s.tick(save(Duration::ZERO, "home"));
 
     // One second short of the budget: still waiting.
-    let last_ok = CAPTIVE_TRYING_TIMEOUT - S;
+    let last_ok = CAPTIVE_TRYING_TIMEOUT - TICK;
     assert_eq!(s.tick(idle(last_ok)), NetAction::Nothing);
     assert!(matches!(s.phase(), NetPhase::CaptiveTrying { .. }));
 
@@ -166,7 +167,7 @@ fn association_beats_a_save_arriving_in_the_same_tick() {
 #[test]
 fn connecting_falls_back_only_after_the_full_grace() {
     let mut s = NetSupervisor::new(Some(creds("home")), Duration::ZERO);
-    assert_eq!(s.tick(idle(CAPTIVE_AFTER_DISCONNECT - S)), NetAction::Nothing);
+    assert_eq!(s.tick(idle(CAPTIVE_AFTER_DISCONNECT - TICK)), NetAction::Nothing);
     assert!(matches!(s.phase(), NetPhase::StaConnecting { .. }));
     assert_eq!(
         s.tick(idle(CAPTIVE_AFTER_DISCONNECT)),
@@ -207,7 +208,7 @@ fn serving_counts_the_grace_from_the_first_miss_not_the_latest() {
         );
     }
     let deadline = secs(100) + CAPTIVE_AFTER_DISCONNECT;
-    assert_eq!(s.tick(idle(deadline - S)), NetAction::Nothing);
+    assert_eq!(s.tick(idle(deadline - TICK)), NetAction::Nothing);
     assert_eq!(
         s.tick(idle(deadline)),
         NetAction::FallbackToCaptive(creds("home"))
@@ -251,7 +252,7 @@ fn fallback_retrying_promotes_on_association() {
     );
     // The background STA half gets there eventually.
     assert_eq!(
-        s.tick(assoc(deadline + S)),
+        s.tick(assoc(deadline + TICK)),
         NetAction::PromoteToSta(creds("home"))
     );
     assert!(matches!(
@@ -270,7 +271,7 @@ fn fallback_retrying_accepts_new_creds_over_the_carried_ones() {
     s.tick(idle(CAPTIVE_AFTER_DISCONNECT));
     assert!(matches!(s.phase(), NetPhase::CaptiveFallbackRetrying { .. }));
 
-    let t = CAPTIVE_AFTER_DISCONNECT + S;
+    let t = CAPTIVE_AFTER_DISCONNECT + TICK;
     assert_eq!(s.tick(save(t, "new")), NetAction::ApplyCreds(creds("new")));
     assert_eq!(
         *s.phase(),

@@ -133,7 +133,7 @@ fn active(profile: Profile) -> ChargeSupervisor {
     let mut s = ChargeSupervisor::new(profile);
     let a = ok_tick(&mut s, b(bring_up_v, -0.1), TICK);
     assert!(!accept_enable(&mut s, a), "full pack must not resume Absorb");
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
     s
 }
 
@@ -144,7 +144,7 @@ fn enter_absorb(s: &mut ChargeSupervisor) {
         ok_tick(s, b(OK_V, -4.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 /// Drive `s` from Active into `Tripped(OutputUnexpectedlyOff(cause), acked: true)`.
@@ -161,6 +161,141 @@ fn latch_self_disable(s: &mut ChargeSupervisor, cause: ProtectionStatus) {
         FaultReason::OutputUnexpectedlyOff(cause)
     ));
     accept_disable(s, a);
+}
+
+/// Drive `s` to the Absorb→Float transition and hand back its ticket,
+/// uncommitted, so the caller owns the apply step.
+fn drive_to_absorb_to_float_pending(s: &mut ChargeSupervisor) -> VoltageTicket {
+    enter_absorb(s);
+    let tapered = b(CV_V, -(lfp_4s().exit_absorb_a - 0.1));
+    let p = expected_poll(s, tapered);
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(s.tick(p, TICK), Action::None));
+    }
+    let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
+        panic!("expected Absorb→Float UpdateVoltage after EXIT_DEBOUNCE");
+    };
+    assert!(ticket.cycle_output, "Absorb→Float is a step DOWN");
+    ticket
+}
+
+/// Drive `s` to the Float→Absorb transition and hand back its ticket.
+fn drive_to_float_to_absorb_pending(s: &mut ChargeSupervisor) -> VoltageTicket {
+    let p = expected_poll(s, b(OK_V, -4.0));
+    let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
+        panic!("expected Float→Absorb UpdateVoltage");
+    };
+    assert!(!ticket.cycle_output, "Float→Absorb is a step UP");
+    ticket
+}
+
+/// Run one `UpdateVoltage` exactly as the firmware does: execute the
+/// writes, then commit the ticket only if V_SET actually landed. Returns
+/// the errors the sequence reported. `settle` is a no-op here — the
+/// quiet window is a real delay only on hardware.
+fn apply_ticket(
+    s: &mut ChargeSupervisor,
+    xy: &mut MockWriter,
+    ticket: VoltageTicket,
+) -> Vec<XyError> {
+    let mut errs = Vec::new();
+    let outcome = apply_update_voltage(xy, &ticket, || {}, |e| errs.push(e));
+    if outcome == VoltageWriteOutcome::Committed {
+        s.commit_voltage(ticket);
+    }
+    errs
+}
+
+/// A poll where the buck reports `output` and everything else is drift-free.
+/// Built from `expected_setpoints` rather than `expected_poll` so it stays
+/// valid across the latch-state changes these tests drive.
+fn poll_with_output(s: &ChargeSupervisor, output: BuckOutput) -> PollResult {
+    PollResult {
+        output: Some(output),
+        setpoints: Some(s.expected_setpoints()),
+        battery: b(OK_V, -0.1),
+    }
+}
+
+/// Deterministic xorshift64. Enough to shuffle the supervisor through state
+/// combinations no hand-written scenario reaches, while staying exactly
+/// reproducible from the seed a failure prints.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        // xorshift64 is a fixed point at zero.
+        Self(seed | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// Uniform in `0..n`.
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// A poll drawn from the plausible space: mostly healthy, occasionally a
+/// failed read, a drifted setpoint, a missing or NaN sample, or a buck
+/// that disagrees with the supervisor about its own output.
+fn random_poll(rng: &mut Rng, s: &ChargeSupervisor) -> PollResult {
+    let profile = lfp_4s();
+    let setpoints = match rng.below(1000) {
+        0..=14 => None,
+        15..=16 => Some(Setpoints {
+            v_set: 12.0,
+            i_set: profile.regulation_a,
+        }),
+        _ => Some(s.expected_setpoints()),
+    };
+    let battery = match rng.below(1000) {
+        0..=19 => None,
+        20..=24 => Some(BatterySample {
+            voltage: f32::NAN,
+            current: -1.0,
+        }),
+        // 12.00–15.99 V spans the CC ramp, the CV plateau (14.4) and the
+        // OV trip (14.6).
+        //
+        // Current is bimodal on purpose. Drawn uniformly from 0–12 A it
+        // sits above the 2.5 A tail on most ticks, so the *leaky* exit
+        // window never nets its 60 s and Absorb→Float — the step-down, the
+        // transition that must cycle the output — fires zero times in
+        // 100k ticks. So 85% of samples come from a band straddling the
+        // tail instead: both sides of the gate still get drawn, but below
+        // it often enough that the window can actually net out mid-run.
+        _ => Some(BatterySample {
+            voltage: 12.0 + (rng.below(400) as f32) / 100.0,
+            current: -if rng.below(100) < 85 {
+                (rng.below(260) as f32) / 100.0
+            } else {
+                (rng.below(1200) as f32) / 100.0
+            },
+        }),
+    };
+    let output = match rng.below(1000) {
+        0 => None,
+        1..=3 => Some(BuckOutput::Off {
+            cause: match rng.below(4) {
+                0 => ProtectionStatus::Lvp,
+                1 => ProtectionStatus::Otp,
+                2 => ProtectionStatus::Ovp,
+                _ => ProtectionStatus::Normal,
+            },
+        }),
+        _ => Some(expected_output(s)),
+    };
+    PollResult {
+        setpoints,
+        output,
+        battery,
+    }
 }
 
 #[test]
@@ -339,7 +474,7 @@ fn safety_limits_ovp_clears_supervisor_threshold() {
 #[test]
 fn starts_in_float_at_float_voltage() {
     let s = ChargeSupervisor::new(lfp_4s());
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
     assert!(approx(s.target_voltage(), 13.5));
 }
 
@@ -351,7 +486,7 @@ fn enters_absorb_when_charging_current_exceeds_threshold() {
         ok_tick(&mut s, b(OK_V, -4.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
     assert!(approx(s.target_voltage(), 14.4));
 }
 
@@ -360,7 +495,7 @@ fn does_not_enter_absorb_at_exact_threshold() {
     // Strictly greater: 3.0 A must NOT trigger; 3.001 A must.
     let mut s = active(lfp_4s());
     assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
     assert!(matches!(
         ok_tick(&mut s, b(OK_V, -3.001), TICK),
         Action::UpdateVoltage { .. }
@@ -372,7 +507,7 @@ fn discharge_current_does_not_enter_absorb() {
     // 5 A discharge (positive). |I| > 3 A but it's NOT charging.
     let mut s = active(lfp_4s());
     assert!(matches!(ok_tick(&mut s, b(OK_V, 5.0), TICK), Action::None));
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -384,7 +519,7 @@ fn stays_in_absorb_above_exit_threshold() {
     assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     // Strictly less-than, so 2.5 stays.
     assert!(matches!(ok_tick(&mut s, b(OK_V, -2.5), TICK), Action::None));
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -400,7 +535,7 @@ fn exits_absorb_when_taper_drops_below_threshold() {
         ok_tick(&mut s, b(OK_V, -2.4), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
     assert!(approx(s.target_voltage(), 13.5));
 }
 
@@ -437,7 +572,7 @@ fn sustained_recharge_drains_exit_gate() {
     for _ in 0..EXIT_DEBOUNCE.as_secs() {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -4.0), TICK), Action::None));
     }
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
     // A fresh full window below tail is now required to exit.
     for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
@@ -446,7 +581,7 @@ fn sustained_recharge_drains_exit_gate() {
         ok_tick(&mut s, b(OK_V, -2.4), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -479,7 +614,7 @@ fn pulsing_current_still_exits_absorb() {
     // fast that the spikes were being ignored entirely.
     let cycle = exited_at.expect("pulsing pack never exited Absorb");
     assert!((25..40).contains(&cycle), "exited after {cycle} cycles");
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
     assert!(approx(s.target_voltage(), 13.5));
 }
 
@@ -500,7 +635,7 @@ fn exit_debounce_does_not_accumulate_in_float() {
         Action::UpdateVoltage { .. }
     ));
     assert!(matches!(ok_tick(&mut s, b(OK_V, -2.4), TICK), Action::None));
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -513,7 +648,7 @@ fn exit_debounce_honors_elapsed() {
         ok_tick(&mut s, b(OK_V, -2.4), EXIT_DEBOUNCE),
         Action::UpdateVoltage { .. }
     ));
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
     assert!(approx(s.target_voltage(), 13.5));
 }
 
@@ -524,12 +659,12 @@ fn hysteresis_no_flap_between_thresholds() {
     for _ in 0..10 {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     }
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
     ok_tick(&mut s, b(OK_V, -4.0), TICK);
     for _ in 0..10 {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -2.7), TICK), Action::None));
     }
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -566,8 +701,8 @@ fn nan_or_inf_in_sample_treated_as_missing() {
         assert!(matches!(ok_tick(&mut s, b(OK_V, v), TICK), Action::None));
         assert!(matches!(ok_tick(&mut s, b(v, -1.0), TICK), Action::None));
     }
-    assert!(matches!(s.phase(), Phase::Float));
-    assert!(s.fault().is_none());
+    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -582,7 +717,7 @@ fn nan_voltage_eventually_latches_battery_stale() {
             Action::None
         ));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     let a = ok_tick(&mut s, b(f32::NAN, -0.1), TICK);
     assert!(matches_disable(&a, FaultReason::BatterySensorStale));
 }
@@ -595,7 +730,7 @@ fn nan_current_eventually_latches_battery_stale() {
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
         ok_tick(&mut s, b(OK_V, f32::NAN), TICK);
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     let a = ok_tick(&mut s, b(OK_V, f32::NAN), TICK);
     assert!(matches_disable(&a, FaultReason::BatterySensorStale));
 }
@@ -614,7 +749,7 @@ fn nan_then_recovery_clears_stale_debounce() {
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
         ok_tick(&mut s, b(f32::NAN, -0.1), TICK);
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -675,48 +810,27 @@ fn full_charge_cycle() {
 }
 
 #[test]
-fn ov_fault_honors_sub_second_elapsed() {
-    // 500 ms ticks. Five of them = 2.5 s — under the 3 s budget, no fault.
-    // Sixth tick brings the accumulated time to exactly OV_DURATION → fault.
-    let mut s = active(lfp_4s());
-    let step = Duration::from_millis(500);
-    for _ in 0..5 {
-        assert!(matches!(ok_tick(&mut s, b(14.7, -0.1), step), Action::None));
+fn ov_trip_accumulates_elapsed_time_not_tick_count() {
+    // Same budget reached three ways. A regression that counts calls
+    // instead of `+= elapsed` passes the first row and fails the others.
+    let ms = Duration::from_millis;
+    let cases: [(&str, &[Duration]); 3] = [
+        ("6 x 500 ms = 3.0 s", &[ms(500); 6]),
+        ("one tick covering the whole budget", &[OV_DURATION]),
+        ("1500 + 1000 + 600 = 3100 ms", &[ms(1500), ms(1000), ms(600)]),
+    ];
+    for (label, steps) in cases {
+        let mut s = active(lfp_4s());
+        let (trip, before) = steps.split_last().expect("each row trips on its last tick");
+        for step in before {
+            let a = ok_tick(&mut s, b(14.7, -0.1), *step);
+            assert!(matches!(a, Action::None), "{label}: tripped early");
+        }
+        assert!(
+            matches_disable(&ok_tick(&mut s, b(14.7, -0.1), *trip), FaultReason::Overvoltage),
+            "{label}: did not trip at the budget"
+        );
     }
-    assert!(matches_disable(
-        &ok_tick(&mut s, b(14.7, -0.1), step),
-        FaultReason::Overvoltage,
-    ));
-}
-
-#[test]
-fn ov_fault_in_a_single_large_elapsed_tick() {
-    // One call covering the full OV budget — should fault immediately. Catches
-    // a regression that accumulates +1 per call instead of `+= elapsed`.
-    let mut s = active(lfp_4s());
-    assert!(matches_disable(
-        &ok_tick(&mut s, b(14.7, -0.1), OV_DURATION),
-        FaultReason::Overvoltage,
-    ));
-}
-
-#[test]
-fn ov_fault_with_mixed_elapsed_values() {
-    // 1500 ms + 1000 ms + 600 ms = 3100 ms ≥ 3000 ms budget. Trips on the
-    // third tick, not earlier (cumulative time, not tick count).
-    let mut s = active(lfp_4s());
-    assert!(matches!(
-        ok_tick(&mut s, b(14.7, -0.1), Duration::from_millis(1500)),
-        Action::None
-    ));
-    assert!(matches!(
-        ok_tick(&mut s, b(14.7, -0.1), Duration::from_millis(1000)),
-        Action::None
-    ));
-    assert!(matches_disable(
-        &ok_tick(&mut s, b(14.7, -0.1), Duration::from_millis(600)),
-        FaultReason::Overvoltage,
-    ));
 }
 
 #[test]
@@ -756,7 +870,7 @@ fn absorb_does_not_time_out_below_budget() {
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
         assert!(matches!(ok_tick(&mut s, b(CV_V, -3.0), TICK), Action::None));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -766,7 +880,7 @@ fn float_does_not_accumulate_absorb_ticks() {
     for _ in 0..(MAX_ABSORB.as_secs() + 10) {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -0.1), TICK), Action::None));
     }
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -787,7 +901,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
         ok_tick(&mut s, b(OK_V, -0.1), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 
     // Re-enter Absorb and burn the original margin's worth of ticks.
     // No fault yet — counter started over.
@@ -795,7 +909,7 @@ fn absorb_counter_resets_on_taper_back_to_float() {
     for _ in 0..20 {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -809,8 +923,8 @@ fn cc_ramp_below_absorb_v_does_not_arm_timeout() {
     for _ in 0..(MAX_ABSORB.as_secs() + 10) {
         assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
     }
-    assert!(s.fault().is_none());
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.fault(), None);
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -824,13 +938,13 @@ fn absorb_timer_resets_on_cc_dip() {
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
         ok_tick(&mut s, b(CV_V, -3.0), TICK);
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     // CC dip: voltage below the CV band resets the absorb debouncer.
     assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
         assert!(matches!(ok_tick(&mut s, b(CV_V, -3.0), TICK), Action::None));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -840,9 +954,9 @@ fn supervisor_passes_setpoint_through_on_phase_transition() {
         ok_tick(&mut s, b(13.5, -4.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
     assert!(approx(s.target_voltage(), 14.4));
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -854,7 +968,7 @@ fn supervisor_returns_none_on_steady_state() {
             Action::None
         ));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -864,11 +978,11 @@ fn battery_stale_for_budget_latches() {
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
         assert!(matches!(ok_tick(&mut s, None, TICK), Action::None));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 
     let a = ok_tick(&mut s, None, TICK);
     assert!(matches_disable(&a, FaultReason::BatterySensorStale));
-    assert!(matches!(s.fault(), Some(FaultReason::BatterySensorStale)));
+    assert_eq!(s.fault(), Some(FaultReason::BatterySensorStale));
 }
 
 #[test]
@@ -883,7 +997,7 @@ fn battery_recovers_within_budget_no_latch() {
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
         assert!(matches!(ok_tick(&mut s, None, TICK), Action::None));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -909,7 +1023,7 @@ fn modbus_recovers_within_budget_no_latch() {
     for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {
         fail_tick(&mut s, b(13.5, -0.1), TICK);
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -933,7 +1047,7 @@ fn overvoltage_brief_recovers_no_latch() {
     // Two more above must NOT latch (< budget after reset).
     ok_tick(&mut s, b(14.7, -0.1), TICK);
     ok_tick(&mut s, b(14.7, -0.1), TICK);
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -943,7 +1057,7 @@ fn ov_below_threshold_does_not_trip() {
     for _ in 0..(OV_DURATION.as_secs() + 5) {
         ok_tick(&mut s, b(14.55, -0.1), TICK);
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -978,7 +1092,7 @@ fn latched_supervisor_does_not_change_phase() {
     accept_disable(&mut s, a);
     // Heavy charging current would normally drive Float→Absorb.
     ok_tick(&mut s, b(13.5, -5.0), TICK);
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -1000,7 +1114,7 @@ fn first_fault_wins_over_simultaneous_conditions() {
     for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
         fail_tick(&mut s, None, TICK);
     }
-    assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
+    assert_eq!(s.fault(), Some(FaultReason::ModbusUnhealthy));
 }
 
 #[test]
@@ -1013,7 +1127,7 @@ fn supervisor_latches_on_absorb_timeout() {
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
         ok_tick(&mut s, b(CV_V, -3.0), TICK);
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 
     let a = ok_tick(&mut s, b(CV_V, -3.0), TICK);
     assert!(matches_disable(&a, FaultReason::AbsorbTimeout));
@@ -1066,7 +1180,7 @@ fn setpoint_within_tolerance_no_drift_fault() {
         ..expected_poll(&s, b(13.5, -0.1))
     };
     assert!(matches!(s.tick(p, TICK), Action::None));
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -1077,7 +1191,7 @@ fn setpoint_drift_does_not_overwrite_existing_latch() {
     for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
         fail_tick(&mut s, b(13.5, -0.1), TICK);
     }
-    assert!(matches!(s.fault(), Some(FaultReason::ModbusUnhealthy)));
+    assert_eq!(s.fault(), Some(FaultReason::ModbusUnhealthy));
     let p = PollResult {
         setpoints: Some(Setpoints {
             v_set: 12.0,
@@ -1122,13 +1236,13 @@ fn low_pack_resumes_absorb_after_bringup() {
     let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
     let resume_absorb = accept_enable(&mut s, a);
     assert!(resume_absorb, "pack below CV plateau ⇒ must request Absorb");
-    assert!(matches!(s.phase(), Phase::Float)); // not committed until V_SET write
+    assert_eq!(s.phase(), Phase::Float); // not committed until V_SET write
     let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
     assert!(
         matches!(a, Action::UpdateVoltage(ref t) if approx(t.target_v, lfp_4s().absorb_v)),
         "expected UpdateVoltage to absorb_v, got {a:?}",
     );
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -1141,7 +1255,7 @@ fn full_pack_stays_float_after_bringup() {
     assert!(!accept_enable(&mut s, a), "full pack must not resume Absorb");
     let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
     assert!(matches!(a, Action::None), "expected None, got {a:?}");
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -1320,8 +1434,8 @@ fn update_voltage_retries_until_acked() {
         panic!("expected UpdateVoltage");
     };
     assert!(approx(t1.target_v, profile.absorb_v));
-    assert!(matches!(s.phase(), Phase::Float)); // not yet committed
-    assert!(s.fault().is_none());
+    assert_eq!(s.phase(), Phase::Float); // not yet committed
+    assert_eq!(s.fault(), None);
 
     // No ack — second tick re-emits UpdateVoltage, same target. No
     // SettingsDrift even though setpoints (Float) lag the pending phase
@@ -1330,12 +1444,12 @@ fn update_voltage_retries_until_acked() {
         panic!("expected UpdateVoltage retry");
     };
     assert!(approx(t2.target_v, profile.absorb_v));
-    assert!(matches!(s.phase(), Phase::Float));
-    assert!(s.fault().is_none());
+    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.fault(), None);
 
     // Now commit — phase commits, debouncers reset, normal operation.
     s.commit_voltage(t2);
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -1413,7 +1527,7 @@ fn buck_output_off_in_pending_does_not_fault() {
     let mut s = ChargeSupervisor::new(lfp_4s());
     let a = s.tick(expected_poll(&s, b(OK_V, -0.1)), TICK);
     assert!(matches!(a, Action::EnableOutput { .. }));
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
 }
 
 #[test]
@@ -1471,7 +1585,7 @@ fn pending_does_not_enter_absorb_even_at_high_charge_current() {
     let high_current = -10.0;
     let battery = b(profile.float_v, high_current);
     let a = s.tick(expected_poll(&s, battery), TICK);
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
     // After the commit, supervisor goes Active still in Float — the first
     // real tick then runs the phase machine. Verify the very next tick
     // (now Active) is the one that emits the transition.
@@ -1496,7 +1610,7 @@ fn active_lvp_drops_to_pending_without_latch() {
     };
     let a = s.tick(p_lvp, TICK);
     assert!(matches!(a, Action::None));
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     assert!(matches!(s.latch, LatchState::Pending { .. }));
 }
 
@@ -1519,7 +1633,7 @@ fn pending_waits_for_lvp_to_clear_before_enable() {
     for _ in 0..120 {
         assert!(matches!(s.tick(p_lvp, TICK), Action::None));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     // LVP clears: buck back to Off with no protection cause. Pending
     // bring-up energises on the next tick.
     let p_clear = expected_poll(&s, b(OK_V, -0.1));
@@ -1578,7 +1692,7 @@ fn pending_at_boot_with_lvp_waits() {
     for _ in 0..30 {
         assert!(matches!(s.tick(p_lvp, TICK), Action::None));
     }
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     assert!(matches!(s.latch, LatchState::Pending { .. }));
 }
 
@@ -1607,7 +1721,7 @@ fn lvp_recovery_accepts_buck_auto_re_enable() {
     };
     let a = s.tick(p_recovered, TICK);
     assert!(matches!(a, Action::None));
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     assert!(matches!(
         s.latch,
         LatchState::Active {
@@ -1647,7 +1761,7 @@ fn active_otp_drops_to_pending_without_latch() {
     };
     let a = s.tick(p_otp, TICK);
     assert!(matches!(a, Action::None));
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     assert!(matches!(s.latch, LatchState::Pending { .. }));
 }
 
@@ -1670,7 +1784,7 @@ fn otp_recovery_accepts_buck_auto_re_enable() {
     };
     let a = s.tick(p_recovered, TICK);
     assert!(matches!(a, Action::None));
-    assert!(s.fault().is_none());
+    assert_eq!(s.fault(), None);
     assert!(matches!(
         s.latch,
         LatchState::Active {
@@ -1712,49 +1826,6 @@ impl VoltageWriter for MockWriter {
 }
 
 /// Drive `s` from Active+Absorb to Active+pending_voltage=Some(Float) by
-/// Drive `s` to the Absorb→Float transition and hand back its ticket,
-/// uncommitted, so the caller owns the apply step.
-fn drive_to_absorb_to_float_pending(s: &mut ChargeSupervisor) -> VoltageTicket {
-    enter_absorb(s);
-    let tapered = b(CV_V, -(lfp_4s().exit_absorb_a - 0.1));
-    let p = expected_poll(s, tapered);
-    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
-        assert!(matches!(s.tick(p, TICK), Action::None));
-    }
-    let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
-        panic!("expected Absorb→Float UpdateVoltage after EXIT_DEBOUNCE");
-    };
-    assert!(ticket.cycle_output, "Absorb→Float is a step DOWN");
-    ticket
-}
-
-/// Drive `s` to the Float→Absorb transition and hand back its ticket.
-fn drive_to_float_to_absorb_pending(s: &mut ChargeSupervisor) -> VoltageTicket {
-    let p = expected_poll(s, b(OK_V, -4.0));
-    let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
-        panic!("expected Float→Absorb UpdateVoltage");
-    };
-    assert!(!ticket.cycle_output, "Float→Absorb is a step UP");
-    ticket
-}
-
-/// Run one `UpdateVoltage` exactly as the firmware does: execute the
-/// writes, then commit the ticket only if V_SET actually landed. Returns
-/// the errors the sequence reported. `settle` is a no-op here — the
-/// quiet window is a real delay only on hardware.
-fn apply_ticket(
-    s: &mut ChargeSupervisor,
-    xy: &mut MockWriter,
-    ticket: VoltageTicket,
-) -> Vec<XyError> {
-    let mut errs = Vec::new();
-    let outcome = apply_update_voltage(xy, &ticket, || {}, |e| errs.push(e));
-    if outcome == VoltageWriteOutcome::Committed {
-        s.commit_voltage(ticket);
-    }
-    errs
-}
-
 #[test]
 fn apply_step_up_happy_path() {
     let mut s = active(lfp_4s());
@@ -1767,7 +1838,7 @@ fn apply_step_up_happy_path() {
         "step-up must not touch output"
     );
     assert!(errs.is_empty());
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -1783,7 +1854,7 @@ fn apply_step_down_happy_path() {
     );
     assert_eq!(xy.set_voltage_calls, vec![lfp_4s().float_v]);
     assert!(errs.is_empty());
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -1799,7 +1870,7 @@ fn apply_step_down_step1_failure_does_not_write_voltage() {
     assert!(xy.set_voltage_calls.is_empty());
     assert_eq!(errs, vec![XyError::SetOutput]);
     // Outcome was Retry, so the ticket went uncommitted.
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
     // Supervisor re-emits UpdateVoltage on next tick for retry.
     let p = expected_poll(&s, b(CV_V, -(lfp_4s().exit_absorb_a - 0.1)));
     assert!(
@@ -1823,7 +1894,7 @@ fn apply_step_down_step2_failure_restores_output() {
     );
     assert_eq!(xy.set_voltage_calls, vec![lfp_4s().float_v]);
     assert_eq!(errs, vec![XyError::SetVoltage]);
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -1839,7 +1910,7 @@ fn apply_step_down_step2_then_restore_both_fail_records_both() {
     let errs = apply_ticket(&mut s, &mut xy, ticket);
     assert_eq!(xy.set_output_calls, vec![false, true]);
     assert_eq!(errs, vec![XyError::SetVoltage, XyError::SetOutput]);
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 }
 
 #[test]
@@ -1858,7 +1929,7 @@ fn apply_step_down_step3_failure_retries_once_then_records() {
     assert_eq!(errs, vec![XyError::SetOutput]);
     // V_SET landed, so the outcome is Committed and the phase moves even
     // though the buck is now dark — the next tick latches for that.
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -1873,7 +1944,7 @@ fn apply_step_down_step3_first_attempt_recovers_on_retry() {
     let errs = apply_ticket(&mut s, &mut xy, ticket);
     assert_eq!(xy.set_output_calls, vec![false, true, true]);
     assert!(errs.is_empty(), "transient single failure must not record");
-    assert!(matches!(s.phase(), Phase::Float));
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -1891,18 +1962,7 @@ fn apply_step_up_failure_does_not_touch_output() {
     );
     assert_eq!(xy.set_voltage_calls, vec![lfp_4s().absorb_v]);
     assert_eq!(errs, vec![XyError::SetVoltage]);
-    assert!(matches!(s.phase(), Phase::Float));
-}
-
-/// A poll where the buck reports `output` and everything else is drift-free.
-/// Built from `expected_setpoints` rather than `expected_poll` so it stays
-/// valid across the latch-state changes these tests drive.
-fn poll_with_output(s: &ChargeSupervisor, output: BuckOutput) -> PollResult {
-    PollResult {
-        output: Some(output),
-        setpoints: Some(s.expected_setpoints()),
-        battery: b(OK_V, -0.1),
-    }
+    assert_eq!(s.phase(), Phase::Float);
 }
 
 #[test]
@@ -1950,7 +2010,7 @@ fn phase_changes_are_not_latch_transitions() {
     let mut s = active(lfp_4s());
     while s.pop_transition().is_some() {}
     enter_absorb(&mut s);
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
     assert_eq!(s.pop_transition(), None);
 }
 
@@ -1978,87 +2038,6 @@ fn transition_ring_drops_oldest_when_undrained() {
     assert_eq!(drained[0], ChargeTransition::ProtectHold);
     assert_eq!(drained[1], ChargeTransition::ProtectCleared);
     assert_eq!(drained[TRANSITION_BUFFER - 1], ChargeTransition::ProtectCleared);
-}
-
-/// Deterministic xorshift64. Enough to shuffle the supervisor through state
-/// combinations no hand-written scenario reaches, while staying exactly
-/// reproducible from the seed a failure prints.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        // xorshift64 is a fixed point at zero.
-        Self(seed | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// Uniform in `0..n`.
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
-
-/// A poll drawn from the plausible space: mostly healthy, occasionally a
-/// failed read, a drifted setpoint, a missing or NaN sample, or a buck
-/// that disagrees with the supervisor about its own output.
-fn random_poll(rng: &mut Rng, s: &ChargeSupervisor) -> PollResult {
-    let profile = lfp_4s();
-    let setpoints = match rng.below(1000) {
-        0..=14 => None,
-        15..=16 => Some(Setpoints {
-            v_set: 12.0,
-            i_set: profile.regulation_a,
-        }),
-        _ => Some(s.expected_setpoints()),
-    };
-    let battery = match rng.below(1000) {
-        0..=19 => None,
-        20..=24 => Some(BatterySample {
-            voltage: f32::NAN,
-            current: -1.0,
-        }),
-        // 12.00–15.99 V spans the CC ramp, the CV plateau (14.4) and the
-        // OV trip (14.6).
-        //
-        // Current is bimodal on purpose. Drawn uniformly from 0–12 A it
-        // sits above the 2.5 A tail on most ticks, so the *leaky* exit
-        // window never nets its 60 s and Absorb→Float — the step-down, the
-        // transition that must cycle the output — fires zero times in
-        // 100k ticks. So 85% of samples come from a band straddling the
-        // tail instead: both sides of the gate still get drawn, but below
-        // it often enough that the window can actually net out mid-run.
-        _ => Some(BatterySample {
-            voltage: 12.0 + (rng.below(400) as f32) / 100.0,
-            current: -if rng.below(100) < 85 {
-                (rng.below(260) as f32) / 100.0
-            } else {
-                (rng.below(1200) as f32) / 100.0
-            },
-        }),
-    };
-    let output = match rng.below(1000) {
-        0 => None,
-        1..=3 => Some(BuckOutput::Off {
-            cause: match rng.below(4) {
-                0 => ProtectionStatus::Lvp,
-                1 => ProtectionStatus::Otp,
-                2 => ProtectionStatus::Ovp,
-                _ => ProtectionStatus::Normal,
-            },
-        }),
-        _ => Some(expected_output(s)),
-    };
-    PollResult {
-        setpoints,
-        output,
-        battery,
-    }
 }
 
 #[test]
@@ -2191,7 +2170,7 @@ fn steady_healthy_polls_never_leave_float() {
     for tick in 0..(2 * EXIT_DEBOUNCE.as_secs()) {
         let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
         assert!(matches!(a, Action::None), "tick {tick}: {a:?}");
-        assert!(matches!(s.phase(), Phase::Float));
+        assert_eq!(s.phase(), Phase::Float);
         assert_eq!(s.fault(), None);
     }
 }
@@ -2205,7 +2184,7 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
     let profile = lfp_4s();
     let mut s = active(profile);
     enter_absorb(&mut s);
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
 
     let p_lvp = poll_with_output(&s, BuckOutput::Off {
         cause: ProtectionStatus::Lvp,
@@ -2236,7 +2215,7 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
         !matches!(a, Action::UpdateVoltage(_)),
         "no-op voltage write emitted: {a:?}"
     );
-    assert!(matches!(s.phase(), Phase::Absorb));
+    assert_eq!(s.phase(), Phase::Absorb);
     assert!(approx(s.expected_setpoints().v_set, profile.absorb_v));
 }
 
