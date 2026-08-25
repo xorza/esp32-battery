@@ -34,6 +34,15 @@ pub enum FaultReason {
     /// cell, a wiring fault, a load eating the whole charge current — would
     /// otherwise have no cap on it at all.
     ChargeTimeout,
+    /// Buck dropped into a self-clearing protection more than `MAX_HOLDS`
+    /// times with no `FLAP_WINDOW` of quiet between them. Each hold on its
+    /// own is benign and gets waited out; a stream of them is a supply that
+    /// cannot carry the charge current, and waiting forever means an output
+    /// that blips at the flap rate for as long as the condition lasts.
+    ///
+    /// Latches even though the output is already off — the point is to stop
+    /// bringing it back up.
+    ProtectionFlapping,
     /// Pack drew more than `OVERCURRENT_TOL ×` the profile's charge rate for
     /// `OVERCURRENT_DURATION`. The buck's own CC loop and OCP bound *total*
     /// output current, which includes the UPS load; this is the only check
@@ -68,6 +77,7 @@ impl std::fmt::Display for FaultReason {
             Self::Overvoltage => f.write_str("pack overvoltage"),
             Self::AbsorbTimeout => f.write_str("absorb time cap reached"),
             Self::ChargeTimeout => f.write_str("total charge time cap reached"),
+            Self::ProtectionFlapping => f.write_str("buck protection flapping"),
             Self::ChargeOvercurrent => f.write_str("pack charge overcurrent"),
             Self::SettingsDrift => f.write_str("setpoint readback drift"),
             Self::OutputUnexpectedlyOff(s) => write!(f, "buck self-disabled ({s})"),

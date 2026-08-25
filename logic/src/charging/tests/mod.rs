@@ -215,6 +215,29 @@ fn drain_transitions(s: &mut ChargeSupervisor) -> Vec<ChargeTransition> {
     out
 }
 
+/// The buck drops its output on input UVLO — one turn of a sagging rail.
+fn sag(s: &mut ChargeSupervisor) -> Action {
+    let p = poll_with_output(
+        s,
+        BuckOutput::Off {
+            cause: ProtectionStatus::Lvp,
+        },
+    );
+    s.tick(p, TICK)
+}
+
+/// …and brings it back once the rail recovers unloaded.
+fn recover(s: &mut ChargeSupervisor) -> Action {
+    let p = poll_with_output(s, BuckOutput::On);
+    s.tick(p, TICK)
+}
+
+/// Hold steady and healthy for `span`. One big-elapsed tick, which is all a
+/// run of holds needs to age out of `FLAP_WINDOW`.
+fn quiet(s: &mut ChargeSupervisor, span: Duration) {
+    assert!(matches!(ok_tick(s, b(OK_V, -0.1), span), Action::None));
+}
+
 /// A poll where the buck reports `output` and everything else is drift-free.
 /// Takes the output as an argument rather than deriving it like
 /// `expected_poll` does, so it stays valid across the state changes these

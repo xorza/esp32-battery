@@ -537,13 +537,14 @@ fn labels_are_the_snake_case_wire_identifiers() {
     // `/api` publishes these verbatim and dashboards match on them, so the
     // strings are a wire format: pinned here against the literals rather
     // than re-derived from the same `IntoStaticStr` that produces them.
-    let faults: [(FaultReason, &str); 9] = [
+    let faults: [(FaultReason, &str); 10] = [
         (FaultReason::BatterySensorStale, "battery_sensor_stale"),
         (FaultReason::ModbusUnhealthy, "modbus_unhealthy"),
         (FaultReason::Overvoltage, "overvoltage"),
         (FaultReason::AbsorbTimeout, "absorb_timeout"),
         (FaultReason::ChargeTimeout, "charge_timeout"),
         (FaultReason::ChargeOvercurrent, "charge_overcurrent"),
+        (FaultReason::ProtectionFlapping, "protection_flapping"),
         (FaultReason::SettingsDrift, "settings_drift"),
         (
             FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ovp),

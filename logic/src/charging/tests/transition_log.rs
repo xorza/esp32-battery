@@ -15,22 +15,18 @@ fn transitions_record_the_route_not_just_the_destination() {
 
     // Input rail sags: the buck self-disables on LVP and we step back to
     // bring-up rather than latching.
-    let p_lvp = poll_with_output(&s, BuckOutput::Off {
-        cause: ProtectionStatus::Lvp,
-    });
-    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    assert!(matches!(sag(&mut s), Action::None));
     assert_eq!(s.pop_transition(), Some(ChargeTransition::ProtectHold));
 
     // Rail returns and the buck re-enables itself.
-    let p_on = poll_with_output(&s, BuckOutput::On);
-    assert!(matches!(s.tick(p_on, TICK), Action::None));
+    assert!(matches!(recover(&mut s), Action::None));
     assert_eq!(s.pop_transition(), Some(ChargeTransition::ProtectCleared));
 
     // Second hold, recovered the other way round: the cause clears but the
     // buck stays off, so the supervisor energises it itself. That commit is
     // the same code path as a cold-boot bring-up and must still log
     // ProtectCleared — a hold ended, not a fresh boot.
-    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    assert!(matches!(sag(&mut s), Action::None));
     assert_eq!(s.pop_transition(), Some(ChargeTransition::ProtectHold));
     let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
     assert!(!accept_enable(&mut s, a), "pack at the plateau stays in Float");
@@ -66,15 +62,13 @@ fn phase_changes_are_not_latch_transitions() {
 fn transition_ring_drops_oldest_when_undrained() {
     let mut s = active(lfp_4s());
     drain_transitions(&mut s);
-    let p_lvp = poll_with_output(&s, BuckOutput::Off {
-        cause: ProtectionStatus::Lvp,
-    });
-    let p_on = poll_with_output(&s, BuckOutput::On);
-
-    // 5 hold/clear cycles = 10 transitions into an 8-slot ring.
+    // 5 hold/clear cycles = 10 transitions into an 8-slot ring. Spaced
+    // past `FLAP_WINDOW` so they stay five separate supply events rather
+    // than one flap — a flap latches on the fifth and logs that instead.
     for _ in 0..5 {
-        s.tick(p_lvp, TICK);
-        s.tick(p_on, TICK);
+        sag(&mut s);
+        recover(&mut s);
+        quiet(&mut s, FLAP_WINDOW + TICK);
     }
     let drained = drain_transitions(&mut s);
     assert_eq!(drained.len(), TRANSITION_BUFFER);

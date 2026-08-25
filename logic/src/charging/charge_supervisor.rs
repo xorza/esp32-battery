@@ -9,6 +9,7 @@ use crate::charging::action::{Action, DisableTicket, EnableTicket, VoltageTicket
 use crate::charging::charge_state::{ChargeEvent, ChargeState};
 use crate::charging::debounce::Debounce;
 use crate::charging::fault_reason::FaultReason;
+use crate::charging::hold_budget::HoldBudget;
 use crate::charging::inhibit_reason::InhibitReason;
 use crate::charging::phase::Phase;
 use crate::charging::poll_result::{BatterySample, BuckOutput, PollResult};
@@ -46,6 +47,8 @@ pub struct ChargeSupervisor {
     ov: Debounce,
     /// Charge current over the pack's own rate, against `OVERCURRENT_TOL`.
     overcurrent: Debounce,
+    /// Self-clearing holds lately, against `MAX_HOLDS` / `FLAP_WINDOW`.
+    holds: HoldBudget,
     /// Time at the CV plateau, against `MAX_ABSORB`.
     absorb: Debounce,
     /// Time since entering Absorb, against `MAX_CHARGE`. Counts whatever the
@@ -81,6 +84,7 @@ impl ChargeSupervisor {
             state: ChargeState::Boot,
             ov: Debounce::default(),
             overcurrent: Debounce::default(),
+            holds: HoldBudget::default(),
             absorb: Debounce::default(),
             charge_total: Debounce::default(),
             exit: Debounce::default(),
@@ -237,9 +241,11 @@ impl ChargeSupervisor {
         }
         // Output is off for the whole hold, so the pack decays. A partly
         // accumulated OV window would otherwise carry across and trip the
-        // next regulating stretch early.
+        // next regulating stretch early. The hold itself goes on the flap
+        // budget, which the gauntlet reads back on this same tick.
         if to.holding() {
             self.ov.reset();
+            self.holds.record();
         }
         self.state = to;
     }
@@ -467,7 +473,22 @@ impl ChargeSupervisor {
     /// across a move between them. `self.state` is only read here, never
     /// written — `tick` relies on that to dispatch on it afterwards.
     fn gauntlet(&mut self, p: &PollResult, elapsed: Duration) -> Verdict {
-        // 1. Commanded vs. reported setpoints. No debounce: the read itself
+        // 1. Protection flapping. Ahead of everything else because it is a
+        //    conclusion about accumulated history, and a single tick's
+        //    inhibit further down would otherwise return before it could be
+        //    reached — leaving the loop it describes to run forever.
+        //
+        //    Latches unconditionally rather than through `fault_or_inhibit`.
+        //    The output is off, so on the usual rule this would only inhibit
+        //    — but "hold the buck off and re-check next tick" is precisely
+        //    the behaviour that is failing here, and the point is to stop
+        //    bringing it back up. `OutputOnInPending` is the only other
+        //    condition that latches an idle machine.
+        if self.holds.step(elapsed) {
+            return Verdict::Latch(FaultReason::ProtectionFlapping);
+        }
+
+        // 2. Commanded vs. reported setpoints. No debounce: the read itself
         //    succeeded, so a mismatch is the device disagreeing with us
         //    rather than transport noise.
         if let Some(sp) = p.setpoints {
@@ -480,7 +501,7 @@ impl ChargeSupervisor {
             }
         }
 
-        // 2. Modbus health. `p.setpoints.is_none()` doubles as the read-failed
+        // 3. Modbus health. `p.setpoints.is_none()` doubles as the read-failed
         //    signal — a successful read means the link is up.
         if self
             .modbus_err
@@ -490,7 +511,7 @@ impl ChargeSupervisor {
                 .fault_or_inhibit(FaultReason::ModbusUnhealthy, InhibitReason::ModbusUnhealthy);
         }
 
-        // 3. Battery sample freshness. NaN/Inf counts as missing: a sensor
+        // 4. Battery sample freshness. NaN/Inf counts as missing: a sensor
         //    reporting non-finite values can't supervise charging, and
         //    silently ignoring it would let a stuck sensor mask overvoltage.
         let battery = p
@@ -509,7 +530,7 @@ impl ChargeSupervisor {
             return Verdict::Inhibit(InhibitReason::NoBatterySample);
         };
 
-        // 4. Overvoltage. Regulating needs the 3 s debounce so switching
+        // 5. Overvoltage. Regulating needs the 3 s debounce so switching
         //    noise and load steps don't trip a healthy charge. Bring-up
         //    needs none: a single sample over the line is reason enough not
         //    to energise, and since that only inhibits, one noisy reading
@@ -524,7 +545,7 @@ impl ChargeSupervisor {
             return Verdict::Inhibit(InhibitReason::Overvoltage);
         }
 
-        // 5. Charge overcurrent. I_SET bounds the buck's *total* output
+        // 6. Charge overcurrent. I_SET bounds the buck's *total* output
         //    current, load included, so with an idle load it does not hold
         //    the pack to its own rate — only this does. Stepped in both
         //    states so the window stays coherent across a move, but it can
@@ -539,13 +560,13 @@ impl ChargeSupervisor {
             return Verdict::Latch(FaultReason::ChargeOvercurrent);
         }
 
-        // 6. Bring-up-only gates. Not faults — they say "not yet", and only
+        // 7. Bring-up-only gates. Not faults — they say "not yet", and only
         //    mean anything while the output is off.
         if self.state.bringing_up() {
             // Demand a fresh setpoint readback before energising.
             // `boot_sequence` already verified the writes, but requiring
             // closed-loop confirmation here means we never ask for output-on
-            // until the link is demonstrably alive. Check 2 eventually
+            // until the link is demonstrably alive. Check 3 eventually
             // inhibits on sustained failure, but takes 5 s; this covers the gap.
             if p.setpoints.is_none() {
                 return Verdict::Inhibit(InhibitReason::ModbusUnhealthy);

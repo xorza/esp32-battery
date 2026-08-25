@@ -144,8 +144,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
     // Absorb (not stall in Float).
     let profile = lfp_4s();
     let mut s = active(profile);
-    let p_lvp = poll_with_output(&s, BuckOutput::Off { cause: ProtectionStatus::Lvp });
-    s.tick(p_lvp, TICK);
+    sag(&mut s);
     // Pack rests well below absorb_v - ABSORB_CV_BAND_V (= 14.3).
     let drained = b(13.0, 0.0);
     let p_clear = PollResult {
@@ -197,10 +196,7 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
     enter_absorb(&mut s);
     assert_eq!(s.state(), ChargeState::Absorb);
 
-    let p_lvp = poll_with_output(&s, BuckOutput::Off {
-        cause: ProtectionStatus::Lvp,
-    });
-    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    assert!(matches!(sag(&mut s), Action::None));
 
     // Pack rests at 13.0, below the 14.3 plateau ⇒ resume_absorb is true.
     let drained = b(13.0, 0.0);
@@ -231,6 +227,55 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
 }
 
 #[test]
+fn a_flapping_supply_stops_being_waited_out() {
+    // The field loop this exists for: a rail that cannot carry the charge
+    // current sags, the buck drops on LVP, the rail recovers unloaded, the
+    // buck comes back, and it sags again. Each turn takes the UPS output
+    // away and gives it back, and nothing about the loop ends on its own.
+    // `MAX_HOLDS` turns are waited out; the next is not.
+    let mut s = active(lfp_4s());
+    for turn in 0..MAX_HOLDS {
+        assert!(matches!(sag(&mut s), Action::None), "turn {turn} latched early");
+        assert!(matches!(recover(&mut s), Action::None), "turn {turn}");
+        assert_eq!(s.fault(), None, "turn {turn}");
+    }
+    // Latches on the way *into* the hold, with the output already off —
+    // the point is not to disable anything, it is to stop bringing it back.
+    assert!(matches_disable(
+        &sag(&mut s),
+        FaultReason::ProtectionFlapping
+    ));
+    // The hold was entered and then overridden on the same tick: reconcile
+    // moved into it, the gauntlet read the budget back and latched out.
+    assert_eq!(s.state(), ChargeState::Tripping);
+}
+
+#[test]
+fn a_quiet_stretch_ends_a_run_of_holds() {
+    // A rail that sags once an hour is not flapping — it is a rail that
+    // sags. The count is a *run*, so a quiet stretch longer than
+    // `FLAP_WINDOW` ends it, and what follows gets a full fresh budget.
+    let mut s = active(lfp_4s());
+    for _ in 0..MAX_HOLDS {
+        sag(&mut s);
+        recover(&mut s);
+    }
+    assert_eq!(s.fault(), None);
+
+    quiet(&mut s, FLAP_WINDOW + TICK);
+    for turn in 0..MAX_HOLDS {
+        assert!(matches!(sag(&mut s), Action::None), "turn {turn}: count did not clear");
+        assert!(matches!(recover(&mut s), Action::None), "turn {turn}");
+    }
+    assert_eq!(s.fault(), None, "the count did not clear");
+    // And the fresh run still ends the same way.
+    assert!(matches_disable(
+        &sag(&mut s),
+        FaultReason::ProtectionFlapping
+    ));
+}
+
+#[test]
 fn protect_hold_clears_the_overvoltage_window() {
     // OV accumulates while regulating, the buck then self-disables on a
     // transient protection. Output is off for the hold, so the pack decays
@@ -247,12 +292,8 @@ fn protect_hold_clears_the_overvoltage_window() {
     }
 
     // Buck drops on input UVLO, then comes back.
-    let p_lvp = poll_with_output(&s, BuckOutput::Off {
-        cause: ProtectionStatus::Lvp,
-    });
-    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
-    let p_on = poll_with_output(&s, BuckOutput::On);
-    assert!(matches!(s.tick(p_on, TICK), Action::None));
+    assert!(matches!(sag(&mut s), Action::None));
+    assert!(matches!(recover(&mut s), Action::None));
 
     // A single over-volt tick must not latch: the window restarts at zero,
     // so it takes the full OV_DURATION again.

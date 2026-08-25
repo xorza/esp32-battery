@@ -230,7 +230,7 @@ and back restarts it; a protection hold restarts it.
 
 ## Issue 3 — protection holds flap without limit
 
-**Severity: medium-high.** An input rail that sags under charge current
+**DONE**, at 4 holds per 5-minute run. Severity: medium-high. An input rail that sags under charge current
 gives `SelfDisabled` → `SelfEnabled` once a second, forever, each cycle
 blipping the UPS load. Nothing counts, nothing gives up.
 
@@ -511,8 +511,8 @@ whole point of the state existing.
 | 2 | leaky absorb clock + `MAX_CHARGE` | 2 | new `ChargeTimeout` fault | **done** |
 | 3 | `rested_full` on SoC | 4 | full packs stop forcing an Absorb cycle | **done** |
 | 4 | Groundwork B + I_SET/OCP + `ChargeOvercurrent` | 5 | I_SET rises by the load budget | **done** |
-| 5 | `HoldBudget` | 3 | new `ProtectionFlapping` fault | next |
-| 6 | `FaultResponse` + `ToParked`/`Parked` | 8 (partial) | three faults stop killing the load | |
+| 5 | `HoldBudget` | 3 | new `ProtectionFlapping` fault | **done** |
+| 6 | `FaultResponse` + `ToParked`/`Parked` | 8 (partial) | three faults stop killing the load | next |
 | 7 | pack temperature | 7 | hardware first | |
 
 Phases 0–3 are small and touch nothing outside `charging/`. Phase 4 reaches
@@ -539,8 +539,10 @@ that table in the same commit as each variant.
    budget lands in phase 4 — the slowest legitimate empty→full runs at the
    *delivered* current, `i_set_a - load_a`, not `regulation_a`, so a large
    load budget stretches the legitimate case toward the cap.
-3. **`FLAP_WINDOW` / `MAX_HOLDS` (phase 5).** Proposed: 4 holds in 5 min.
-   Depends on how often your supply legitimately sags.
+3. ~~**`FLAP_WINDOW` / `MAX_HOLDS` (phase 5).**~~ Shipped at 4 holds per
+   5-minute run. Note the shape: a run ends only after `FLAP_WINDOW` with no
+   new hold, so this is not "4 in any 5 minutes" — a rail sagging every four
+   minutes indefinitely does eventually latch, which is intended.
 4. **Park-versus-disable on `Overvoltage` (phase 6).** Recommended Disable;
    the table above is a starting position, not a settled one.
 5. **Temperature sensor and the absent-sensor policy (phase 7).** Part

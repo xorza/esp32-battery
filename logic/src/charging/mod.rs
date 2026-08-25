@@ -40,6 +40,7 @@ pub(crate) mod charge_state;
 pub(crate) mod charge_supervisor;
 pub(crate) mod debounce;
 pub(crate) mod fault_reason;
+pub(crate) mod hold_budget;
 pub(crate) mod inhibit_reason;
 pub(crate) mod phase;
 pub(crate) mod poll_result;
@@ -157,6 +158,19 @@ const OVERCURRENT_TOL: f32 = 1.25;
 /// Debounced because the buck pulses near a full pack and a load stepping
 /// off is a genuine transient, not a fault.
 const OVERCURRENT_DURATION: Duration = Duration::from_secs(5);
+
+/// How long the supervisor must go without a new self-clearing hold before
+/// it forgets the ones before it. Five minutes is far longer than the
+/// second-scale loop a sagging rail produces, and far shorter than the gap
+/// between two unrelated supply events.
+const FLAP_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Self-clearing holds tolerated inside one run before the supervisor stops
+/// waiting them out. The next one latches `ProtectionFlapping`.
+///
+/// Four leaves room for a supply that hiccups on a cold start or a
+/// compressor kicking in nearby, while still ending a genuine flap inside a
+/// handful of seconds rather than never.
+const MAX_HOLDS: u8 = 4;
 
 /// How long Modbus reads to the XY can keep failing before we fail closed.
 const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
