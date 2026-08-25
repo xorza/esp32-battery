@@ -96,6 +96,9 @@ pub enum ChargeTransition {
     ProtectCleared,
     /// A fault latched. Reboot-only recovery from here.
     Latched,
+    /// A fault stopped the charge but left the output up: the buck holds
+    /// the float target and the load stays fed. Reboot-only, like a latch.
+    Parked,
 }
 
 impl EventKind for XyError {

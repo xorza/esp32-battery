@@ -5,9 +5,13 @@
 //! finish the pack. Once current tapers below `exit_absorb_a`, drops back to
 //! Float. Profiles are per-chemistry constants.
 //!
-//! Wraps the phase logic with a latch that disables the buck on
-//! overvoltage, stuck-absorb, missing-battery, or unhealthy-Modbus
-//! conditions. Once latched, only a reboot clears it.
+//! Wraps the phase logic with the fault machinery: overvoltage, a stuck
+//! absorb, a missing battery, an unhealthy Modbus link and the rest all
+//! stop the charge, and only a reboot resumes it. What they do to the
+//! output splits two ways — see `FaultReason::response`. Losing control of
+//! the buck takes it down; an overcharge with control intact only drops it
+//! to the float target, because on a UPS a dark output means the pack
+//! starts carrying the load.
 //!
 //! Both live in one flat state machine — see `charge_state.rs`, whose
 //! `TRANSITIONS` table is the whole of it: which V_SET the device holds,

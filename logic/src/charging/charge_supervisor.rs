@@ -8,7 +8,7 @@ use heapless::Deque;
 use crate::charging::action::{Action, DisableTicket, EnableTicket, VoltageTicket};
 use crate::charging::charge_state::{ChargeEvent, ChargeState};
 use crate::charging::debounce::Debounce;
-use crate::charging::fault_reason::FaultReason;
+use crate::charging::fault_reason::{FaultReason, FaultResponse};
 use crate::charging::hold_budget::HoldBudget;
 use crate::charging::inhibit_reason::InhibitReason;
 use crate::charging::phase::Phase;
@@ -105,6 +105,14 @@ impl ChargeSupervisor {
 
     pub fn fault(&self) -> Option<FaultReason> {
         self.fault
+    }
+
+    /// Charging stopped on a fault but the buck is still up, holding the
+    /// float target with the load fed. Distinct from a latch, where the
+    /// output is dark and the load is on the pack — the two look the same
+    /// through `fault()` alone, and they are not the same at all.
+    pub fn parked(&self) -> bool {
+        self.state.parked()
     }
 
     /// Why the supervisor is holding the buck off without having latched,
@@ -369,6 +377,19 @@ impl ChargeSupervisor {
     fn on_fault(&mut self, reason: FaultReason) -> Action {
         self.fault = Some(reason);
         self.inhibit = None;
+        // Parking is the gentler answer and it is offered once: a
+        // park-class fault raised again from inside a park is proof that
+        // holding float did not fix it, so the second one disables.
+        if reason.response() == FaultResponse::Park && !self.state.parked() {
+            self.step(ChargeEvent::Park);
+            // `Float`/`ToAbsorb` already hold the float target and land
+            // straight in `Parked` with nothing to write; the two holding
+            // absorb owe the same step-down `ToFloat` does.
+            return match self.state.retarget_to() {
+                Some(next) => self.update_voltage_for(next),
+                None => Action::None,
+            };
+        }
         self.step(ChargeEvent::Fault);
         self.disable_for_latched_fault()
     }
@@ -410,7 +431,12 @@ impl ChargeSupervisor {
             // Any other cause is the buck's own hardware OVP/OCP or a panel
             // toggle — it is not coming back on its own.
             (s, Some(BuckOutput::Off { cause })) if s.sourcing() => {
-                if cause.is_self_clearing() {
+                // A parked machine does not wait anything out. It is already
+                // in a degraded mode a human has to clear, and the point of
+                // the park — keeping the load fed — is gone the moment the
+                // output drops. Waiting would mean silently resuming a park
+                // whose fault nobody has looked at.
+                if cause.is_self_clearing() && !s.parked() {
                     self.step(ChargeEvent::SelfDisabled);
                     None
                 } else {

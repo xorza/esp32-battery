@@ -19,6 +19,7 @@ use xy_modbus::{ProtectionStatus, RtuError, Setpoints, XyError as BusError};
 mod absorb_timeout;
 mod bring_up;
 mod faults;
+mod parked;
 mod phase_machine;
 mod profile;
 mod protection_recovery;
@@ -213,6 +214,27 @@ fn drain_transitions(s: &mut ChargeSupervisor) -> Vec<ChargeTransition> {
         out.push(t);
     }
     out
+}
+
+/// Confirm the tick that raised `expected` parked on it rather than
+/// latching: charging stopped, buck still up, load still fed.
+///
+/// Takes the action `ok_tick` returned, which has already committed the
+/// write — so the supervisor has reached `Parked`, not `ToParked`.
+fn accept_park(s: &ChargeSupervisor, a: Action, expected: FaultReason) {
+    match a {
+        // Parking out of absorb owes the same off→write→on step-down that
+        // an ordinary Absorb→Float taper does.
+        Action::UpdateVoltage(t) => {
+            assert!(t.cycle_output, "a step down to float must cycle the output");
+        }
+        // Parking from a state already holding float has nothing to write.
+        Action::None => {}
+        other => panic!("expected a park, got {other:?}"),
+    }
+    assert_eq!(s.fault(), Some(expected));
+    assert!(s.parked(), "charging must stop, but the load stays fed");
+    assert_eq!(s.state(), ChargeState::Parked);
 }
 
 /// The buck drops its output on input UVLO — one turn of a sagging rail.

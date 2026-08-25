@@ -376,10 +376,8 @@ fn overcurrent_is_measured_on_the_pack_not_the_setpoint() {
         ok_tick(&mut s, b(OK_V, -(trip + 0.1)), TICK);
     }
     assert_eq!(s.fault(), None);
-    assert!(matches_disable(
-        &ok_tick(&mut s, b(OK_V, -(trip + 0.1)), TICK),
-        FaultReason::ChargeOvercurrent
-    ));
+    let a = ok_tick(&mut s, b(OK_V, -(trip + 0.1)), TICK);
+    accept_park(&s, a, FaultReason::ChargeOvercurrent);
 }
 
 #[test]

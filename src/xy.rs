@@ -478,6 +478,7 @@ fn run<D: XyDevice>(
             status.ps_offline = outcome.ps_offline;
             status.phase = supervisor.phase();
             status.fault = supervisor.fault();
+            status.parked = supervisor.parked();
             status.inhibit = supervisor.inhibit();
         }
         thread::sleep(POLL_INTERVAL);

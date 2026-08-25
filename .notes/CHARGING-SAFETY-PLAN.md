@@ -438,7 +438,10 @@ acceptable, because it is indistinguishable from a working sensor.
 
 ## Issue 8 — nothing bounds pack discharge
 
-**Severity: high, and only partly fixable in firmware.**
+**PARTLY DONE.** The fault-response classification shipped as described,
+with `Overvoltage` on Disable. What cannot be fixed in firmware — the BMS
+low-voltage disconnect — remains open, and stays in `ISSUES.md`.
+Severity: high, and only partly fixable in firmware.
 
 ### What cannot be fixed here
 
@@ -512,8 +515,8 @@ whole point of the state existing.
 | 3 | `rested_full` on SoC | 4 | full packs stop forcing an Absorb cycle | **done** |
 | 4 | Groundwork B + I_SET/OCP + `ChargeOvercurrent` | 5 | I_SET rises by the load budget | **done** |
 | 5 | `HoldBudget` | 3 | new `ProtectionFlapping` fault | **done** |
-| 6 | `FaultResponse` + `ToParked`/`Parked` | 8 (partial) | three faults stop killing the load | next |
-| 7 | pack temperature | 7 | hardware first | |
+| 6 | `FaultResponse` + `ToParked`/`Parked` | 8 (partial) | three faults stop killing the load | **done** |
+| 7 | pack temperature | 7 | hardware first | next |
 
 Phases 0–3 are small and touch nothing outside `charging/`. Phase 4 reaches
 into `main.rs` and the `/api` ceiling asserts. Phase 6 adds `/api` surface.
@@ -543,8 +546,9 @@ that table in the same commit as each variant.
    5-minute run. Note the shape: a run ends only after `FLAP_WINDOW` with no
    new hold, so this is not "4 in any 5 minutes" — a rail sagging every four
    minutes indefinitely does eventually latch, which is intended.
-4. **Park-versus-disable on `Overvoltage` (phase 6).** Recommended Disable;
-   the table above is a starting position, not a settled one.
+4. ~~**Park-versus-disable on `Overvoltage` (phase 6).**~~ Shipped on
+   Disable. `FaultReason::response` is the whole table in one place, so
+   moving any row is a one-line change plus its test.
 5. **Temperature sensor and the absent-sensor policy (phase 7).** Part
    choice, plus whether a board without one refuses to charge.
 6. **BMS low-voltage-disconnect setpoint (issue 8).** Needs writing down

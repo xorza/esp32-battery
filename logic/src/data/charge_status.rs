@@ -34,9 +34,17 @@ pub struct ChargeStatus {
     /// Current charging phase, or `None` while the supervisor is still in
     /// Pending bring-up / latched off.
     pub phase: Option<Phase>,
-    /// Latched supervisor fault, if any. `None` during normal operation;
-    /// `Some(reason)` once the buck has been latched off, and it stays set
-    /// until a reboot. Conditions that recover on their own report through
+    /// `true` when a fault stopped the charge but left the buck up: it
+    /// holds the float target and the load is still fed. Read alongside
+    /// [`Self::fault`], which is `Some` either way — the difference between
+    /// a park and a latch is whether the pack is being drained, and
+    /// `fault` alone cannot say.
+    pub parked: bool,
+    /// Supervisor fault, if any. `None` during normal operation;
+    /// `Some(reason)` once one has stopped the charge, and it stays set
+    /// until a reboot. Says nothing about the output — [`Self::parked`]
+    /// is what distinguishes a buck held at float from a dark one.
+    /// Conditions that recover on their own report through
     /// [`Self::inhibit`] instead and never reach this field.
     pub fault: Option<FaultReason>,
     /// Why the supervisor is holding the buck off without having latched.

@@ -96,6 +96,10 @@ pub struct ApiResponse<'a> {
     /// `"absorb"` / `"float"` while the supervisor is actively regulating,
     /// `null` while still bringing up, or once a fault has latched the buck off.
     pub phase: Option<&'static str>,
+    /// `true` when the fault stopped the charge but left the output up and
+    /// the load fed. `false` with a fault set means the buck is dark and
+    /// the pack is carrying the load.
+    pub parked: bool,
     /// Snake_case identifier of the latched fault, or `null` if none.
     /// Stable for dashboards to switch on; `fault_message` is the
     /// human-readable form (with cause for `OutputUnexpectedlyOff`).
@@ -163,6 +167,7 @@ pub fn mount(
             ps_offline: status.ps_offline,
             phase: status.phase.map(|p| p.label()),
             fault: status.fault.map(|f| f.label()),
+            parked: status.parked,
             fault_message: fault_message.as_deref(),
             inhibit: status.inhibit.map(|i| i.label()),
             inhibit_message: inhibit_message.as_deref(),

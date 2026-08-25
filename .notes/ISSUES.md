@@ -1,8 +1,5 @@
 # Open issues
 
-- No pack temperature reaches the supervisor. Charging below 0 °C is not
-  inhibited for any chemistry. The buck's OTP covers its own die only.
-
-- Nothing bounds pack discharge. The buck's LVP register is input-side UVLO,
-  so after a latch or during a protection hold the pack supplies the load with
-  no firmware-side cutoff.
+- A `ChargeState::Parked` supervisor latches when the buck self-disables on a
+  self-clearing cause, rather than holding and resuming the park when the
+  cause lifts. The load stays on the pack once the rail returns.

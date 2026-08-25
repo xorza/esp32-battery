@@ -1,13 +1,16 @@
-//! Why the supervisor latched the buck off.
+//! Why the supervisor stopped charging, and what it did about it.
 
 use strum::IntoStaticStr;
 use xy_modbus::ProtectionStatus;
 
-/// Why the supervisor latched the buck off. Once latched, only a reboot
-/// clears it — auto-recovery on a battery charger means trying again
-/// under the same conditions. `OutputUnexpectedlyOff` carries the
-/// device-reported PROTECT cause that was active when the buck
-/// self-disabled (or `Normal` if no cause was set).
+/// Why the supervisor stopped charging. Recovery is a reboot either way —
+/// auto-recovery on a battery charger means trying again under the same
+/// conditions — but what happens to the *output* differs: see
+/// [`FaultReason::response`], which splits these into the ones that take
+/// the buck down and the ones that only drop it to the float target.
+/// `OutputUnexpectedlyOff` carries the device-reported PROTECT cause that
+/// was active when the buck self-disabled (or `Normal` if no cause was
+/// set).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum FaultReason {
@@ -86,7 +89,43 @@ impl std::fmt::Display for FaultReason {
     }
 }
 
+/// What the supervisor does about a fault.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum FaultResponse {
+    /// Output off, and off until a reboot.
+    Disable,
+    /// Drop to the float target and hold there, load still fed.
+    Park,
+}
+
 impl FaultReason {
+    /// What the supervisor does about this fault.
+    ///
+    /// Losing control of the buck means the only safe output is no output —
+    /// we cannot supervise what we cannot see or command. A pack taking too
+    /// much charge is a different problem: control is intact, and the
+    /// hazard is the charging itself. Dropping to the float target stops it
+    /// while the load stays fed, which on a UPS is the difference between
+    /// "charging stopped" and "the pack drains until someone notices".
+    ///
+    /// `Overvoltage` is the deliberate borderline case, and it disables:
+    /// parking means dropping V_SET and trusting the buck to hold it, on a
+    /// buck we just caught regulating above the target we gave it.
+    pub(super) fn response(self) -> FaultResponse {
+        match self {
+            Self::BatterySensorStale
+            | Self::ModbusUnhealthy
+            | Self::Overvoltage
+            | Self::SettingsDrift
+            | Self::ProtectionFlapping
+            | Self::OutputUnexpectedlyOff(_)
+            | Self::OutputOnInPending => FaultResponse::Disable,
+            Self::AbsorbTimeout | Self::ChargeTimeout | Self::ChargeOvercurrent => {
+                FaultResponse::Park
+            }
+        }
+    }
+
     /// Stable snake_case identifier — what API consumers and dashboards
     /// match on. The `Display` impl is the human-readable form for logs.
     pub fn label(self) -> &'static str {

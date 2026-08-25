@@ -38,6 +38,18 @@ pub(crate) enum ChargeState {
     /// Sourcing, device still at the absorb target, an off→write→on
     /// step-down to float outstanding.
     ToFloat,
+    /// Sourcing, device still at the absorb target, an off→write→on
+    /// step-down to float outstanding *because a fault said to stop
+    /// charging* — the same write as `ToFloat`, landing somewhere else.
+    ToParked,
+    /// Sourcing at the float target with a fault latched and the phase
+    /// machine frozen: charging has stopped, but the load is still fed.
+    ///
+    /// The response to a fault whose hazard is overcharge and whose control
+    /// of the buck is intact. Killing the output would stop the overcharge
+    /// too, and also drop the load onto the pack to drain for however long
+    /// it takes someone to notice — which is the worse of the two on a UPS.
+    Parked,
     /// A fault latched. `set_output(false)` not yet confirmed, so the
     /// disable is re-emitted every tick.
     Tripping,
@@ -50,8 +62,12 @@ pub(crate) enum ChargeState {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, EnumCount, VariantArray)]
 #[repr(u8)]
 pub(super) enum ChargeEvent {
-    /// The safety gauntlet latched a fault.
+    /// The safety gauntlet raised a fault whose answer is to stop
+    /// sourcing entirely.
     Fault,
+    /// The safety gauntlet raised a fault whose answer is to stop charging
+    /// but keep the load fed — see [`ChargeState::Parked`].
+    Park,
     /// The buck self-disabled on a self-clearing cause while sourcing.
     SelfDisabled,
     /// The buck's output came back on without us asking. Out of a hold
@@ -92,6 +108,14 @@ pub(super) enum ChargeEvent {
 /// latch is only as good as the output actually being off, so a buck that
 /// resurfaces is re-disabled rather than ignored. Nothing in the column
 /// leads anywhere that sources.
+///
+/// The `Park` column carries the fourth: the two states already holding
+/// the float target go straight to `Parked`, because there is no write to
+/// make, while the two holding absorb go via `ToParked` for the same
+/// off→write→on step-down `ToFloat` performs. Nothing parks from a
+/// bring-up state — every park-class fault is raised from a sourcing path —
+/// and nothing parks *out of* a park, which the supervisor escalates to a
+/// disable instead.
 #[rustfmt::skip]
 const TRANSITIONS: [[Option<ChargeState>; ChargeEvent::COUNT]; ChargeState::COUNT] = {
     const X: Option<ChargeState> = None;
@@ -101,19 +125,23 @@ const TRANSITIONS: [[Option<ChargeState>; ChargeEvent::COUNT]; ChargeState::COUN
     const ABS: Option<ChargeState> = Some(ChargeState::Absorb);
     const TOA: Option<ChargeState> = Some(ChargeState::ToAbsorb);
     const TOF: Option<ChargeState> = Some(ChargeState::ToFloat);
+    const TOP: Option<ChargeState> = Some(ChargeState::ToParked);
+    const PRK: Option<ChargeState> = Some(ChargeState::Parked);
     const HLDF: Option<ChargeState> = Some(ChargeState::HoldFloat);
     const HLDA: Option<ChargeState> = Some(ChargeState::HoldAbsorb);
     [
-        //          Fault SelfDis SelfEn Enabled BelowFull TaperUp TaperDn VWritten Disabled
-        /* Boot   */ [TRIP,    X,     X,   FLT,     TOA,      X,      X,      X,       X],
-        /* HoldF  */ [TRIP,    X,   FLT,   FLT,     TOA,      X,      X,      X,       X],
-        /* HoldA  */ [TRIP,    X,   ABS,   ABS,     ABS,      X,      X,      X,       X],
-        /* Float  */ [TRIP, HLDF,     X,     X,       X,    TOA,      X,      X,       X],
-        /* Absorb */ [TRIP, HLDA,     X,     X,       X,      X,    TOF,      X,       X],
-        /* ToAbs  */ [TRIP, HLDF,     X,     X,       X,      X,      X,    ABS,       X],
-        /* ToFlt  */ [TRIP, HLDA,     X,     X,       X,      X,      X,    FLT,       X],
-        /* Tripng */ [   X,    X,     X,     X,       X,      X,      X,      X,    LTCH],
-        /* Latchd */ [   X,    X,  TRIP,     X,       X,      X,      X,      X,       X],
+        //          Fault  Park SelfDis SelfEn Enabled BelowFull TaperUp TaperDn VWritten Disabled
+        /* Boot   */ [TRIP,   X,    X,     X,   FLT,     TOA,      X,      X,      X,       X],
+        /* HoldF  */ [TRIP,   X,    X,   FLT,   FLT,     TOA,      X,      X,      X,       X],
+        /* HoldA  */ [TRIP,   X,    X,   ABS,   ABS,     ABS,      X,      X,      X,       X],
+        /* Float  */ [TRIP, PRK, HLDF,     X,     X,       X,    TOA,      X,      X,       X],
+        /* Absorb */ [TRIP, TOP, HLDA,     X,     X,       X,      X,    TOF,      X,       X],
+        /* ToAbs  */ [TRIP, PRK, HLDF,     X,     X,       X,      X,      X,    ABS,       X],
+        /* ToFlt  */ [TRIP, TOP, HLDA,     X,     X,       X,      X,      X,    FLT,       X],
+        /* ToPark */ [TRIP,   X,    X,     X,     X,       X,      X,      X,    PRK,       X],
+        /* Parked */ [TRIP,   X,    X,     X,     X,       X,      X,      X,      X,       X],
+        /* Tripng */ [   X,   X,    X,     X,     X,       X,      X,      X,      X,    LTCH],
+        /* Latchd */ [   X,   X,    X,  TRIP,     X,       X,      X,      X,      X,       X],
     ]
 };
 
@@ -128,12 +156,26 @@ impl ChargeState {
     /// this, and it is total: the hold and latch states answer `false` for
     /// the same reason `Boot` does — the output is off, or on its way off.
     pub(super) fn sourcing(self) -> bool {
-        matches!(self, Self::Float | Self::Absorb | Self::ToAbsorb | Self::ToFloat)
+        matches!(
+            self,
+            Self::Float
+                | Self::Absorb
+                | Self::ToAbsorb
+                | Self::ToFloat
+                | Self::ToParked
+                | Self::Parked
+        )
     }
 
     /// Output is off and the supervisor is deciding whether to bring it up.
     pub(super) fn bringing_up(self) -> bool {
         matches!(self, Self::Boot | Self::HoldFloat | Self::HoldAbsorb)
+    }
+
+    /// Parked on a fault, or on the way there. Still sourcing — the load is
+    /// fed — but charging has stopped and will not resume without a reboot.
+    pub(super) fn parked(self) -> bool {
+        matches!(self, Self::ToParked | Self::Parked)
     }
 
     /// Waiting out a self-clearing buck protection. A buck reporting `On`
@@ -153,8 +195,10 @@ impl ChargeState {
             // A retarget's ticket is uncommitted until the write lands, so
             // `To*` names the target the device still holds, not the one
             // it is moving to.
-            Self::Boot | Self::HoldFloat | Self::Float | Self::ToAbsorb => Some(Phase::Float),
-            Self::HoldAbsorb | Self::Absorb | Self::ToFloat => Some(Phase::Absorb),
+            Self::Boot | Self::HoldFloat | Self::Float | Self::ToAbsorb | Self::Parked => {
+                Some(Phase::Float)
+            }
+            Self::HoldAbsorb | Self::Absorb | Self::ToFloat | Self::ToParked => Some(Phase::Absorb),
             Self::Tripping | Self::Latched => None,
         }
     }
@@ -174,7 +218,7 @@ impl ChargeState {
     pub(super) fn retarget_to(self) -> Option<Phase> {
         match self {
             Self::ToAbsorb => Some(Phase::Absorb),
-            Self::ToFloat => Some(Phase::Float),
+            Self::ToFloat | Self::ToParked => Some(Phase::Float),
             _ => None,
         }
     }
@@ -190,6 +234,9 @@ impl ChargeState {
             (s, n) if s.holding() && n.sourcing() => Some(ChargeTransition::ProtectCleared),
             (s, n) if s.sourcing() && n.holding() => Some(ChargeTransition::ProtectHold),
             (_, Self::Tripping) => Some(ChargeTransition::Latched),
+            // One entry per park episode: `Absorb → ToParked` records it,
+            // and the `ToParked → Parked` that completes the write does not.
+            (s, n) if !s.parked() && n.parked() => Some(ChargeTransition::Parked),
             _ => None,
         }
     }
@@ -234,9 +281,15 @@ mod tests {
             // and it always moves *away* from the target being held.
             assert_eq!(
                 s.retarget_to().is_some(),
-                matches!(s, ChargeState::ToAbsorb | ChargeState::ToFloat),
+                matches!(
+                    s,
+                    ChargeState::ToAbsorb | ChargeState::ToFloat | ChargeState::ToParked
+                ),
                 "{s:?}"
             );
+            // Parked is a sourcing state, so it is judged like any other —
+            // it is not a blind spot the gauntlet stops looking at.
+            assert!(!s.parked() || s.sourcing(), "{s:?}");
             if let Some(to) = s.retarget_to() {
                 assert_ne!(Some(to), s.setpoint_phase(), "{s:?} retargets to itself");
             }
@@ -267,6 +320,15 @@ mod tests {
                     ChargeEvent::Fault => {
                         assert_eq!(to, ChargeState::Tripping, "{from:?}");
                         assert!(from.sourcing() || from.bringing_up(), "{from:?}");
+                    }
+                    // A park keeps the buck up, so it is only reachable from
+                    // a sourcing state — and never from one already parked,
+                    // which the supervisor escalates to a `Fault` instead.
+                    // The V_SET does not move until a write is committed.
+                    ChargeEvent::Park => {
+                        assert!(from.sourcing() && !from.parked(), "{from:?}");
+                        assert!(to.parked(), "{from:?} → {to:?}");
+                        assert_eq!(to.setpoint_phase(), from.setpoint_phase(), "{from:?}");
                     }
                     // Only a sourcing buck can drop out, and it lands in
                     // the hold for the target it was holding.
@@ -322,7 +384,7 @@ mod tests {
     #[test]
     fn transitions_log_the_move_they_mean() {
         use ChargeState::*;
-        let cases: [(ChargeState, ChargeState, Option<ChargeTransition>); 11] = [
+        let cases: [(ChargeState, ChargeState, Option<ChargeTransition>); 14] = [
             (Boot, Float, Some(ChargeTransition::Energised)),
             (Boot, ToAbsorb, Some(ChargeTransition::Energised)),
             (HoldFloat, Float, Some(ChargeTransition::ProtectCleared)),
@@ -338,6 +400,11 @@ mod tests {
             // disable ack is covered by the latch entry that preceded it.
             (Float, ToAbsorb, None),
             (Tripping, Latched, None),
+            // A park is one episode: the move into it records, the write
+            // that completes it does not.
+            (Absorb, ToParked, Some(ChargeTransition::Parked)),
+            (Float, Parked, Some(ChargeTransition::Parked)),
+            (ToParked, Parked, None),
         ];
         for (from, to, want) in cases {
             assert_eq!(from.logged_as(to), want, "{from:?} → {to:?}");

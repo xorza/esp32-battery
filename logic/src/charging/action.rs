@@ -64,10 +64,13 @@ impl DisableTicket {
 /// enable. Each tick re-runs the same safety checks as the sourcing path;
 /// once all clear it emits `EnableOutput` and stays where it is until the
 /// caller commits the ticket. After that the phase machine, drift check
-/// and fault paths run. After a fault latches, only `DisableOutput` is
-/// ever emitted until the disable is committed; the supervisor then sits
-/// in `Action::None` indefinitely (reboot-only recovery — transient
-/// protection causes LVP/OTP are waited out in a hold without latching).
+/// and fault paths run. A fault ends the charge one of two ways. If it
+/// disables, only `DisableOutput` is emitted until the write is committed
+/// and the supervisor then sits in `Action::None`. If it parks, one last
+/// `UpdateVoltage` steps down to the float target and the supervisor sits
+/// in `Action::None` there with the output still up. Both are reboot-only;
+/// transient protection causes LVP/OTP are neither, and get waited out in
+/// a hold.
 ///
 /// Every non-`None` variant carries a ticket. Perform the write, then
 /// commit the ticket only if the write succeeded: dropping it instead is
