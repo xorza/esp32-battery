@@ -12,3 +12,7 @@
 
 monitoring/volumes/
 .tmp/
+
+# Library crate built only via `-p` from the root, which uses the root
+# lockfile. A second lockfile here is never consulted and silently drifts.
+logic/Cargo.lock

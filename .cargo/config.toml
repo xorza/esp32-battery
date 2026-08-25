@@ -28,5 +28,9 @@ build-std = ["std", "panic_abort"]
 [env]
 # Override with: MCU=esp32c3 cargo build --release
 MCU = { value = "esp32c6", relative = false }
+# Pinned to the tag, not `release/v5.5`: v5.5.5 added
+# `unaligned_multi_block_rw_max_chunk_size` to `sdmmc_host_t`, and published
+# esp-idf-hal 0.46.2 does not initialize it, so its `sdmmc` module stops
+# compiling. Move to the branch once esp-idf-hal publishes past 0.46.2.
 ESP_IDF_VERSION = "v5.5.4"
 ESP_IDF_TOOLS_INSTALL_DIR = "global"

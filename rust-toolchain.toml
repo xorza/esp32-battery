@@ -1,2 +1,7 @@
+# Not `nightly`: since mid-2026 `library/std/src/sys/fs/unix.rs` references
+# `libc::AT_FDCWD` unconditionally, and `libc` defines no `AT_*` constants for
+# the espidf platform — so `-Z build-std` cannot compile `std` for any
+# `*-esp-espidf` target. The `esp` toolchain (rustc 1.95-nightly) predates that
+# change and ships `rust-src`. Revisit when libc gains espidf `AT_*`.
 [toolchain]
 channel = "esp"

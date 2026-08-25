@@ -167,12 +167,6 @@ impl NetResources {
         }
     }
 
-    pub fn set_status(&self, s: SubmissionStatus) {
-        if let Self::Mixed { bundle, .. } = self {
-            bundle.set_status(s);
-        }
-    }
-
     /// Refresh the AP scan cache if it has gone stale. The TTL lives with
     /// the cache; the supervisor only decides *when* scanning is safe.
     pub fn refresh_scan_if_stale(&mut self, now: Duration) {

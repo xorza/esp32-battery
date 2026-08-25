@@ -2239,3 +2239,39 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
     assert!(matches!(s.phase(), Phase::Absorb));
     assert!(approx(s.expected_setpoints().v_set, profile.absorb_v));
 }
+
+#[test]
+fn protect_hold_clears_the_overvoltage_window() {
+    // OV accumulates while regulating, the buck then self-disables on a
+    // transient protection. Output is off for the hold, so the pack decays
+    // — the partial OV window must not carry across and trip the next
+    // regulating stretch early.
+    let profile = lfp_4s();
+    let over = profile.absorb_v + OV_MARGIN_V + 0.1;
+    let mut s = active(profile);
+
+    // Two of the three seconds OV needs.
+    for _ in 0..(OV_DURATION.as_secs() - 1) {
+        assert!(matches!(ok_tick(&mut s, b(over, -0.1), TICK), Action::None));
+        assert_eq!(s.fault(), None);
+    }
+
+    // Buck drops on input UVLO, then comes back.
+    let p_lvp = poll_with_output(&s, BuckOutput::Off {
+        cause: ProtectionStatus::Lvp,
+    });
+    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    let p_on = poll_with_output(&s, BuckOutput::On);
+    assert!(matches!(s.tick(p_on, TICK), Action::None));
+
+    // A single over-volt tick must not latch: the window restarts at zero,
+    // so it takes the full OV_DURATION again.
+    for _ in 0..(OV_DURATION.as_secs() - 1) {
+        assert!(matches!(ok_tick(&mut s, b(over, -0.1), TICK), Action::None));
+        assert_eq!(s.fault(), None, "OV window carried across the hold");
+    }
+    assert!(matches_disable(
+        &ok_tick(&mut s, b(over, -0.1), TICK),
+        FaultReason::Overvoltage
+    ));
+}

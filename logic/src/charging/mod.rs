@@ -848,6 +848,11 @@ impl ChargeSupervisor {
                     reason: PendingReason::ProtectRecovery,
                 });
                 self.reset_phase_timers();
+                // Output is off for the duration of the hold, so the pack
+                // voltage decays. A partly-accumulated OV window from before
+                // the self-disable would otherwise carry across and trip the
+                // next regulating stretch early.
+                self.ov = Debounce::default();
                 self.inhibit = Some(InhibitReason::BuckProtection(cause));
                 return Action::None;
             }

@@ -24,10 +24,13 @@ const SERVER_CERT: X509<'static> =
 const SERVER_KEY: X509<'static> = X509::pem_until_nul(include_bytes!("../../certs/selfsigned.key"));
 
 /// Published `esp-idf-svc` 0.52.1 exposes neither TCP keep-alive nor
-/// `SO_LINGER` on the server config, so neither is set here. Half-open
-/// sockets are reclaimed only by `lru_purge_enable` plus the 2 s session
-/// timeout, and closed sockets go through TIME_WAIT — which matters
-/// because `max_open_sockets` is 3 on the dashboard.
+/// `SO_LINGER` on the server config, so neither is set here. What covers
+/// the gap: `lru_purge_enable` evicts the least-recently-used connection
+/// when the pool is full, so a new client always gets in, and the 5 s
+/// `recv_wait_timeout` / `send_wait_timeout` the crate hard-codes tear
+/// down a stalled socket. The pool counts *open* sockets, so sockets in
+/// TIME_WAIT do not consume `max_open_sockets`. The residual loss is
+/// slower reclamation of a peer that vanished silently mid-connection.
 pub(crate) fn create_server(
     stack_size: usize,
     wildcard: bool,

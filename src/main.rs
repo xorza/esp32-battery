@@ -133,15 +133,6 @@ fn main() {
 
     let recorder = EventRecorder::new(event_log.clone(), clock.clone());
 
-    // TEMP: simulate errors to verify webpage + LCD display. Remove before merging.
-    // {
-    //     use esp32_battery_logic::error_log::{Event, InaError, XyError};
-    //     recorder.record(Event::Ina(InaError::BusVoltageRead));
-    //     recorder.record(Event::Ina(InaError::CurrentRead));
-    //     recorder.record(Event::Xy(XyError::ReadStatus));
-    //     recorder.record(Event::Xy(XyError::SetVoltage));
-    // }
-
     xy::start(board.xy, sensor_data.clone(), recorder.clone());
     ina::start(board.i2c, sensor_data.clone(), recorder);
 
@@ -222,7 +213,13 @@ fn apply_net_action(
         }
         NetAction::MarkSubmissionFailed => {
             warn!("Captive: STA association timed out; flipping to Failed");
-            resources.set_status(SubmissionStatus::Failed);
+            if let NetResources::Mixed { wifi, bundle } = &mut resources {
+                // The phase drops the credentials on this transition; the
+                // radio has to as well, or the STA half keeps retrying a
+                // pair the supervisor no longer knows about.
+                wifi.clear_sta_creds();
+                bundle.set_status(SubmissionStatus::Failed);
+            }
             resources
         }
         NetAction::StartMdns => {

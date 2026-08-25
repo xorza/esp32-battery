@@ -266,6 +266,24 @@ impl<'d> MixedWifi<'d> {
         self.sta_configured = true;
     }
 
+    /// Drop the credentials the STA half is retrying, without stopping the
+    /// radio — the captive AP stays associated with the user's phone. Used
+    /// when a submission's association budget expires: the phase drops the
+    /// creds, so leaving them applied would have the STA half retrying
+    /// credentials the supervisor has already forgotten.
+    pub fn clear_sta_creds(&mut self) {
+        info!("Clearing STA creds (live)");
+        self.driver
+            .wifi
+            .set_configuration(&Configuration::Mixed(
+                ClientConfiguration::default(),
+                ap_config(),
+            ))
+            .unwrap();
+        let _ = self.driver.wifi.disconnect();
+        self.sta_configured = false;
+    }
+
     /// Returns post-attempt connection state. Until creds are configured,
     /// this is just a read of `is_connected()` — connecting to an empty
     /// SSID logs an error per second otherwise.
