@@ -9,6 +9,9 @@
 
 use super::Sample;
 
+/// Entries the ring holds. Sets the RAM footprint (204 × 20 B ≈ 4 KB) and the
+/// size of the array `/api` serializes on every request; the span it covers is
+/// this times the current interval.
 pub const HISTORY_CAPACITY: usize = 204;
 
 /// Once the interval reaches this, the window slides (oldest sample dropped)
@@ -111,10 +114,11 @@ impl History {
             if self.interval < MAX_INTERVAL {
                 self.compact();
             } else {
-                // At the cap the window slides rather than coarsening: one
-                // sample's worth of memmove per `MAX_INTERVAL` seconds buys a
-                // contiguous buffer for every reader and a chart whose left
-                // edge advances smoothly instead of in jumps.
+                // At the cap the window slides rather than coarsening. Each
+                // drop costs a whole-buffer memmove, but only once per
+                // `MAX_INTERVAL` seconds, and it buys every reader a
+                // contiguous slice plus a chart whose left edge advances
+                // smoothly instead of in jumps.
                 self.samples.remove(0);
             }
         }
@@ -129,13 +133,14 @@ impl History {
     fn compact(&mut self) {
         let half = self.samples.len() / 2;
         for i in 0..half {
+            let a = self.samples[2 * i];
+            let b = self.samples[2 * i + 1];
             let mut pair = SampleAccum::default();
-            pair.add(&self.samples[2 * i]);
-            pair.add(&self.samples[2 * i + 1]);
+            pair.add(&a);
+            pair.add(&b);
             // The later of the two stamps: like an accumulated sample, a
             // compacted one is labelled by the end of the span it covers.
-            let time_s = self.samples[2 * i + 1].time_s;
-            self.samples[i] = pair.average(2, time_s);
+            self.samples[i] = pair.average(2, b.time_s);
         }
         self.samples.truncate(half);
         self.interval *= 2;

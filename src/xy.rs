@@ -498,9 +498,9 @@ struct PollOutcome {
     ps_offline: bool,
 }
 
-/// One read cycle: poll the buck, push readings into shared sensor data,
-/// snapshot the latest battery sample, and return the supervisor's
-/// per-tick view of the world.
+/// One read cycle: poll the buck, publish what it said into shared sensor
+/// data, snapshot the latest battery sample, and hand back everything the
+/// tick needs.
 ///
 /// The Modbus read runs *without* the `SensorData` lock held — UART
 /// transactions can take up to `response_timeout` (500 ms) and we don't
@@ -516,11 +516,8 @@ fn poll<D: XyDevice>(
     // one Modbus round-trip instead of three. PROTECT is necessarily
     // Normal while OUTPUT_EN is on; non-Normal here means the buck
     // self-disabled this session (boot_sequence wiped 0x0010).
-    let (setpoints, output, ps, ps_offline) = match xy.read_status() {
+    let (setpoints, output, ps) = match xy.read_status() {
         Ok(s) => {
-            // Input UVLO = the DC supply was disconnected / sagged. Treat it
-            // as a benign, self-clearing "PS offline" status, not a fault.
-            let ps_offline = !s.output_on && s.protection == ProtectionStatus::Lvp;
             let ps = Some(PsReading {
                 voltage: s.v_out,
                 current: s.i_out,
@@ -533,7 +530,7 @@ fn poll<D: XyDevice>(
                 *last_protection = ProtectionStatus::Normal;
                 BuckOutput::On
             } else {
-                // LVP is surfaced as "PS offline" above and recovers on its
+                // LVP is surfaced as "PS offline" below and recovers on its
                 // own — don't pollute the event log with it. Other causes
                 // record once per latch episode (rising edge / cause change);
                 // the warn! stays per-poll for log visibility.
@@ -550,12 +547,12 @@ fn poll<D: XyDevice>(
                     cause: s.protection,
                 }
             });
-            (setpoints, output, ps, ps_offline)
+            (setpoints, output, ps)
         }
         Err(e) => {
             warn!("XY read_status: {e}");
             recorder.record(Event::Xy(XyError::ReadStatus));
-            (None, None, None, false)
+            (None, None, None)
         }
     };
 
@@ -571,6 +568,18 @@ fn poll<D: XyDevice>(
             current: b.current,
         })
     };
+
+    // Input UVLO with the output down = the DC supply was disconnected or
+    // sagged. Benign and self-clearing, so the dashboard shows it as a status
+    // rather than a fault. Read back off `output` rather than recomputed from
+    // the raw status, so it cannot disagree with what the supervisor is handed
+    // for the same poll.
+    let ps_offline = matches!(
+        output,
+        Some(BuckOutput::Off {
+            cause: ProtectionStatus::Lvp
+        })
+    );
 
     PollOutcome {
         poll: PollResult {
