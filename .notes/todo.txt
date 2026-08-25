@@ -1,0 +1,1 @@
+under the load voltaqge is always less thatn 14.2, how will it work
