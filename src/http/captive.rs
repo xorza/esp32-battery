@@ -9,14 +9,19 @@ use crate::dns::DnsHandle;
 use crate::net::{CaptiveBundle, SubmissionStatusHandle, new_creds_mailbox};
 use crate::wifi::ScanCache;
 
-use super::{create_server, serve_common_assets, serve_static};
+use super::{ServerConfig, create_server, serve_common_assets, serve_static};
 
 pub fn start(scan_cache: ScanCache) -> CaptiveBundle {
     let dns = DnsHandle::start();
     let mailbox = new_creds_mailbox();
     let status = SubmissionStatusHandle::new();
 
-    let mut server = create_server(8192, true, 4, false);
+    let mut server = create_server(ServerConfig {
+        stack_size: 8192,
+        max_sockets: 4,
+        wildcard: true,
+        https: false,
+    });
 
     captive_api::mount(&mut server, scan_cache, mailbox.clone(), status.clone());
     serve_common_assets(&mut server);

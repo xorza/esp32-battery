@@ -24,6 +24,7 @@ use mipidsi::Builder;
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
+use strum::EnumCount;
 
 use crate::board::LcdPins;
 use esp32_battery_logic::NetStatus;
@@ -65,15 +66,49 @@ const VALUE_H: u32 = 22;
 const UPTIME_X: i32 = 240;
 const UPTIME_W: u32 = 80;
 const UPTIME_H: u32 = 12;
+/// FONT_6X10 baseline inside the uptime band.
+const UPTIME_BASELINE: i32 = 8;
 
-// Lower bands (non-overlapping, each 22 tall).
+// Single 320-wide, one-band-tall buffer (~14 KB BSS) used for flicker-free
+// composition of one row at a time. Baseline leaves a FONT_10X20 line's
+// ascenders and descenders inside the band.
+const SCRATCH_W: u32 = DISPLAY_W;
+const SCRATCH_H: u32 = 22;
+const BAND_BASELINE: i32 = 16;
+
+/// FONT_10X20's horizontal advance. The font is monospace, so text widths in
+/// the lower region are character counts times this.
+const FONT_10X20_ADVANCE: i32 = 10;
+
+// Lower bands: one `SCRATCH_H`-tall band per row, stacked at a fixed pitch.
 const LOWER_LEFT_X: i32 = 20;
 const LOWER_TITLE_TOP: i32 = 70;
-const LOWER_ROW1_TOP: i32 = 96;
-const LOWER_ROW2_TOP: i32 = 120;
-const LOWER_ROW3_TOP: i32 = 144;
-// Label up to 4 chars (FONT_10X20 → 40 px) + 10 px gap; values align here.
-const LOWER_VALUE_X: i32 = LOWER_LEFT_X + 4 * 10 + 10;
+/// Row pitch: a full band plus two pixels of air, so one row's descenders
+/// cannot touch the next. Derived from `SCRATCH_H` rather than written out,
+/// which is what keeps the bands from overlapping when either changes.
+const LOWER_ROW_PITCH: i32 = SCRATCH_H as i32 + 2;
+/// The first value row clears the title band by a pitch plus a little more —
+/// that extra gap is what separates the heading from the values under it.
+const LOWER_ROW1_TOP: i32 = LOWER_TITLE_TOP + LOWER_ROW_PITCH + 2;
+const LOWER_ROW2_TOP: i32 = LOWER_ROW1_TOP + LOWER_ROW_PITCH;
+const LOWER_ROW3_TOP: i32 = LOWER_ROW2_TOP + LOWER_ROW_PITCH;
+/// Labels are at most 4 characters; values start one character further on so
+/// they align across rows.
+const LOWER_VALUE_X: i32 = LOWER_LEFT_X + 5 * FONT_10X20_ADVANCE;
+
+/// Right margin for a lower-region badge. The panel's controller has a column
+/// offset that eats the rightmost pixels, so a badge flush to `SCRATCH_W`
+/// loses part of its last glyph.
+const BADGE_RIGHT_MARGIN: i32 = 14;
+
+const _: () = assert!(
+    LOWER_TITLE_TOP >= LOWER_Y,
+    "the title band starts above the lower region it belongs to"
+);
+const _: () = assert!(
+    LOWER_ROW3_TOP + SCRATCH_H as i32 <= DISPLAY_H as i32,
+    "the bottom lower row runs off the panel"
+);
 
 const COLOR_BG: Rgb565 = Rgb565::BLACK;
 const COLOR_LABEL: Rgb565 = Rgb565::new(18, 36, 18);
@@ -99,14 +134,7 @@ fn battery_current_color(current: f32) -> Rgb565 {
     }
 }
 
-// Single 320×22 buffer (~14 KB BSS) used for flicker-free composition
-// of one row at a time. Baseline at y=16 leaves a FONT_10X20 line's
-// ascenders/descenders inside the band.
-
-const SCRATCH_W: u32 = DISPLAY_W;
-const SCRATCH_H: u32 = 22;
 const SCRATCH_PX: usize = (SCRATCH_W * SCRATCH_H) as usize;
-const BAND_BASELINE: i32 = 16;
 
 struct Scratch {
     pixels: &'static mut [Rgb565],
@@ -226,10 +254,39 @@ impl LowerKey {
     }
 }
 
+/// Longest text an upper-region cell renders. Sized for the uptime corner,
+/// which is the widest: a many-digit hour count plus `"h MMm SSs"`.
+const CELL_TEXT_CAP: usize = 32;
+
+/// A repaintable slot in the upper region. The variant order indexes
+/// [`Ui::painted`].
+#[derive(Copy, Clone, EnumCount)]
+enum UpperCell {
+    Voltage,
+    Power,
+    BatteryCurrent,
+    PsCurrent,
+    Uptime,
+}
+
+/// What an upper cell currently shows. The colour is part of it because two
+/// readings can format identically and still differ: battery current is drawn
+/// as a magnitude, with charge/discharge carried entirely by the colour.
+#[derive(Clone, Debug, PartialEq)]
+struct PaintedCell {
+    text: heapless::String<CELL_TEXT_CAP>,
+    color: Rgb565,
+}
+
 struct Ui<D> {
     display: D,
     scratch: Scratch,
     last_lower: Option<LowerKey>,
+    /// What each upper cell is currently showing, so an unchanged one skips
+    /// its blit. Every cell is a full band pushed over SPI, and at 2 Hz most
+    /// ticks move one or two of the five — the readings are quiet and the
+    /// uptime corner only ticks once a second.
+    painted: [Option<PaintedCell>; UpperCell::COUNT],
 }
 
 impl<D> Ui<D>
@@ -242,6 +299,7 @@ where
             display,
             scratch,
             last_lower: None,
+            painted: [const { None }; UpperCell::COUNT],
         }
     }
 
@@ -268,13 +326,27 @@ where
         }
     }
 
+    /// Record `next` as what `slot` shows, reporting whether that differs from
+    /// what is already on the panel.
+    fn cell_changed(&mut self, slot: UpperCell, next: &PaintedCell) -> bool {
+        if self.painted[slot as usize].as_ref() == Some(next) {
+            return false;
+        }
+        self.painted[slot as usize] = Some(next.clone());
+        true
+    }
+
     /// 150×22 upper-region cell; text composed from `args`.
-    fn cell(&mut self, top: Point, color: Rgb565, args: core::fmt::Arguments<'_>) {
-        let mut buf = heapless::String::<32>::new();
-        let _ = buf.write_fmt(args);
+    fn cell(&mut self, slot: UpperCell, top: Point, color: Rgb565, args: core::fmt::Arguments<'_>) {
+        let mut text = heapless::String::new();
+        let _ = text.write_fmt(args);
+        let next = PaintedCell { text, color };
+        if !self.cell_changed(slot, &next) {
+            return;
+        }
         self.scratch.clear();
         Text::new(
-            &buf,
+            &next.text,
             Point::new(0, BAND_BASELINE),
             MonoTextStyle::new(&FONT_10X20, color),
         )
@@ -295,12 +367,10 @@ where
             .draw(s)
             .unwrap();
             if let Some((b, c)) = badge {
-                // FONT_10X20 advances 10 px/char; pad the right margin generously so
-                // the panel's column-offset quirk doesn't clip the last glyph.
-                let w = (b.len() as i32) * 10;
+                let w = (b.len() as i32) * FONT_10X20_ADVANCE;
                 Text::new(
                     b,
-                    Point::new(SCRATCH_W as i32 - w - 14, BAND_BASELINE),
+                    Point::new(SCRATCH_W as i32 - w - BADGE_RIGHT_MARGIN, BAND_BASELINE),
                     MonoTextStyle::new(&FONT_10X20, c),
                 )
                 .draw(s)
@@ -339,53 +409,66 @@ where
         self.display.fill_solid(&area, COLOR_BG).unwrap();
     }
 
-    /// Upper region — four values + uptime. Repainted every tick.
+    /// Upper region — four values + uptime. Every cell decides for itself
+    /// whether anything moved; see [`Ui::painted`].
     fn draw_upper(&mut self, bat: Ina228Reading, ps: PsReading, uptime: Duration) {
         self.cell(
+            UpperCell::Voltage,
             Point::new(COL_LEFT, ROW1_TOP),
             COLOR_VOLTAGE,
             format_args!("{:.2} V", bat.voltage),
         );
         self.cell(
+            UpperCell::Power,
             Point::new(COL_RIGHT, ROW1_TOP),
             COLOR_POWER,
             format_args!("{:.2} W", bat.power),
         );
         // Battery: sign conveyed by color, magnitude only in text.
         self.cell(
+            UpperCell::BatteryCurrent,
             Point::new(COL_LEFT, ROW2_TOP),
             battery_current_color(bat.current),
             format_args!("{:.3} A", bat.current.abs()),
         );
         self.cell(
+            UpperCell::PsCurrent,
             Point::new(COL_RIGHT, ROW2_TOP),
             COLOR_PSU_CURRENT,
             format_args!("{:.3} A", ps.current),
         );
 
-        let mut buf = heapless::String::<16>::new();
+        // Its own draw rather than `cell`'s: a smaller font, a different
+        // baseline, and a band narrower than a value cell.
+        let mut text = heapless::String::new();
         let secs = uptime.as_secs();
         let _ = write!(
-            buf,
+            text,
             "{}h {:02}m {:02}s",
             secs / 3600,
             (secs % 3600) / 60,
             secs % 60
         );
-        self.scratch.clear();
-        Text::new(
-            &buf,
-            Point::new(0, 8),
-            MonoTextStyle::new(&FONT_6X10, COLOR_LABEL),
-        )
-        .draw(&mut self.scratch)
-        .unwrap();
-        self.scratch.blit(
-            &mut self.display,
-            Point::new(UPTIME_X, 0),
-            UPTIME_W,
-            UPTIME_H,
-        );
+        let next = PaintedCell {
+            text,
+            color: COLOR_LABEL,
+        };
+        if self.cell_changed(UpperCell::Uptime, &next) {
+            self.scratch.clear();
+            Text::new(
+                &next.text,
+                Point::new(0, UPTIME_BASELINE),
+                MonoTextStyle::new(&FONT_6X10, COLOR_LABEL),
+            )
+            .draw(&mut self.scratch)
+            .unwrap();
+            self.scratch.blit(
+                &mut self.display,
+                Point::new(UPTIME_X, 0),
+                UPTIME_W,
+                UPTIME_H,
+            );
+        }
     }
 
     /// Lower region — repainted only when the visible state changes.

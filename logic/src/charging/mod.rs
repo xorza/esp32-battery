@@ -38,6 +38,7 @@ pub(crate) mod inhibit_reason;
 pub(crate) mod phase;
 pub(crate) mod poll_result;
 pub(crate) mod profile;
+pub(crate) mod protection_policy;
 pub(crate) mod voltage_writer;
 
 /// CC charge rate as a fraction of pack capacity. 0.2C is the
@@ -123,7 +124,11 @@ const TRANSITION_BUFFER: usize = 8;
 /// Allowed drift between commanded and observed setpoint. One register
 /// quantum is 0.01; two-quantum slack absorbs IEEE-float round-trip
 /// quirks on values like 14.4 V whose binary repr isn't exact.
-const SETPOINT_DRIFT_TOL: f32 = 0.02;
+///
+/// Public because the firmware's boot-time readback verification is the same
+/// commanded-vs-reported comparison, made once instead of every tick, and
+/// must not disagree about how close counts as equal.
+pub const SETPOINT_DRIFT_TOL: f32 = 0.02;
 
 #[cfg(test)]
 mod tests;

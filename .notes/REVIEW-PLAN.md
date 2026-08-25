@@ -244,30 +244,70 @@ still worth doing for the `power_online` removal, though nothing in
 
 ---
 
-## Phase 5 — Firmware ergonomics
+## Phase 5 — Firmware ergonomics — **DONE**
 
-Lowest risk, lowest urgency; safe to defer.
+**Item 31 was bigger than the finding said: five sites, not four.** The rule
+"input UVLO is benign and self-clearing" now lives in `ProtectionPolicy`, a
+trait on the foreign `ProtectionStatus` with two predicates. `is_self_clearing`
+(LVP or OTP) is what the supervisor waits out instead of latching — it replaced
+two separate `Lvp | Otp` patterns in `safety_verdict`, not one. `is_input_loss`
+(LVP alone) is what the dashboard calls "PS offline" and the event log ignores.
+Both default to `false` for an unrecognised cause, which fails safe: a new
+protection latches rather than being waited out forever. A table test pins all
+eleven causes and the subset relation between the two predicates — OTP is the
+case that keeps them apart, waited out but still worth a log entry.
 
-29. **`http` helper stack.** Named server configuration instead of
-    `create_server(10240, false, 3, true)`; inline `read_exact` into its single
-    OTA caller; drop `mount_json_get`'s pass-through closure; build
-    `serve_static`'s header set at mount time rather than per request.
-30. **`xy::poll`.** Split the five jobs; give the PROTECT rising-edge dedup a
-    home instead of a `&mut ProtectionStatus` out-parameter threaded from `run`.
-31. **Single LVP policy.** "Input UVLO is benign" is decided independently in
-    firmware and in logic, in four places.
-32. **Remaining duplicated constants and types.** `SETPOINT_DRIFT_TOL` vs
-    `xy::verify`'s literal `0.02`; `EXPECTED_MODEL_CODE`, which is compared
-    against nothing; `api::PsReading` / `api::BatteryReading` mirroring the logic
-    types; `ina::ReadingAccum` vs `SampleAccum`; the `AP_GATEWAY` array vs the
-    hard-coded `"http://192.168.71.1/"` in `/generate_204`.
-33. **`lcd.rs` layout.** Derive the row stride instead of writing 96/120/144 and
-    keeping `SCRATCH_H` compatible by hand; give `draw_upper` the change
-    detection `draw_lower` already has; fold the `- 14` badge margin into the
-    font-metric calculation or say what it is.
+**Item 30.** `poll` is now read → classify → publish → derive, four lines each
+naming a job. The PROTECT rising-edge dedup moved into `ProtectionLog`, which
+owns the last-seen cause instead of the loop threading a `&mut ProtectionStatus`
+down from `run`, and `ps_reading` names the status→`PsReading` conversion.
 
-**Verify:** `./run_tests.sh`, then flash and look at the panel — 33 is the one
-group tests cannot judge.
+**Item 32, three of five.** `xy::verify`'s bare `0.02` is now
+`SETPOINT_DRIFT_TOL` — it is the same commanded-vs-reported comparison the
+supervisor makes per tick, done once at boot. `EXPECTED_MODEL_CODE` is gone from
+the boot path: `BootError::ModelMismatch` carried an `expected_code` the driver
+never named, so it now reports only what the device said, and the constant
+survives as `FAKE_MODEL_CODE` inside `mod fake`, which is its only real use. The
+captive portal's redirect is built from `AP_GATEWAY` at mount time instead of
+being written out as `"http://192.168.71.1/"`.
+
+Two of the five were **not** done, both for the same kind of reason:
+
+- `api::PsReading` mirroring `logic::PsReading` would need `serde` added to the
+  logic crate — a new manifest entry, which needs your go-ahead — and it would
+  couple a pure-logic data type to a wire format it currently knows nothing
+  about. The mirror is arguably the right layering: the JSON shape can change
+  without touching the domain type. Its neighbour `api::BatteryReading` already
+  has to differ (it carries `soc` where the domain type carries `voltage`).
+- `ina::ReadingAccum` and `data::history::SampleAccum` are structurally the same
+  sum-then-divide, but over different types, in different crates, at different
+  accumulator precision (f64 vs f32). Unifying needs either a macro or a generic
+  over `[f32; N]` that swaps named fields for indices — and a channel mix-up
+  that the compiler can no longer catch is a worse outcome than twenty lines of
+  obvious arithmetic written twice.
+
+**Item 29.** `create_server` takes a named `ServerConfig` instead of
+`(10240, false, 3, true)`. `read_exact` moved into `src/ota.rs` as
+`read_hmac_tag` with its two messages inlined — it had exactly one caller.
+`serve_static` builds its header set once at mount time rather than rebuilding a
+4-entry vector with four `unwrap()`s per request. The JSON stack lost two
+layers: `with_json_buf` and `json_response` each had a single caller, so both
+folded into `mount_json_get`, taking the `|inner| build(inner)` pass-through
+with them. Six layers down to four, and a serialization failure now names the
+route in its log line.
+
+**Item 33.** The lower-region rows derive from `SCRATCH_H`: pitch is a full band
+plus two pixels, and const asserts hold the title band inside the lower region
+and the bottom row on the panel. `FONT_10X20_ADVANCE` and `BADGE_RIGHT_MARGIN`
+name the two numbers that were sitting bare inside the badge calculation.
+`draw_upper` now has the change detection `draw_lower` had: each of the five
+cells caches the text *and* the colour it last painted — the colour matters
+because battery current is drawn as a magnitude with charge/discharge carried
+entirely by the colour, so two identical strings can need different pixels.
+
+**Verify:** `./run_tests.sh` passes, 182 tests. Item 33 is the one tests cannot
+judge — the firmware crate has no host-testable surface, so the cell cache wants
+a look at the panel.
 
 ---
 

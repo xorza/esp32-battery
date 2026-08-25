@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use esp_idf_svc::http::server::{EspHttpConnection, EspHttpServer};
+use esp_idf_svc::http::server::{EspHttpConnection, EspHttpServer, Request};
 use esp_idf_svc::ota::EspOta;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use log::{info, warn};
@@ -36,16 +36,27 @@ pub fn init() {
     LazyLock::force(&OTA_KEY);
 }
 
-fn handle_upload(
-    req: &mut esp_idf_svc::http::server::Request<&mut EspHttpConnection>,
-) -> Result<usize, &'static str> {
-    let mut expected_hmac = [0u8; 32];
-    crate::http::read_exact(
-        req,
-        &mut expected_hmac,
-        "failed to read HMAC",
-        "missing HMAC signature",
-    )?;
+/// Read the 32-byte HMAC tag the upload is prefixed with. A body that ends
+/// early is a truncated upload, not a read error, so the two get different
+/// messages — the client can retry one and not the other.
+fn read_hmac_tag(req: &mut Request<&mut EspHttpConnection>) -> Result<[u8; 32], &'static str> {
+    let mut tag = [0u8; 32];
+    let mut filled = 0;
+    while filled < tag.len() {
+        let n = req.read(&mut tag[filled..]).map_err(|e| {
+            warn!("OTA: HMAC prefix read failed: {e:?}");
+            "failed to read HMAC"
+        })?;
+        if n == 0 {
+            return Err("missing HMAC signature");
+        }
+        filled += n;
+    }
+    Ok(tag)
+}
+
+fn handle_upload(req: &mut Request<&mut EspHttpConnection>) -> Result<usize, &'static str> {
+    let expected_hmac = read_hmac_tag(req)?;
 
     let mut mac = HmacSha256::new_from_slice(&*OTA_KEY).expect("HMAC key length must be valid");
 

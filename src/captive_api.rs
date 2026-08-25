@@ -7,6 +7,8 @@
 //! association) persists to NVS — bad creds therefore never overwrite a
 //! known-good pair on flash.
 
+use core::fmt::Write as _;
+
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::sys::EspError;
 use log::info;
@@ -101,14 +103,17 @@ pub fn mount(
     });
 
     // Android captive portal detection: expects 204, gets 302 → triggers popup.
-    mount_get(server, "/generate_204", |req| {
+    // The redirect target is built from `AP_GATEWAY` once at mount time, so the
+    // portal cannot end up pointing somewhere the AP does not answer, and the
+    // request path does no formatting.
+    let mut portal_url = heapless::String::<24>::new();
+    let [a, b, c, d] = crate::wifi::AP_GATEWAY;
+    write!(portal_url, "http://{a}.{b}.{c}.{d}/").expect("dotted quad fits 24 bytes");
+    mount_get(server, "/generate_204", move |req| {
         req.into_response(
             302,
             None,
-            &[
-                ("Location", "http://192.168.71.1/"),
-                ("Connection", "close"),
-            ],
+            &[("Location", portal_url.as_str()), ("Connection", "close")],
         )
         .map_err(|e| e.0)?;
         Ok::<(), EspError>(())

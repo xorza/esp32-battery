@@ -12,13 +12,13 @@ use crate::charging::inhibit_reason::InhibitReason;
 use crate::charging::phase::Phase;
 use crate::charging::poll_result::{BatterySample, BuckOutput, PollResult};
 use crate::charging::profile::Profile;
+use crate::charging::protection_policy::ProtectionPolicy;
 use crate::charging::{
     ABSORB_CV_BAND_V, BATTERY_MISSING_TIMEOUT, EXIT_DEBOUNCE, MAX_ABSORB,
     MODBUS_UNHEALTHY_TIMEOUT, OV_DURATION, OV_MARGIN_V, SETPOINT_DRIFT_TOL, TRANSITION_BUFFER,
 };
 use crate::error_log::ChargeTransition;
 use xy_modbus::ProtectionStatus;
-use xy_modbus::ProtectionStatus::{Lvp, Otp};
 use xy_modbus::Setpoints;
 
 /// Latch state.
@@ -429,19 +429,16 @@ impl ChargeSupervisor {
         //    a panel toggle). Pending expects OFF: an ON means our boot
         //    disable / S_INI=0 didn't stick.
         //
-        //    LVP (input UVLO) and OTP (over-temp) are sensor-driven, not true
-        //    latches: the buck is healthy and waiting on a condition to
-        //    clear, and it may re-enable OUTPUT_EN by itself once it does.
-        //    So we step back to Pending and treat a later ON as the expected
-        //    recovery. Setpoints are untouched through the wait — check 1
-        //    just verified them — so regulation resumes at known targets.
+        //    A self-clearing cause (see `ProtectionPolicy`) is the buck
+        //    waiting on a condition rather than failing, and it may re-enable
+        //    OUTPUT_EN by itself once the condition lifts. So we step back to
+        //    Pending and treat a later ON as the expected recovery. Setpoints
+        //    are untouched through the wait — check 1 just verified them — so
+        //    regulation resumes at known targets.
         match (&self.latch, p.output) {
-            (
-                LatchState::Active { .. },
-                Some(BuckOutput::Off {
-                    cause: cause @ (Lvp | Otp),
-                }),
-            ) => {
+            (LatchState::Active { .. }, Some(BuckOutput::Off { cause }))
+                if cause.is_self_clearing() =>
+            {
                 return Verdict::EnterProtectRecovery(cause);
             }
             (LatchState::Active { .. }, Some(BuckOutput::Off { cause })) => {
@@ -527,11 +524,11 @@ impl ChargeSupervisor {
             if p.setpoints.is_none() {
                 return Verdict::Inhibit(InhibitReason::ModbusUnhealthy);
             }
-            // Enabling into a live LVP/OTP hold would succeed at the Modbus
-            // layer while the buck stayed off, flapping EnableOutput every poll.
-            if let Some(BuckOutput::Off {
-                cause: cause @ (Lvp | Otp),
-            }) = p.output
+            // Enabling into a live self-clearing hold would succeed at the
+            // Modbus layer while the buck stayed off, flapping EnableOutput
+            // every poll.
+            if let Some(BuckOutput::Off { cause }) = p.output
+                && cause.is_self_clearing()
             {
                 return Verdict::Inhibit(InhibitReason::BuckProtection(cause));
             }

@@ -14,11 +14,12 @@ use std::time::Duration;
 
 use log::{error, info, warn};
 
+use esp32_battery_logic::SETPOINT_DRIFT_TOL;
 use esp32_battery_logic::{
     Action, BatterySample, BuckOutput, BusError, ChargeSupervisor, PollResult, VoltageWriteOutcome,
     VoltageWriter, apply_update_voltage,
 };
-use esp32_battery_logic::{ChargeStatus, PsReading, SensorData};
+use esp32_battery_logic::{ChargeStatus, ProtectionPolicy, PsReading, SensorData};
 use esp32_battery_logic::{Event, XyError};
 
 use xy_modbus::{ModelCheck, ProtectionStatus, SafetyLimits, Status};
@@ -38,12 +39,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// inter-frame + ~500 ms response timeout), but the explicit sleep
 /// removes the dependence on transport timing.
 const STEP_DOWN_SETTLE: Duration = Duration::from_millis(100);
-
-/// MODEL register value for the XY7025 — the variant this board carries
-/// and the one xy-modbus's register scales are written for. Drives the
-/// boot-time model gate's error payload and the fake device's mock
-/// MODEL response.
-const EXPECTED_MODEL_CODE: u16 = 0x6500;
 
 /// The set of operations the charging loop needs from the buck. Real
 /// builds get the `xy_modbus`-backed implementation; `xy-fake` builds
@@ -86,9 +81,10 @@ enum BootError {
     OutputOn,
     /// Device's MODEL register reports a code whose register scales are
     /// not the ones xy-modbus decodes with. Readings (especially I-OUT)
-    /// would be off by 10×; refuse to proceed.
+    /// would be off by 10×; refuse to proceed. Only the reported code is
+    /// carried: which codes the driver's scales suit is `check_model`'s
+    /// business, and naming one here would be this module's guess at it.
     ModelMismatch {
-        expected_code: u16,
         device_code: u16,
     },
 }
@@ -114,12 +110,9 @@ impl std::fmt::Display for BootError {
                 )
             }
             Self::OutputOn => f.write_str("OUTPUT_EN read back ON after disable"),
-            Self::ModelMismatch {
-                expected_code,
-                device_code,
-            } => write!(
+            Self::ModelMismatch { device_code } => write!(
                 f,
-                "MODEL mismatch: driver scales expect 0x{expected_code:04X}, device reports 0x{device_code:04X}"
+                "MODEL 0x{device_code:04X}: register scales are not the ones this driver decodes with"
             ),
         }
     }
@@ -208,8 +201,14 @@ mod fake {
     use esp32_battery_logic::{BusError, VoltageWriter};
     use xy_modbus::{ModelCheck, ProtectionStatus, RegMode, SafetyLimits, Setpoints, Status};
 
-    use super::{EXPECTED_MODEL_CODE, XyDevice};
+    use super::XyDevice;
     use crate::board::XyPins;
+
+    /// MODEL word the fake reports: the XY7025's, so `xy-fake` builds clear
+    /// the same `check_model` gate a real board does rather than masking it.
+    /// Nothing compares against this — whether the driver's scales suit the
+    /// device is `ModelCheck::scales_match`, decided inside xy-modbus.
+    const FAKE_MODEL_CODE: u16 = 0x6500;
 
     const BAUD: u32 = 115200;
 
@@ -269,11 +268,8 @@ mod fake {
 
     impl XyDevice for Xy<'_> {
         fn check_model(&mut self) -> Result<ModelCheck, BusError> {
-            // Mirrors what a correctly-wired XY7025 reports, so the fake
-            // clears the same boot gate the real device does instead of
-            // masking it.
             Ok(ModelCheck {
-                device_code: EXPECTED_MODEL_CODE,
+                device_code: FAKE_MODEL_CODE,
                 scales_match: true,
                 limits_match: true,
             })
@@ -334,7 +330,6 @@ fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<u16, BootError> {
     let check = xy.check_model()?;
     if !check.scales_match {
         return Err(BootError::ModelMismatch {
-            expected_code: EXPECTED_MODEL_CODE,
             device_code: check.device_code,
         });
     }
@@ -375,11 +370,12 @@ fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<u16, BootError> {
     Ok(device_code)
 }
 
-/// One register quantum is 0.01 (V or A); allow up to two quanta for
-/// IEEE-float round-trip slack on values like 14.4 V whose binary repr
-/// isn't exact.
+/// Confirm a register read back what we wrote. Uses the supervisor's
+/// `SETPOINT_DRIFT_TOL`: this is the same commanded-vs-reported comparison
+/// its per-tick drift check makes, done once at boot, and the two must not
+/// disagree about how close counts as equal.
 fn verify(what: &'static str, expected: f32, actual: f32) -> Result<(), BootError> {
-    if (expected - actual).abs() < 0.02 {
+    if (expected - actual).abs() < SETPOINT_DRIFT_TOL {
         Ok(())
     } else {
         Err(BootError::Verify {
@@ -456,16 +452,14 @@ fn run<D: XyDevice>(
     charge_status.lock().unwrap().model_code = model_code;
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
-    // Tracks the last-seen PROTECT cause so a latch is logged to the event
-    // log once per episode, not on every poll while it stays latched.
-    let mut last_protection = ProtectionStatus::Normal;
+    let mut protection = ProtectionLog::new();
     // Lapped after `poll`, so a tick is charged its own Modbus traffic as
     // well as `POLL_INTERVAL` — which is the whole span the supervisor's
     // windows are meant to cover.
     let mut timer = LoopTimer::start();
     loop {
         wdt.reset();
-        let outcome = poll(&mut xy, &sensor_data, &recorder, &mut last_protection);
+        let outcome = poll(&mut xy, &sensor_data, &recorder, &mut protection);
         let action = supervisor.tick(outcome.poll, timer.lap());
         apply_action(&mut xy, &mut supervisor, action, &recorder);
         // The supervisor has no clock, so it buffers latch transitions and
@@ -498,9 +492,65 @@ struct PollOutcome {
     ps_offline: bool,
 }
 
-/// One read cycle: poll the buck, publish what it said into shared sensor
-/// data, snapshot the latest battery sample, and hand back everything the
-/// tick needs.
+/// Per-episode de-duplication for latched `PROTECT` causes.
+///
+/// A latched buck reports the same cause on every poll for as long as it
+/// stays down, so the event log wants one entry per episode rather than one
+/// per second. Owns the last-seen cause so the loop doesn't have to carry it.
+#[derive(Debug)]
+struct ProtectionLog {
+    last: ProtectionStatus,
+}
+
+impl ProtectionLog {
+    fn new() -> Self {
+        Self {
+            last: ProtectionStatus::Normal,
+        }
+    }
+
+    /// Turn one status read into the supervisor's `BuckOutput`, recording any
+    /// newly-latched protection cause on the way.
+    fn classify(&mut self, s: &Status, recorder: &EventRecorder) -> BuckOutput {
+        if s.output_on {
+            // Sourcing again: whatever episode was running is over, so the
+            // next latch of the same cause counts as new.
+            self.last = ProtectionStatus::Normal;
+            return BuckOutput::On;
+        }
+        // Input loss is surfaced as "PS offline" and recovers on its own —
+        // don't pollute the event log with it. Every other cause records on
+        // the rising edge (first poll, or a change of cause); the warn! stays
+        // per-poll for log visibility.
+        if !s.protection.is_input_loss()
+            && let Some(ev) = XyError::from_protection(s.protection)
+        {
+            warn!("XY PROTECT latched: {}", s.protection);
+            if self.last != s.protection {
+                recorder.record(Event::Xy(ev));
+            }
+        }
+        self.last = s.protection;
+        BuckOutput::Off {
+            cause: s.protection,
+        }
+    }
+}
+
+/// The PS half of a status read, as the sensor store wants it.
+fn ps_reading(s: &Status) -> PsReading {
+    PsReading {
+        voltage: s.v_out,
+        current: s.i_out,
+        power: s.p_out,
+        v_set: s.setpoints.v_set,
+        i_set: s.setpoints.i_set,
+    }
+}
+
+/// One read cycle: read the buck, classify what it reported, publish the PS
+/// half into shared sensor data, snapshot the latest battery sample, and hand
+/// back everything the tick needs.
 ///
 /// The Modbus read runs *without* the `SensorData` lock held — UART
 /// transactions can take up to `response_timeout` (500 ms) and we don't
@@ -510,58 +560,28 @@ fn poll<D: XyDevice>(
     xy: &mut D,
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
-    last_protection: &mut ProtectionStatus,
+    protection: &mut ProtectionLog,
 ) -> PollOutcome {
     // Single bulk read covers V_SET..V_IN, PROTECT, CVCC, OUTPUT_EN —
     // one Modbus round-trip instead of three. PROTECT is necessarily
     // Normal while OUTPUT_EN is on; non-Normal here means the buck
     // self-disabled this session (boot_sequence wiped 0x0010).
-    let (setpoints, output, ps) = match xy.read_status() {
-        Ok(s) => {
-            let ps = Some(PsReading {
-                voltage: s.v_out,
-                current: s.i_out,
-                power: s.p_out,
-                v_set: s.setpoints.v_set,
-                i_set: s.setpoints.i_set,
-            });
-            let setpoints = Some(s.setpoints);
-            let output = Some(if s.output_on {
-                *last_protection = ProtectionStatus::Normal;
-                BuckOutput::On
-            } else {
-                // LVP is surfaced as "PS offline" below and recovers on its
-                // own — don't pollute the event log with it. Other causes
-                // record once per latch episode (rising edge / cause change);
-                // the warn! stays per-poll for log visibility.
-                if s.protection != ProtectionStatus::Lvp
-                    && let Some(ev) = XyError::from_protection(s.protection)
-                {
-                    warn!("XY PROTECT latched: {}", s.protection);
-                    if *last_protection != s.protection {
-                        recorder.record(Event::Xy(ev));
-                    }
-                }
-                *last_protection = s.protection;
-                BuckOutput::Off {
-                    cause: s.protection,
-                }
-            });
-            (setpoints, output, ps)
-        }
+    let status = match xy.read_status() {
+        Ok(s) => Some(s),
         Err(e) => {
             warn!("XY read_status: {e}");
             recorder.record(Event::Xy(XyError::ReadStatus));
-            (None, None, None)
+            None
         }
     };
+    let output = status.as_ref().map(|s| protection.classify(s, recorder));
 
     // The cycle's only `SensorData` acquisition: publish what the buck said
     // and take the battery snapshot the supervisor needs, together.
     let battery = {
         let mut sd = sensor_data.lock().unwrap();
-        if let Some(ps) = ps {
-            sd.update_ps(ps);
+        if let Some(s) = &status {
+            sd.update_ps(ps_reading(s));
         }
         sd.battery_reading().map(|b| BatterySample {
             voltage: b.voltage,
@@ -569,21 +589,16 @@ fn poll<D: XyDevice>(
         })
     };
 
-    // Input UVLO with the output down = the DC supply was disconnected or
+    // Input loss with the output down = the DC supply was disconnected or
     // sagged. Benign and self-clearing, so the dashboard shows it as a status
     // rather than a fault. Read back off `output` rather than recomputed from
     // the raw status, so it cannot disagree with what the supervisor is handed
     // for the same poll.
-    let ps_offline = matches!(
-        output,
-        Some(BuckOutput::Off {
-            cause: ProtectionStatus::Lvp
-        })
-    );
+    let ps_offline = matches!(output, Some(BuckOutput::Off { cause }) if cause.is_input_loss());
 
     PollOutcome {
         poll: PollResult {
-            setpoints,
+            setpoints: status.as_ref().map(|s| s.setpoints),
             output,
             battery,
         },

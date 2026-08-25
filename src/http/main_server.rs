@@ -13,7 +13,7 @@ use crate::log_ring;
 use crate::net::ResetSignal;
 use crate::{api, errors, ota, wifi_reset};
 
-use super::{create_server, serve_common_assets, serve_static};
+use super::{ServerConfig, create_server, serve_common_assets, serve_static};
 
 pub fn start(
     sensor_data: Arc<Mutex<SensorData>>,
@@ -22,7 +22,12 @@ pub fn start(
     nvs: Arc<EspNvs<NvsDefault>>,
     reset: ResetSignal,
 ) -> EspHttpServer<'static> {
-    let mut server = create_server(10240, false, 3, true);
+    let mut server = create_server(ServerConfig {
+        stack_size: 10240,
+        max_sockets: 3,
+        wildcard: false,
+        https: true,
+    });
 
     serve_common_assets(&mut server);
     serve_static(

@@ -29,9 +29,10 @@ pub enum InhibitReason {
     /// one sample over the line is enough to refuse bring-up, where the
     /// same single sample is not enough to trip a regulating buck.
     Overvoltage,
-    /// Buck is holding itself off on a self-clearing protection (input
-    /// UVLO / over-temp). `set_output(true)` would succeed at the
-    /// Modbus layer and change nothing, so we wait for the cause.
+    /// Buck is holding itself off on a cause
+    /// [`crate::ProtectionPolicy::is_self_clearing`] accepts.
+    /// `set_output(true)` would succeed at the Modbus layer and change
+    /// nothing, so we wait for the cause instead.
     BuckProtection(ProtectionStatus),
 }
 
