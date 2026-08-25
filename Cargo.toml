@@ -36,7 +36,7 @@ xy-modbus = { git = "https://github.com/xorza/xy-modbus", branch = "master", fea
 log = "*"
 esp-idf-svc = "*"
 esp-idf-hal = "*"
-ina228 = "*"
+ina228 = { git="https://github.com/xorza/ina228.git", branch = "master" }
 embedded-hal = "*"
 heapless = "*"
 hmac = "*"
