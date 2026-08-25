@@ -245,12 +245,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
-name = "compile-fmt"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bed69047ed42e52c7e38d6421eeb8ceefb4f2a2b52eed59137f7bad7908f6800"
-
-[[package]]
 name = "const_format"
 version = "0.2.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -571,7 +565,8 @@ dependencies = [
 [[package]]
 name = "embuild"
 version = "0.33.3"
-source = "git+https://github.com/esp-rs/embuild?branch=master#370f01f58f8ae4368c0c330d8e6c00984294adbd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1767ebe775033ebaed7a04fb02cc2ae7abfdc660656190957403f97594e687c7"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -641,7 +636,8 @@ dependencies = [
 [[package]]
 name = "esp-idf-hal"
 version = "0.46.2"
-source = "git+https://github.com/xorza/esp-idf-hal.git?branch=feat%2Fi2c-driver#2c83d6a5d345f0847ea2757879824085cf50fd40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2585c80f488be431ad14e199883a05ff31576adaa23014befa0f040fd91490b8"
 dependencies = [
  "atomic-waker",
  "embassy-sync",
@@ -663,7 +659,8 @@ dependencies = [
 [[package]]
 name = "esp-idf-svc"
 version = "0.52.1"
-source = "git+https://github.com/esp-rs/esp-idf-svc.git?branch=master#3bc7361aade1eb9845a979d06e621a69a3dfbaff"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "033432e951f49284a4b8874cdb2d7fb940a3b0181460f452ca7414ebe66babca"
 dependencies = [
  "embassy-futures",
  "embedded-hal-async",
@@ -681,13 +678,13 @@ dependencies = [
 [[package]]
 name = "esp-idf-sys"
 version = "0.37.2"
-source = "git+https://github.com/esp-rs/esp-idf-sys.git?branch=master#f616563a87595032f06f1fec95b6816b1c11135c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8df62993f242eb05d9ddb63e503624fb22f24a11d6c680e85cf0169ee14421f"
 dependencies = [
  "anyhow",
  "build-time",
  "cargo_metadata",
  "cmake",
- "compile-fmt",
  "const_format",
  "embuild",
  "envy",
@@ -695,7 +692,6 @@ dependencies = [
  "regex",
  "serde",
  "strum 0.24.1",
- "toml",
  "which",
 ]
 
@@ -994,7 +990,7 @@ dependencies = [
 [[package]]
 name = "ina228"
 version = "0.2.0"
-source = "git+https://github.com/xorza/ina228.git?branch=master#317be365ea6839d0ba32619ceca997dc7c04c708"
+source = "git+https://github.com/xorza/ina228.git?branch=master#41f7adbf103f59b2bec425c721ca7b596cc3d73f"
 dependencies = [
  "embedded-hal 1.0.0",
 ]
@@ -1228,7 +1224,7 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
- "toml_edit 0.25.13+spec-1.1.0",
+ "toml_edit",
 ]
 
 [[package]]
@@ -1413,15 +1409,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "serde_spanned"
-version = "0.6.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -1616,27 +1603,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml"
-version = "0.8.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
-dependencies = [
- "serde",
- "serde_spanned",
- "toml_datetime 0.6.11",
- "toml_edit 0.22.27",
-]
-
-[[package]]
-name = "toml_datetime"
-version = "0.6.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1647,28 +1613,14 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.22.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
-dependencies = [
- "indexmap",
- "serde",
- "serde_spanned",
- "toml_datetime 0.6.11",
- "toml_write",
- "winnow 0.7.15",
-]
-
-[[package]]
-name = "toml_edit"
 version = "0.25.13+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
 dependencies = [
  "indexmap",
- "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_datetime",
  "toml_parser",
- "winnow 1.0.4",
+ "winnow",
 ]
 
 [[package]]
@@ -1677,14 +1629,8 @@ version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
- "winnow 1.0.4",
+ "winnow",
 ]
-
-[[package]]
-name = "toml_write"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "typenum"
@@ -1953,15 +1899,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
@@ -1972,7 +1909,7 @@ dependencies = [
 [[package]]
 name = "xy-modbus"
 version = "0.1.1"
-source = "git+https://github.com/xorza/xy-modbus?branch=master#8e403683fb0a9089a8d4ecb359e827f1b18ca555"
+source = "git+https://github.com/xorza/xy-modbus?branch=master#fae334c7ab57118cdacbf754379ff84602470ba3"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-io 0.7.1",
