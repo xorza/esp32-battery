@@ -34,23 +34,11 @@ use esp32_battery_logic::data::SensorData;
 use esp32_battery_logic::error_log::EventLog;
 use xy_modbus::SafetyLimits;
 
+use esp32_battery_logic::net::wifi_credentials::WifiCredentials;
+use esp32_battery_logic::net::{NetAction, NetPhase, NetPoll, NetSupervisor};
+
 use crate::clock::{EventRecorder, uptime};
-use crate::net::{LinkState, NetState, NetStatusHandle, ResetSignal, SubmissionStatus};
-use crate::nvs_creds::WifiCredentials;
-
-/// How long `is_connected() == false` may persist before we tear down
-/// the host server and fall back to the captive AP. The AP is a fallback
-/// for "the saved creds no longer work" (rotated password, SSID gone),
-/// so we wait long enough that a real outage of the user's router (ISP
-/// reboot, scheduled maintenance) doesn't unnecessarily flap us into
-/// captive mode and break the dashboard for everyone on the LAN.
-const CAPTIVE_AFTER_DISCONNECT: Duration = Duration::from_secs(2 * 60 * 60);
-
-/// How long the captive page's "Connecting..." spinner is allowed to
-/// run before we declare the submitted credentials a failure and let
-/// the user re-enter them. ESP-IDF associates good creds in 3–8s
-/// typically; 20s is comfortably past that.
-const CAPTIVE_TRYING_TIMEOUT: Duration = Duration::from_secs(20);
+use crate::net::{NetResources, NetStatusHandle, ResetSignal, SubmissionStatus};
 
 /// Supervisor loop period.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
@@ -173,253 +161,122 @@ fn main() {
         reset,
     };
 
-    // Bootstrap per `wifi_fsm.md`: STA if we have creds, captive otherwise.
-    let mut state = match boot_creds {
-        Some(creds) => {
-            let sta_wifi = wifi.into_sta(&creds);
-            let server = sta_ctx.start_dashboard();
-            NetState::StaConnecting {
-                wifi: sta_wifi,
-                server,
-                creds,
-                session_start: uptime(),
-            }
-        }
-        None => {
+    // Bootstrap per `net_fsm.md`: STA if we have creds, captive otherwise.
+    let mut supervisor = NetSupervisor::new(boot_creds, uptime());
+    let mut resources = match supervisor.phase() {
+        NetPhase::StaConnecting { creds, .. } => NetResources::Sta {
+            wifi: wifi.into_sta(creds),
+            server: sta_ctx.start_dashboard(),
+            mdns: None,
+        },
+        _ => {
             let mixed = wifi.into_mixed(None);
             let bundle = http::start_captive(mixed.scan_cache());
-            NetState::CaptiveIdle {
+            NetResources::Mixed {
                 wifi: mixed,
                 bundle,
             }
         }
     };
-    net_status.store(state.lcd_status());
+    net_status.store(supervisor.phase().lcd_status());
 
     loop {
         thread::sleep(TICK_PERIOD);
         let now = uptime();
         sensor_data.lock().unwrap().tick(clock.epoch_s());
 
-        if sta_ctx.reset.take() {
-            state = force_captive_idle(state);
-        }
-        state = step(state, now, &sta_ctx);
-        net_status.store(state.lcd_status());
+        resources.debug_assert_matches_phase(supervisor.phase());
+        let poll = NetPoll {
+            now,
+            associated: resources.try_connect(supervisor.phase()),
+            submitted: resources.take_creds(),
+            reset_requested: sta_ctx.reset.take(),
+        };
+        let action = supervisor.tick(poll);
+        resources = apply_net_action(action, resources, now, &sta_ctx);
+        net_status.store(supervisor.phase().lcd_status());
     }
 }
 
-/// Drop the live STA association and return the FSM to `CaptiveIdle`.
-/// Only reachable from the dashboard's `/wifi-reset`, which is mounted
-/// only on the host server — captive states cannot raise the signal.
-fn force_captive_idle(state: NetState) -> NetState {
-    match state {
-        NetState::StaConnecting { wifi, server, .. } => sta_to_captive_idle(wifi, server, None),
-        NetState::StaServing {
-            wifi, server, mdns, ..
-        } => sta_to_captive_idle(wifi, server, Some(mdns)),
-        _ => unreachable!("/wifi-reset only reachable from dashboard (Sta* states)"),
-    }
-}
-
-fn sta_to_captive_idle(
-    wifi: wifi::StaWifi<'static>,
-    server: EspHttpServer<'static>,
-    mdns: Option<esp_idf_svc::mdns::EspMdns>,
-) -> NetState {
-    drop(server);
-    drop(mdns);
-    let mixed = wifi.into_mixed(None);
-    let bundle = http::start_captive(mixed.scan_cache());
-    NetState::CaptiveIdle {
-        wifi: mixed,
-        bundle,
-    }
-}
-
-/// One supervisor tick. Consumes `state` and returns the next variant.
-fn step(state: NetState, now: Duration, ctx: &StaCtx) -> NetState {
-    match state {
-        NetState::CaptiveIdle { mut wifi, bundle } => {
-            if let Some(creds) = bundle.take_creds() {
-                return apply_submission(wifi, bundle, creds, now);
-            }
-            wifi.refresh_scan_if_stale(now);
-            NetState::CaptiveIdle { wifi, bundle }
-        }
-        NetState::CaptiveTrying {
-            wifi,
-            bundle,
-            creds,
-            since,
-        } => step_captive_trying(wifi, bundle, creds, since, now, ctx),
-        NetState::CaptiveFallbackRetrying {
-            mut wifi,
-            bundle,
-            creds,
-        } => {
-            // STA half is retrying the carry-over creds in the
-            // background. Same ordering as CaptiveTrying: assoc-success
-            // wins over a /save in the same tick.
-            if wifi.try_connect() {
-                return promote_to_serving(wifi, bundle, creds, ctx);
-            }
-            if let Some(new_creds) = bundle.take_creds() {
-                return apply_submission(wifi, bundle, new_creds, now);
-            }
-            wifi.refresh_scan_if_stale(now);
-            NetState::CaptiveFallbackRetrying {
-                wifi,
-                bundle,
-                creds,
-            }
-        }
-        NetState::StaConnecting {
-            mut wifi,
-            server,
-            creds,
-            session_start,
-        } => {
-            if wifi.try_connect() {
-                return NetState::StaServing {
-                    wifi,
-                    server,
-                    mdns: wifi::setup_mdns(),
-                    creds,
-                    link: LinkState::Up,
-                };
-            }
-            if now.saturating_sub(session_start) >= CAPTIVE_AFTER_DISCONNECT {
-                return fallback_to_captive(wifi, server, None, creds);
-            }
-            NetState::StaConnecting {
-                wifi,
-                server,
-                creds,
-                session_start,
-            }
-        }
-        NetState::StaServing {
-            mut wifi,
-            server,
-            mdns,
-            creds,
-            link,
-        } => {
-            let link = match (wifi.try_connect(), link) {
-                (true, _) => LinkState::Up,
-                (false, LinkState::Up) => LinkState::Down { since: now },
-                (false, down) => down,
-            };
-            if let LinkState::Down { since } = link
-                && now.saturating_sub(since) >= CAPTIVE_AFTER_DISCONNECT
-            {
-                return fallback_to_captive(wifi, server, Some(mdns), creds);
-            }
-            NetState::StaServing {
-                wifi,
-                server,
-                mdns,
-                creds,
-                link,
-            }
-        }
-    }
-}
-
-/// `CaptiveTrying` arm. Lifted into its own fn purely because the body
-/// was the longest of the supervisor's match arms.
-fn step_captive_trying(
-    mut wifi: wifi::MixedWifi<'static>,
-    bundle: net::CaptiveBundle,
-    creds: WifiCredentials,
-    since: Duration,
+/// Carry out one `NetAction` against the resources the firmware owns. The
+/// supervisor has already moved; this only makes the radio and the
+/// servers match where it went.
+fn apply_net_action(
+    action: NetAction,
+    mut resources: NetResources,
     now: Duration,
     ctx: &StaCtx,
-) -> NetState {
-    // Order matters: an associate-success on the in-flight creds wins
-    // over a /save that arrived too late — otherwise we'd disconnect
-    // from the network we just successfully joined.
-    if wifi.try_connect() {
-        return promote_to_serving(wifi, bundle, creds, ctx);
-    }
-    if let Some(new_creds) = bundle.take_creds() {
-        return apply_submission(wifi, bundle, new_creds, now);
-    }
-    if now.saturating_sub(since) >= CAPTIVE_TRYING_TIMEOUT {
-        bundle.set_status(SubmissionStatus::Failed);
-        warn!("Captive: STA association timed out; flipping to Failed");
-        return NetState::CaptiveIdle { wifi, bundle };
-    }
-    NetState::CaptiveTrying {
-        wifi,
-        bundle,
-        creds,
-        since,
-    }
-}
-
-/// Apply freshly-submitted creds to the live radio and enter the 20 s
-/// trying window.
-fn apply_submission(
-    mut wifi: wifi::MixedWifi<'static>,
-    bundle: net::CaptiveBundle,
-    creds: WifiCredentials,
-    now: Duration,
-) -> NetState {
-    wifi.set_sta_creds(&creds);
-    bundle.set_status(SubmissionStatus::Trying);
-    NetState::CaptiveTrying {
-        wifi,
-        bundle,
-        creds,
-        since: now,
+) -> NetResources {
+    match action {
+        NetAction::Nothing => resources,
+        NetAction::RefreshScan => {
+            resources.refresh_scan_if_stale(now);
+            resources
+        }
+        NetAction::ApplyCreds(creds) => {
+            if let NetResources::Mixed { wifi, bundle } = &mut resources {
+                wifi.set_sta_creds(&creds);
+                bundle.set_status(SubmissionStatus::Trying);
+            }
+            resources
+        }
+        NetAction::MarkSubmissionFailed => {
+            warn!("Captive: STA association timed out; flipping to Failed");
+            resources.set_status(SubmissionStatus::Failed);
+            resources
+        }
+        NetAction::StartMdns => {
+            if let NetResources::Sta { mdns, .. } = &mut resources {
+                *mdns = Some(wifi::setup_mdns());
+            }
+            resources
+        }
+        NetAction::PromoteToSta(creds) => promote_to_sta(resources, ctx, &creds),
+        NetAction::FallbackToCaptive(creds) => sta_to_captive(resources, Some(&creds)),
+        NetAction::ForceCaptive => sta_to_captive(resources, None),
     }
 }
 
-/// Captive → STA promotion. Persist creds to NVS, drop the captive
-/// bundle (joins DNS thread, stops captive HTTP), switch the radio to
-/// STA-only, start the dashboard server + mDNS.
-fn promote_to_serving(
-    wifi: wifi::MixedWifi<'static>,
-    bundle: net::CaptiveBundle,
-    creds: WifiCredentials,
-    ctx: &StaCtx,
-) -> NetState {
-    nvs_creds::save(&ctx.nvs, &creds);
-    // Publish "connected" and linger so the captive page's 1 Hz /status
-    // poll can read it before the AP disappears with the bundle.
+/// Captive → STA. Persist the credentials that just worked, let the
+/// captive page see `Connected`, then drop the bundle (which joins the
+/// DNS thread and stops the captive HTTP server), switch the radio to
+/// STA-only, and bring the dashboard and mDNS up.
+fn promote_to_sta(resources: NetResources, ctx: &StaCtx, creds: &WifiCredentials) -> NetResources {
+    let NetResources::Mixed { wifi, bundle } = resources else {
+        // Only a captive phase can emit PromoteToSta, so this means the
+        // supervisor and the resources have gone out of step. Say so —
+        // silence would leave the radio stuck with no way to tell.
+        warn!("net: PromoteToSta while already STA-only; resources out of step");
+        return resources;
+    };
+    nvs_creds::save(&ctx.nvs, creds);
+    // Linger so the captive page's 1 Hz /status poll picks up `Connected`
+    // before the AP disappears along with the bundle.
     bundle.set_status(SubmissionStatus::Connected);
     thread::sleep(Duration::from_millis(1500));
     drop(bundle);
-    let sta_wifi = wifi.into_sta(&creds);
-    let server = ctx.start_dashboard();
-    let mdns = wifi::setup_mdns();
-    NetState::StaServing {
-        wifi: sta_wifi,
-        server,
-        mdns,
-        creds,
-        link: LinkState::Up,
+    NetResources::Sta {
+        wifi: wifi.into_sta(creds),
+        server: ctx.start_dashboard(),
+        mdns: Some(wifi::setup_mdns()),
     }
 }
 
-/// STA → Captive fallback. Drops the dashboard, switches the radio to
-/// Mixed (carrying creds so the STA half keeps retrying), brings up the
-/// captive bundle.
-fn fallback_to_captive(
-    wifi: wifi::StaWifi<'static>,
-    server: EspHttpServer<'static>,
-    mdns: Option<esp_idf_svc::mdns::EspMdns>,
-    creds: WifiCredentials,
-) -> NetState {
+/// STA → captive. Drops the dashboard and mDNS, switches the radio to
+/// Mixed, and mounts the captive bundle. `creds` are carried onto the
+/// radio so the STA half keeps retrying in the background; `None` leaves
+/// it bare, which is what `/wifi-reset` wants.
+fn sta_to_captive(resources: NetResources, creds: Option<&WifiCredentials>) -> NetResources {
+    let NetResources::Sta { wifi, server, mdns } = resources else {
+        warn!("net: captive fallback while already captive; resources out of step");
+        return resources;
+    };
     drop(server);
     drop(mdns);
-    let mixed = wifi.into_mixed(Some(&creds));
+    let mixed = wifi.into_mixed(creds);
     let bundle = http::start_captive(mixed.scan_cache());
-    NetState::CaptiveFallbackRetrying {
+    NetResources::Mixed {
         wifi: mixed,
         bundle,
-        creds,
     }
 }

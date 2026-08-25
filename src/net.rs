@@ -1,7 +1,11 @@
-//! Flat-state network FSM. One enum, one variant per state, no `Option`s
-//! used as state flags. Each variant carries exactly the resources alive
-//! in that state (radio mode wrapper + servers); transitions consume a
-//! variant and produce another. See `wifi_fsm.md` for the spec.
+//! Firmware-side network resources: the handles the HTTP threads share
+//! with the supervisor, and the resource shell the supervisor's phase
+//! drives.
+//!
+//! The state machine itself is `esp32_battery_logic::net` — pure, and
+//! tested on the host. What lives here is everything that cannot be:
+//! the live radio, the running servers, and the atomics the request
+//! handlers poke.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -12,19 +16,11 @@ use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::mdns::EspMdns;
 use strum::IntoStaticStr;
 
-use crate::dns::DnsHandle;
-use crate::nvs_creds::WifiCredentials;
-use crate::wifi::{MixedWifi, StaWifi};
+use esp32_battery_logic::net::wifi_credentials::WifiCredentials;
+use esp32_battery_logic::net::{NetPhase, NetStatus};
 
-/// LCD-visible status. Computed from the FSM variant + clock each tick.
-#[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug, strum::FromRepr)]
-pub enum NetStatus {
-    Captive = 0,
-    CaptiveTrying = 1,
-    Connecting = 2,
-    Host = 3,
-}
+use crate::dns::DnsHandle;
+use crate::wifi::{MixedWifi, StaWifi};
 
 #[derive(Clone)]
 pub struct NetStatusHandle(Arc<AtomicU8>);
@@ -130,87 +126,80 @@ impl CaptiveBundle {
     }
 }
 
-/// Flat FSM over network state. The variant is the source of truth —
-/// radio mode, alive servers, and legal transitions are all bounded by
-/// the type. See `wifi_fsm.md` for the state table and transitions.
-///
-/// Every variant that has credentials at runtime carries them in the
-/// variant. NVS is the durable store; the FSM doesn't read NVS per
-/// tick. `CaptiveIdle` is the only state without creds — cold boot
-/// before any /save, or after a `CaptiveFailed`-style timeout where
-/// the last attempt's creds are intentionally dropped so the captive
-/// page is the source of truth on retry.
-pub enum NetState {
-    /// Captive AP up, no in-flight submission. Covers cold boot
-    /// (NVS empty) and post-timeout retry. The captive page reads
-    /// `bundle.status` to know whether to show a "wrong creds" error.
-    CaptiveIdle {
+/// The resources a phase owns. Only two shapes exist, because the five
+/// phases collapse to two: Mixed radio with the captive bundle, or
+/// STA-only with the dashboard. `debug_assert_matches_phase` keeps the
+/// mapping honest each tick, which is what the old fused enum enforced
+/// by construction.
+pub enum NetResources {
+    Mixed {
         wifi: MixedWifi<'static>,
         bundle: CaptiveBundle,
     },
-    /// /save creds applied to the radio, association in flight (≤ 20 s).
-    CaptiveTrying {
-        wifi: MixedWifi<'static>,
-        bundle: CaptiveBundle,
-        creds: WifiCredentials,
-        since: Duration,
-    },
-    /// STA→Captive carry-over. Radio is Mixed with the known
-    /// (last-good) creds; STA half retries in the background while
-    /// the captive page lets the user re-enter creds if needed.
-    CaptiveFallbackRetrying {
-        wifi: MixedWifi<'static>,
-        bundle: CaptiveBundle,
-        creds: WifiCredentials,
-    },
-    /// STA-only, never associated this session. Dashboard server is
-    /// up but mDNS isn't (mDNS needs the netif live, only true after
-    /// first associated tick).
-    StaConnecting {
+    Sta {
         wifi: StaWifi<'static>,
         server: EspHttpServer<'static>,
-        creds: WifiCredentials,
-        session_start: Duration,
-    },
-    /// STA-only, dashboard + mDNS up. `link` is the most recent
-    /// `is_connected()` result; mDNS stays up across `Down` windows
-    /// since it'll be valid again on re-link without re-init.
-    StaServing {
-        wifi: StaWifi<'static>,
-        server: EspHttpServer<'static>,
-        mdns: EspMdns,
-        creds: WifiCredentials,
-        link: LinkState,
+        /// Taken on the first association of a session; `None` while
+        /// `StaConnecting`, since mDNS needs a live netif.
+        mdns: Option<EspMdns>,
     },
 }
 
-/// `StaServing` link status. `Up` means the radio is associated this
-/// tick; `Down { since }` means it's not, and the captive-fallback
-/// timer counts from `since`. The variant encodes the invariant
-/// "we only need a timer when we're disconnected" — no
-/// always-present `last_assoc` field whose meaning depends on a
-/// sibling boolean.
-pub enum LinkState {
-    Up,
-    Down { since: Duration },
-}
-
-impl NetState {
-    pub fn lcd_status(&self) -> NetStatus {
-        match self {
-            NetState::CaptiveIdle { .. } | NetState::CaptiveFallbackRetrying { .. } => {
-                NetStatus::Captive
-            }
-            NetState::CaptiveTrying { .. } => NetStatus::CaptiveTrying,
-            NetState::StaConnecting { .. } => NetStatus::Connecting,
-            NetState::StaServing {
-                link: LinkState::Up,
-                ..
-            } => NetStatus::Host,
-            NetState::StaServing {
-                link: LinkState::Down { .. },
-                ..
-            } => NetStatus::Connecting,
+impl NetResources {
+    /// Run this tick's association attempt, if the phase has credentials
+    /// to attempt one with.
+    pub fn try_connect(&mut self, phase: &NetPhase) -> bool {
+        if !phase.polls_association() {
+            return false;
         }
+        match self {
+            Self::Mixed { wifi, .. } => wifi.try_connect(),
+            Self::Sta { wifi, .. } => wifi.try_connect(),
+        }
+    }
+
+    /// Pop a freshly-submitted credentials payload, if the captive
+    /// bundle is up to have received one.
+    pub fn take_creds(&self) -> Option<WifiCredentials> {
+        match self {
+            Self::Mixed { bundle, .. } => bundle.take_creds(),
+            Self::Sta { .. } => None,
+        }
+    }
+
+    pub fn set_status(&self, s: SubmissionStatus) {
+        if let Self::Mixed { bundle, .. } = self {
+            bundle.set_status(s);
+        }
+    }
+
+    /// Refresh the AP scan cache if it has gone stale. The TTL lives with
+    /// the cache; the supervisor only decides *when* scanning is safe.
+    pub fn refresh_scan_if_stale(&mut self, now: Duration) {
+        if let Self::Mixed { wifi, .. } = self {
+            wifi.refresh_scan_if_stale(now);
+        }
+    }
+
+    /// The phase-to-resource mapping is total: three captive phases share
+    /// the Mixed shape and two STA phases share the Sta shape. Asserting
+    /// it each tick recovers the "illegal combinations are not
+    /// representable" property the pure/impure split gave up.
+    pub fn debug_assert_matches_phase(&self, phase: &NetPhase) {
+        debug_assert!(
+            matches!(
+                (phase, self),
+                (
+                    NetPhase::CaptiveIdle
+                        | NetPhase::CaptiveTrying { .. }
+                        | NetPhase::CaptiveFallbackRetrying { .. },
+                    NetResources::Mixed { .. }
+                ) | (
+                    NetPhase::StaConnecting { .. } | NetPhase::StaServing { .. },
+                    NetResources::Sta { .. }
+                )
+            ),
+            "resources do not match phase {phase:?}"
+        );
     }
 }

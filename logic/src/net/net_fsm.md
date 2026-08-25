@@ -1,6 +1,7 @@
 # WiFi FSM
 
-A single flat `enum NetState`. The variant alone determines:
+A single flat `enum NetPhase` in `logic/src/net/mod.rs`. The variant
+alone determines:
 
 - radio mode (STA-only vs Mixed AP+STA)
 - which servers/threads are alive (dashboard vs captive bundle)
@@ -95,27 +96,45 @@ the captive page's spinner / success / error UI can poll it.
 
 ## Sketch
 
+The phase is pure timing and credential state. Resources live in the
+firmware, keyed off the phase, because five phases collapse to two
+resource shapes.
+
 ```rust
-enum NetState {
-    CaptiveIdle              { wifi: MixedWifi, bundle: CaptiveBundle },
-    CaptiveTrying            { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds, since: Duration },
-    CaptiveFallbackRetrying  { wifi: MixedWifi, bundle: CaptiveBundle, creds: Creds },
-    StaConnecting            { wifi: StaWifi,   server: HttpServer, creds: Creds, session_start: Duration },
-    StaServing               { wifi: StaWifi,   server: HttpServer, mdns: EspMdns, creds: Creds, link: LinkState },
+// logic/src/net/mod.rs — pure, host-tested
+enum NetPhase {
+    CaptiveIdle,
+    CaptiveTrying            { creds: WifiCredentials, since: Duration },
+    CaptiveFallbackRetrying  { creds: WifiCredentials },
+    StaConnecting            { creds: WifiCredentials, session_start: Duration },
+    StaServing               { creds: WifiCredentials, link: LinkState },
 }
 
 enum LinkState {
     Up,
     Down { since: Duration },
 }
+
+// src/net.rs — what cannot be pure
+enum NetResources {
+    Mixed { wifi: MixedWifi, bundle: CaptiveBundle },
+    Sta   { wifi: StaWifi, server: EspHttpServer, mdns: Option<EspMdns> },
+}
 ```
 
-Each tick: `match` on `state`, run that arm's logic, return the next
-`NetState`. The variant *is* the state machine — no separate
+Each tick the firmware gathers a `NetPoll` (uptime, this tick's
+association result, any drained `/save` payload, the reset flag), calls
+`NetSupervisor::tick`, and performs the returned `NetAction` against the
+resources it owns. The phase *is* the state machine — no separate
 `Submission` enum, no shared mutex with HTTP for control state, no
 `Option`-as-flag fields. `/save` writes to a single-slot mailbox
-(`Arc<Mutex<Option<Creds>>>`) that the supervisor drains during the
-relevant captive-arm ticks; latest submission wins.
+(`Arc<Mutex<Option<WifiCredentials>>>`) that the firmware drains during
+the relevant captive-arm ticks; latest submission wins.
+
+The 5 → 2 mapping is total and checked by
+`NetResources::debug_assert_matches_phase` once per tick, which is what
+recovers "illegal combinations are not representable" now that the two
+halves are separate types.
 
 ## Constants
 

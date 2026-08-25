@@ -4,23 +4,15 @@
   `b515e541`. Firmware builds and `-p esp32-battery-logic` host builds therefore compile
   against different revisions of the same dependency.
 
-- `src/net.rs` module documentation and the bootstrap comment in `src/main.rs` reference
-  `wifi_fsm.md`; the file is `src/net_fsm.md`.
-
-- The `setup_mdns` doc comment in `src/wifi.rs` refers to ownership by `Net::Sta`, a type
-  that does not exist.
+- After a `CaptiveTrying` timeout the failed credentials stay applied to the radio, but
+  `CaptiveIdle` never attempts association, so a slow-but-successful association is never
+  noticed until another `/save`.
 
 - The `PendingReason::ProtectRecovery` transition in `ChargeSupervisor::tick` calls
   `reset_phase_timers` but leaves the `ov` debouncer accumulated.
 
-- `force_captive_idle` in `src/main.rs` uses `unreachable!()`, which the panic hook turns
-  into an MCU reboot.
-
 - `src/main.rs` retains a commented-out error-simulation block labelled "TEMP" and
   "Remove before merging".
-
-- The `NetState` machine (`src/net.rs`, `step`/`step_captive_trying` in `src/main.rs`) has
-  no tests.
 
 - `create_server` in `src/http/mod.rs` no longer sets TCP keep-alive or `SO_LINGER`:
   published `esp-idf-svc` 0.52.1 exposes neither on its server `Configuration`. Half-open

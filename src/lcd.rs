@@ -26,7 +26,9 @@ use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
 
 use crate::board::LcdPins;
-use crate::net::{NetStatus, NetStatusHandle};
+use esp32_battery_logic::net::NetStatus;
+
+use crate::net::NetStatusHandle;
 
 // === Hardware ======================================================
 

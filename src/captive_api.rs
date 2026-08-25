@@ -17,8 +17,8 @@ use esp32_battery_logic::form;
 
 use crate::http::{json_err, json_ok, mount_get, mount_json_get, mount_post, read_to_buf};
 use crate::net::{CredsMailbox, SubmissionStatus, SubmissionStatusHandle};
-use crate::nvs_creds::{PASSWORD_MAX, SSID_MAX, WifiCredentials};
 use crate::wifi::{ScanCache, ScanResult};
+use esp32_battery_logic::net::wifi_credentials::{PASSWORD_MAX, SSID_MAX, WifiCredentials};
 
 struct ScanRowsView<'a>(&'a ScanResult);
 
