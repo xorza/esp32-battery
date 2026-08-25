@@ -26,6 +26,12 @@ pub enum FaultReason {
     /// above `exit_absorb_a` we'd otherwise sit at CV forever. The CC ramp
     /// up to `absorb_v` doesn't count — only time spent actually at CV.
     AbsorbTimeout,
+    /// Pack spent `MAX_CHARGE.as_secs()` seconds continuously in Absorb
+    /// without the taper ever ending the cycle. `AbsorbTimeout` clocks only
+    /// time at the CV plateau, so a pack that never gets there — a shorted
+    /// cell, a wiring fault, a load eating the whole charge current — would
+    /// otherwise have no cap on it at all.
+    ChargeTimeout,
     /// XY7025 setpoint readback (V_SET or I_SET) disagreed with what we
     /// commanded. The buck is sourcing under unknown setpoints — disable
     /// before it can do damage. Triggers immediately, no debounce: the
@@ -54,6 +60,7 @@ impl std::fmt::Display for FaultReason {
             Self::ModbusUnhealthy => f.write_str("modbus link unhealthy"),
             Self::Overvoltage => f.write_str("pack overvoltage"),
             Self::AbsorbTimeout => f.write_str("absorb time cap reached"),
+            Self::ChargeTimeout => f.write_str("total charge time cap reached"),
             Self::SettingsDrift => f.write_str("setpoint readback drift"),
             Self::OutputUnexpectedlyOff(s) => write!(f, "buck self-disabled ({s})"),
             Self::OutputOnInPending => f.write_str("buck output on while supervisor pending"),

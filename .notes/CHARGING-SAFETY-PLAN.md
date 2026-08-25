@@ -12,7 +12,7 @@ every phase independently shippable and testable.
 
 ## Groundwork A — split `tick` into reconcile → evaluate
 
-**Closes issue 6. Prerequisite for issues 1 and 3.**
+**DONE.** Closes issue 6. Prerequisite for issues 1 and 3.
 
 ### Why
 
@@ -153,7 +153,7 @@ rate — and stops being what is written to I_SET.
 
 ## Issue 1 — `Latched` never re-disables
 
-**Severity: high.** Someone pressing the front panel re-energises a pack
+**DONE.** Severity: high. Someone pressing the front panel re-energises a pack
 the supervisor latched off, and the firmware never notices.
 
 Fully covered by Groundwork A's `Latched` row, plus **one table cell**:
@@ -181,7 +181,8 @@ prove the cycle is stable and each episode logs.
 
 ## Issue 2 — absorb cap defeatable, no total charge cap
 
-**Severity: high for a large pack.** Two distinct holes, two fixes.
+**DONE**, with `MAX_CHARGE = 8 h` and the accumulator named `charge_total`.
+Severity: high for a large pack. Two distinct holes, two fixes.
 
 ### 2a. Make the CV clock leaky
 
@@ -372,7 +373,7 @@ and not at `1.2 ×`; a single spike does not trip it.
 
 ## Issue 6 — `SelfEnabled` bypasses checks 3–5
 
-Dissolved by Groundwork A. No separate work.
+**DONE.** Dissolved by Groundwork A. No separate work.
 
 ---
 
@@ -487,16 +488,16 @@ whole point of the state existing.
 
 ## Sequencing
 
-| phase | work | issues | behaviour change |
-|---|---|---|---|
-| 0 | Groundwork A: reconcile → evaluate | 6 | one-tick window closes; check precedence changes |
-| 1 | `Latched` table cell | 1 | re-disables a resurfaced output |
-| 2 | leaky absorb clock + `MAX_CHARGE` | 2 | new `ChargeTimeout` fault |
-| 3 | `rested_full` on SoC | 4 | full packs stop forcing an Absorb cycle |
-| 4 | Groundwork B + I_SET/OCP + `ChargeOvercurrent` | 5 | I_SET rises by the load budget |
-| 5 | `HoldBudget` | 3 | new `ProtectionFlapping` fault |
-| 6 | `FaultResponse` + `ToParked`/`Parked` | 8 (partial) | three faults stop killing the load |
-| 7 | pack temperature | 7 | hardware first |
+| phase | work | issues | behaviour change | status |
+|---|---|---|---|---|
+| 0 | Groundwork A: reconcile → evaluate | 6 | one-tick window closes; check precedence changes | **done** |
+| 1 | `Latched` table cell | 1 | re-disables a resurfaced output | **done** |
+| 2 | leaky absorb clock + `MAX_CHARGE` | 2 | new `ChargeTimeout` fault | **done** |
+| 3 | `rested_full` on SoC | 4 | full packs stop forcing an Absorb cycle | next |
+| 4 | Groundwork B + I_SET/OCP + `ChargeOvercurrent` | 5 | I_SET rises by the load budget | |
+| 5 | `HoldBudget` | 3 | new `ProtectionFlapping` fault | |
+| 6 | `FaultResponse` + `ToParked`/`Parked` | 8 (partial) | three faults stop killing the load | |
+| 7 | pack temperature | 7 | hardware first | |
 
 Phases 0–3 are small and touch nothing outside `charging/`. Phase 4 reaches
 into `main.rs` and the `/api` ceiling asserts. Phase 6 adds `/api` surface.
@@ -516,9 +517,10 @@ that table in the same commit as each variant.
 1. **Load budget (phase 4).** Worst-case continuous current on the buck
    output. Everything in 5a/5b is sized from it, and it moves the maximum
    supportable pack capacity.
-2. **`MAX_CHARGE` (phase 2).** 8 h proposed. Should exceed the slowest
-   legitimate empty→full at your actual delivered current, which is
-   `i_set_a - load_a`, not `regulation_a`.
+2. ~~**`MAX_CHARGE` (phase 2).**~~ Shipped at 8 h. Revisit once the load
+   budget lands in phase 4 — the slowest legitimate empty→full runs at the
+   *delivered* current, `i_set_a - load_a`, not `regulation_a`, so a large
+   load budget stretches the legitimate case toward the cap.
 3. **`FLAP_WINDOW` / `MAX_HOLDS` (phase 5).** Proposed: 4 holds in 5 min.
    Depends on how often your supply legitimately sags.
 4. **Park-versus-disable on `Overvoltage` (phase 6).** Recommended Disable;

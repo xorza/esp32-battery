@@ -15,7 +15,7 @@ use crate::charging::poll_result::{BatterySample, BuckOutput, PollResult};
 use crate::charging::profile::Profile;
 use crate::charging::protection_policy::ProtectionPolicy;
 use crate::charging::{
-    ABSORB_CV_BAND_V, BATTERY_MISSING_TIMEOUT, EXIT_DEBOUNCE, MAX_ABSORB,
+    ABSORB_CV_BAND_V, BATTERY_MISSING_TIMEOUT, EXIT_DEBOUNCE, MAX_ABSORB, MAX_CHARGE,
     MODBUS_UNHEALTHY_TIMEOUT, OV_DURATION, OV_MARGIN_V, SETPOINT_DRIFT_TOL, TRANSITION_BUFFER,
 };
 use crate::error_log::ChargeTransition;
@@ -39,7 +39,12 @@ pub struct ChargeSupervisor {
     profile: Profile,
     state: ChargeState,
     ov: Debounce,
+    /// Time at the CV plateau, against `MAX_ABSORB`.
     absorb: Debounce,
+    /// Time since entering Absorb, against `MAX_CHARGE`. Counts whatever the
+    /// pack voltage is doing, which is what makes it a backstop for the one
+    /// above rather than a second copy of it.
+    charge_total: Debounce,
     exit: Debounce,
     battery_missing: Debounce,
     modbus_err: Debounce,
@@ -64,6 +69,7 @@ impl ChargeSupervisor {
             state: ChargeState::Boot,
             ov: Debounce::default(),
             absorb: Debounce::default(),
+            charge_total: Debounce::default(),
             exit: Debounce::default(),
             battery_missing: Debounce::default(),
             modbus_err: Debounce::default(),
@@ -182,11 +188,14 @@ impl ChargeSupervisor {
                 .ok()
                 .expect("ring has a free slot after pop_front");
         }
-        // Both windows measure a dwell inside one phase at one V_SET, so
-        // any move at all invalidates them: a hold takes the output away,
-        // and a retarget changes the target they were accumulated against.
+        // These all measure a dwell inside one phase at one V_SET, so any
+        // move at all invalidates them: a hold takes the output away, and a
+        // retarget changes the target they were accumulated against. The
+        // charge budget rides the same rule, which is what scopes it to one
+        // cycle rather than the unit's lifetime.
         if !matches!(to, ChargeState::Tripping | ChargeState::Latched) {
             self.absorb.reset();
+            self.charge_total.reset();
             self.exit.reset();
         }
         // Output is off for the whole hold, so the pack decays. A partly
@@ -540,12 +549,25 @@ impl ChargeSupervisor {
             _ => {}
         }
 
-        // Clock the absorb timeout only while the pack sits at the CV plateau.
-        // A CC dip (load transient pulling voltage back below absorb_v) resets
-        // it via Debounce — that's genuine charging, not a stuck taper.
-        let at_cv = self.at_cv_plateau(b.voltage);
-        if self.state == ChargeState::Absorb && self.absorb.step(at_cv, elapsed, MAX_ABSORB) {
-            return self.on_fault(FaultReason::AbsorbTimeout);
+        // Two caps on the cycle, both cleared by `step` on any state change
+        // so each Absorb stretch is clocked fresh.
+        if self.state == ChargeState::Absorb {
+            // Time at the CV plateau. Leaky rather than hard-reset: a load
+            // transient pulling the pack briefly out of CV must cost the
+            // time it lasted, not erase the window, or a load cycling faster
+            // than the cap keeps it from ever firing. A sustained return to
+            // CC — genuine charging, not a stuck taper — still drains it to
+            // zero and blocks the trip.
+            let at_cv = self.at_cv_plateau(b.voltage);
+            if self.absorb.step_leaky(at_cv, elapsed, MAX_ABSORB) {
+                return self.on_fault(FaultReason::AbsorbTimeout);
+            }
+            // Total time in the cycle, counted unconditionally — the
+            // backstop for a pack that never reaches the plateau, which the
+            // cap above would never see.
+            if self.charge_total.step(true, elapsed, MAX_CHARGE) {
+                return self.on_fault(FaultReason::ChargeTimeout);
+            }
         }
         Action::None
     }

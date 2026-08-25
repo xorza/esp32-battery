@@ -1,10 +1,5 @@
 # Open issues
 
-- `MAX_ABSORB` is clocked with `Debounce::step`, so any tick where the pack
-  leaves the `ABSORB_CV_BAND_V` window zeroes the accumulator. A load that
-  periodically pulls the buck out of CV keeps the absorb cap from firing.
-  There is no cap on total time in Absorb, and none at all on the CC ramp.
-
 - Protection holds are unbounded: `ChargeEvent::SelfDisabled` and
   `ChargeEvent::SelfEnabled` can alternate indefinitely. An input rail that
   sags under charge current gives a repeating LVP hold/resume loop with no

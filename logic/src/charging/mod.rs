@@ -86,7 +86,28 @@ const OV_DURATION: Duration = Duration::from_secs(3);
 /// 0.05C tail (`EXIT_ABSORB_C`), a healthy pack tapers under 30 min once at
 /// CV — 2 h is generous headroom while keeping a stuck-current scenario from
 /// sitting at CV indefinitely.
+///
+/// Applied as a *leaky* window (`Debounce::step_leaky`), for the same reason
+/// `EXIT_DEBOUNCE` is: a UPS load that periodically pulls the buck out of CV
+/// would, under a hard reset, erase the whole accumulation on every dip and
+/// keep the cap from ever firing. Draining costs a dip exactly the time it
+/// lasted, while a genuine sustained return to CC still empties the window
+/// and blocks the trip.
 const MAX_ABSORB: Duration = Duration::from_secs(2 * 60 * 60);
+/// Absolute cap on one charge cycle, counted from entering Absorb and cleared
+/// by any state change.
+///
+/// `MAX_ABSORB` clocks the CV plateau only, and that is right — the CC ramp
+/// from a deeply discharged pack legitimately runs for hours. But it leaves a
+/// pack that never *reaches* the plateau with no cap at all: a shorted cell,
+/// a wiring fault, or a load eating the whole charge current would charge
+/// forever. From empty at `REGULATION_C` a healthy pack needs ~5 h of CC plus
+/// ~1 h of CV, so 8 h bounds the pathological case with generous headroom
+/// over the legitimate one.
+const MAX_CHARGE: Duration = Duration::from_secs(8 * 60 * 60);
+/// The CV plateau is a subset of the cycle, so its cap has to be the tighter
+/// of the two or it could never be the one to fire.
+const _: () = assert!(MAX_CHARGE.as_secs() > MAX_ABSORB.as_secs());
 /// Pack voltage within this of `absorb_v` counts as "at the CV plateau" for
 /// the `MAX_ABSORB` clock. Wide enough to absorb sensing noise / IR drop at
 /// the knee, narrow enough that the CC ramp (well below `absorb_v`) never

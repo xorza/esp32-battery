@@ -82,22 +82,93 @@ fn cc_ramp_below_absorb_v_does_not_arm_timeout() {
 }
 
 #[test]
-fn absorb_timer_resets_on_cc_dip() {
-    // A load transient pulling the pack back below absorb_v (CC again) resets
-    // the clock — that's genuine charging, not a stuck taper. Arm the timer to
-    // one tick shy of the cap, dip once into CC, then a second near-full CV
-    // hold must still not fault: proves the dip cleared the accumulated time.
+fn cv_dips_shave_the_absorb_clock_instead_of_erasing_it() {
+    // A load transient that pulls the buck out of CV for one tick used to
+    // zero the whole window, so a load cycling faster than the cap kept it
+    // from ever firing and the pack sat at CV indefinitely. Leaky: a dip
+    // costs exactly the time it lasted.
+    //
+    // 7199 s at CV, one 1 s dip (→ 7198), then two more at CV: 7199 holds,
+    // 7200 trips.
     let mut s = active(lfp_4s());
     enter_absorb(&mut s);
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
         ok_tick(&mut s, b(CV_V, -3.0), TICK);
     }
-    assert_eq!(s.fault(), None);
-    // CC dip: voltage below the CV band resets the absorb debouncer.
     assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), TICK), Action::None));
+    assert!(matches!(ok_tick(&mut s, b(CV_V, -3.0), TICK), Action::None));
+    assert_eq!(s.fault(), None, "the dip must cost one tick, not the window");
+    assert!(matches_disable(
+        &ok_tick(&mut s, b(CV_V, -3.0), TICK),
+        FaultReason::AbsorbTimeout
+    ));
+}
+
+#[test]
+fn a_sustained_return_to_cc_drains_the_absorb_clock() {
+    // The leak has to be symmetric, or the cap would eventually fire on a
+    // pack that spends most of its time genuinely charging in CC. Fill the
+    // window to one tick shy, spend the same span below the plateau — back
+    // to zero — and a fresh full window is then required.
+    let mut s = active(lfp_4s());
+    enter_absorb(&mut s);
+    for _ in 0..(MAX_ABSORB.as_secs() - 1) {
+        ok_tick(&mut s, b(CV_V, -3.0), TICK);
+    }
+    for _ in 0..(MAX_ABSORB.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, -3.0), TICK);
+    }
     for _ in 0..(MAX_ABSORB.as_secs() - 1) {
         assert!(matches!(ok_tick(&mut s, b(CV_V, -3.0), TICK), Action::None));
     }
+    assert_eq!(s.fault(), None, "the window was not emptied");
+    assert!(matches_disable(
+        &ok_tick(&mut s, b(CV_V, -3.0), TICK),
+        FaultReason::AbsorbTimeout
+    ));
+}
+
+#[test]
+fn charge_timeout_bounds_a_ramp_that_never_reaches_cv() {
+    // `MAX_ABSORB` clocks the plateau only, so a pack that never gets there
+    // — shorted cell, wiring fault, a load eating the whole charge current
+    // — has no other backstop. Hold well below the CV band past the total
+    // budget: `AbsorbTimeout` correctly never fires and `ChargeTimeout` must.
+    let mut s = active(lfp_4s());
+    enter_absorb(&mut s);
+    assert!(matches!(
+        ok_tick(&mut s, b(OK_V, -3.0), MAX_CHARGE - TICK),
+        Action::None
+    ));
+    assert_eq!(s.fault(), None);
+    assert!(matches_disable(
+        &ok_tick(&mut s, b(OK_V, -3.0), TICK),
+        FaultReason::ChargeTimeout
+    ));
+}
+
+#[test]
+fn charge_budget_covers_one_cycle_not_the_unit_lifetime() {
+    // Two Absorb stretches of half the budget each, with a taper between
+    // them. They total more than `MAX_CHARGE`, so a budget that carried
+    // across the taper would fire on the second — it must start over.
+    let half = MAX_CHARGE / 2;
+    let mut s = active(lfp_4s());
+    enter_absorb(&mut s);
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), half), Action::None));
+
+    // Sub-tail current for the exit window drops us back to Float.
+    for _ in 0..(EXIT_DEBOUNCE.as_secs() - 1) {
+        assert!(matches!(ok_tick(&mut s, b(OK_V, -0.1), TICK), Action::None));
+    }
+    assert!(matches!(
+        ok_tick(&mut s, b(OK_V, -0.1), TICK),
+        Action::UpdateVoltage { .. }
+    ));
+    assert_eq!(s.state(), ChargeState::Float);
+
+    enter_absorb(&mut s);
+    assert!(matches!(ok_tick(&mut s, b(OK_V, -3.0), half), Action::None));
     assert_eq!(s.fault(), None);
 }
 
