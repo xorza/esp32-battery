@@ -1,47 +1,11 @@
 use super::*;
 
 #[test]
-fn url_decode_basic() {
-    let mut buf = [0u8; 64];
-    let len = url_decode("hello+world", &mut buf);
-    assert_eq!(&buf[..len], b"hello world");
-}
-
-#[test]
-fn url_decode_percent() {
-    let mut buf = [0u8; 64];
-    let len = url_decode("a%20b%21", &mut buf);
-    assert_eq!(&buf[..len], b"a b!");
-}
-
-#[test]
-fn url_decode_empty() {
-    let mut buf = [0u8; 64];
-    let len = url_decode("", &mut buf);
-    assert_eq!(len, 0);
-}
-
-#[test]
-fn url_decode_no_encoding() {
-    let mut buf = [0u8; 64];
-    let len = url_decode("plain", &mut buf);
-    assert_eq!(&buf[..len], b"plain");
-}
-
-#[test]
 fn url_decode_truncates_at_buffer_limit() {
     let mut buf = [0u8; 3];
     let len = url_decode("abcdef", &mut buf);
     assert_eq!(len, 3);
     assert_eq!(&buf[..len], b"abc");
-}
-
-#[test]
-fn url_decode_invalid_percent_passthrough() {
-    let mut buf = [0u8; 64];
-    let len = url_decode("%ZZ", &mut buf);
-    // Invalid hex digits: '%' is passed through, then Z, Z follow
-    assert_eq!(&buf[..len], b"%ZZ");
 }
 
 #[test]
@@ -56,11 +20,6 @@ fn parse_form_no_password() {
     let (ssid, pass) = parse_form("ssid=OpenNet&pass=").unwrap();
     assert_eq!(ssid, "OpenNet");
     assert_eq!(pass, "");
-}
-
-#[test]
-fn parse_form_missing_ssid() {
-    assert!(parse_form("pass=secret").is_none());
 }
 
 #[test]
@@ -87,6 +46,26 @@ fn parse_form_encoded_values() {
 }
 
 #[test]
-fn parse_form_empty() {
-    assert!(parse_form("").is_none());
+fn url_decode_handles_every_encoding_the_form_sends() {
+    // `+` is a space, `%XX` is a byte, and anything that isn't valid hex
+    // after a `%` passes through untouched rather than being dropped.
+    let cases: [(&str, &[u8]); 5] = [
+        ("hello+world", b"hello world"),
+        ("a%20b%21", b"a b!"),
+        ("plain", b"plain"),
+        ("", b""),
+        ("%ZZ", b"%ZZ"),
+    ];
+    for (input, want) in cases {
+        let mut buf = [0u8; 64];
+        let len = url_decode(input, &mut buf);
+        assert_eq!(&buf[..len], want, "url_decode({input:?})");
+    }
+}
+
+#[test]
+fn parse_form_rejects_bodies_without_an_ssid() {
+    for body in ["pass=secret", ""] {
+        assert!(parse_form(body).is_none(), "{body:?}");
+    }
 }

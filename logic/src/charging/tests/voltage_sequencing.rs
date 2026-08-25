@@ -64,7 +64,7 @@ fn update_voltage_retries_until_acked() {
     let Action::UpdateVoltage(t1) = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage");
     };
-    assert!(approx(t1.target_v, profile.absorb_v));
+    assert_approx(t1.target_v, profile.absorb_v);
     assert_eq!(s.phase(), Phase::Float); // not yet committed
     assert_eq!(s.fault(), None);
 
@@ -74,7 +74,7 @@ fn update_voltage_retries_until_acked() {
     let Action::UpdateVoltage(t2) = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage retry");
     };
-    assert!(approx(t2.target_v, profile.absorb_v));
+    assert_approx(t2.target_v, profile.absorb_v);
     assert_eq!(s.phase(), Phase::Float);
     assert_eq!(s.fault(), None);
 
@@ -93,7 +93,7 @@ fn float_to_absorb_emits_step_up_no_output_cycle() {
     let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
         panic!("expected UpdateVoltage");
     };
-    assert!(approx(ticket.target_v, profile.absorb_v));
+    assert_approx(ticket.target_v, profile.absorb_v);
     assert!(
         !ticket.cycle_output,
         "Float→Absorb is a step UP — must not cycle"
@@ -122,7 +122,7 @@ fn absorb_to_float_emits_step_down_with_output_cycle() {
     let Action::UpdateVoltage(ticket) = s.tick(p, TICK) else {
         panic!("expected Absorb→Float UpdateVoltage after EXIT_DEBOUNCE");
     };
-    assert!(approx(ticket.target_v, profile.float_v));
+    assert_approx(ticket.target_v, profile.float_v);
     assert!(
         ticket.cycle_output,
         "Absorb→Float is a step DOWN — caller must cycle output"

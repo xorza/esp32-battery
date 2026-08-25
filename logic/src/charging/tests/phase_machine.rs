@@ -9,7 +9,7 @@ use super::*;
 fn starts_in_float_at_float_voltage() {
     let s = ChargeSupervisor::new(lfp_4s());
     assert_eq!(s.phase(), Phase::Float);
-    assert!(approx(s.target_voltage(), 13.5));
+    assert_approx(s.target_voltage(), 13.5);
 }
 
 #[test]
@@ -21,7 +21,7 @@ fn enters_absorb_when_charging_current_exceeds_threshold() {
         Action::UpdateVoltage { .. }
     ));
     assert_eq!(s.phase(), Phase::Absorb);
-    assert!(approx(s.target_voltage(), 14.4));
+    assert_approx(s.target_voltage(), 14.4);
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn exits_absorb_when_taper_drops_below_threshold() {
         Action::UpdateVoltage { .. }
     ));
     assert_eq!(s.phase(), Phase::Float);
-    assert!(approx(s.target_voltage(), 13.5));
+    assert_approx(s.target_voltage(), 13.5);
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn exits_absorb_when_load_pulls_current() {
         ok_tick(&mut s, b(OK_V, 3.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(approx(s.target_voltage(), 13.5));
+    assert_approx(s.target_voltage(), 13.5);
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn pulsing_current_still_exits_absorb() {
     let cycle = exited_at.expect("pulsing pack never exited Absorb");
     assert!((25..40).contains(&cycle), "exited after {cycle} cycles");
     assert_eq!(s.phase(), Phase::Float);
-    assert!(approx(s.target_voltage(), 13.5));
+    assert_approx(s.target_voltage(), 13.5);
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn exit_debounce_honors_elapsed() {
         Action::UpdateVoltage { .. }
     ));
     assert_eq!(s.phase(), Phase::Float);
-    assert!(approx(s.target_voltage(), 13.5));
+    assert_approx(s.target_voltage(), 13.5);
 }
 
 #[test]
@@ -233,7 +233,7 @@ fn full_charge_cycle() {
         ok_tick(&mut s, b(OK_V, -8.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(approx(s.target_voltage(), 14.4));
+    assert_approx(s.target_voltage(), 14.4);
     // Hold absorb across a realistic taper — all values stay above 2.5 A.
     for &i in &[-7.0, -5.0, -3.5, -3.0, -2.7] {
         assert!(matches!(ok_tick(&mut s, b(OK_V, i), TICK), Action::None));
@@ -246,7 +246,7 @@ fn full_charge_cycle() {
         ok_tick(&mut s, b(OK_V, -2.4), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(approx(s.target_voltage(), 13.5));
+    assert_approx(s.target_voltage(), 13.5);
     // Sit at float without retriggering absorb (all below 3 A enter).
     for &i in &[-0.05, -0.02, 0.0, -2.0] {
         assert!(matches!(ok_tick(&mut s, b(OK_V, i), TICK), Action::None));
@@ -261,7 +261,7 @@ fn supervisor_passes_setpoint_through_on_phase_transition() {
         Action::UpdateVoltage { .. }
     ));
     assert_eq!(s.phase(), Phase::Absorb);
-    assert!(approx(s.target_voltage(), 14.4));
+    assert_approx(s.target_voltage(), 14.4);
     assert_eq!(s.fault(), None);
 }
 

@@ -76,39 +76,6 @@ fn rd_bit_echoes_into_response_flags() {
 }
 
 #[test]
-fn truncated_header_rejected() {
-    let mut out = [0u8; 64];
-    assert!(build_response(&[0u8; 11], [0; 4], &mut out).is_none());
-}
-
-#[test]
-fn label_running_past_end_rejected() {
-    let mut req = vec![0u8; 12];
-    req.push(50); // label claims 50 bytes but only ~12 follow
-    req.extend_from_slice(b"short");
-    let mut out = [0u8; 64];
-    assert!(build_response(&req, [0; 4], &mut out).is_none());
-}
-
-#[test]
-fn missing_qtype_qclass_rejected() {
-    // Header + label + null but no qtype/qclass
-    let mut req = vec![0u8; 12];
-    req.push(7);
-    req.extend_from_slice(b"example");
-    req.push(0);
-    let mut out = [0u8; 64];
-    assert!(build_response(&req, [0; 4], &mut out).is_none());
-}
-
-#[test]
-fn output_buffer_too_small_rejected() {
-    let req = a_query([0, 0]);
-    let mut out = [0u8; 30]; // need 41
-    assert!(build_response(&req, [0; 4], &mut out).is_none());
-}
-
-#[test]
 fn multi_label_name_preserved_in_answer() {
     // "captive.example" = [7]captive[7]example[0]
     let mut req = vec![0xCA, 0xFE]; // txn
@@ -130,4 +97,29 @@ fn multi_label_name_preserved_in_answer() {
     assert_eq!(&out[12..20], &[7, b'c', b'a', b'p', b't', b'i', b'v', b'e']);
     assert_eq!(&out[20..28], &[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e']);
     assert_eq!(out[28], 0);
+}
+
+#[test]
+fn malformed_or_unanswerable_requests_are_rejected() {
+    // Every one of these must return None rather than emit a partial or
+    // out-of-bounds response into the caller's buffer.
+    let mut label_past_end = vec![0u8; 12];
+    label_past_end.push(50); // claims 50 bytes, only ~5 follow
+    label_past_end.extend_from_slice(b"short");
+
+    let mut no_qtype = vec![0u8; 12]; // header + label + null, nothing after
+    no_qtype.push(7);
+    no_qtype.extend_from_slice(b"example");
+    no_qtype.push(0);
+
+    let cases: [(&str, &[u8], usize); 4] = [
+        ("header truncated", &[0u8; 11], 64),
+        ("label runs past the end", &label_past_end, 64),
+        ("qtype/qclass missing", &no_qtype, 64),
+        ("output buffer too small", &a_query([0, 0]), 30), // needs 41
+    ];
+    for (what, req, out_len) in cases {
+        let mut out = vec![0u8; out_len];
+        assert!(build_response(req, [0; 4], &mut out).is_none(), "{what}");
+    }
 }

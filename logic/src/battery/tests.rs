@@ -4,6 +4,18 @@ fn approx(a: f32, b: f32) -> bool {
     (a - b).abs() < 0.01
 }
 
+/// Assert two floats match, naming both in the failure. `assert!(approx(..))`
+/// reports only "assertion failed", which says nothing about how far off a
+/// derived value actually was. `#[track_caller]` keeps the reported line at
+/// the call site.
+#[track_caller]
+fn assert_approx(actual: f32, expected: f32) {
+    assert!(
+        approx(actual, expected),
+        "{actual} != {expected}"
+    );
+}
+
 const LFP: Chemistry = Chemistry::LiFePo4;
 
 #[test]
@@ -36,8 +48,8 @@ fn exact_curve_entries_4s() {
 #[test]
 fn matches_legacy_4s_table_points() {
     // Spot-check the old pack table is preserved: (13.04, 50.0), (13.20, 70.0).
-    assert!(approx(ocv_soc(LFP, 4, 13.04), 50.0), "got {}, expected 50.0", ocv_soc(LFP, 4, 13.04));
-    assert!(approx(ocv_soc(LFP, 4, 13.20), 70.0), "got {}, expected 70.0", ocv_soc(LFP, 4, 13.20));
+    assert_approx(ocv_soc(LFP, 4, 13.04), 50.0);
+    assert_approx(ocv_soc(LFP, 4, 13.20), 70.0);
 }
 
 #[test]
@@ -56,7 +68,7 @@ fn cell_count_scales_voltage() {
         approx(four, eight),
         "4S at 3.26 V/cell = {four}, 8S = {eight}"
     );
-    assert!(approx(four, 50.0), "got {}, expected 50.0", four);
+    assert_approx(four, 50.0);
 }
 
 #[test]
@@ -66,8 +78,8 @@ fn chemistry_changes_result() {
     let cell_v = 3.70;
     let lfp = ocv_soc(Chemistry::LiFePo4, 1, cell_v);
     let liion = ocv_soc(Chemistry::LiIon, 1, cell_v);
-    assert!(approx(lfp, 100.0), "lfp {lfp}, expected 100.0");
-    assert!(approx(liion, 40.0), "liion {liion}, expected 40.0");
+    assert_approx(lfp, 100.0);
+    assert_approx(liion, 40.0);
     assert!(lfp != liion);
 }
 

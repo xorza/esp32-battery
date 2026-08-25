@@ -28,15 +28,15 @@ fn lfp_4s_50ah_matches_hand_calculation() {
     //   ocp_a          = 10.00  × 1.5 = 15.00 A
     //   lvp_v          = 24     − 2   = 22.00 V
     let p = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
-    assert!(approx(p.absorb_v, 14.40));
-    assert!(approx(p.float_v, 13.50));
-    assert!(approx(p.regulation_a, 10.00));
-    assert!(approx(p.enter_absorb_a, 3.00));
-    assert!(approx(p.exit_absorb_a, 2.50));
+    assert_approx(p.absorb_v, 14.40);
+    assert_approx(p.float_v, 13.50);
+    assert_approx(p.regulation_a, 10.00);
+    assert_approx(p.enter_absorb_a, 3.00);
+    assert_approx(p.exit_absorb_a, 2.50);
     let s = p.safety_limits(INPUT_NOMINAL_V);
-    assert!(approx(s.ovp_v, 15.00));
-    assert!(approx(s.ocp_a, 15.00));
-    assert!(approx(s.lvp_v, 22.00));
+    assert_approx(s.ovp_v, 15.00);
+    assert_approx(s.ocp_a, 15.00);
+    assert_approx(s.lvp_v, 22.00);
     // Derived ordering invariants the supervisor relies on.
     assert!(p.absorb_v > p.float_v);
     assert!(p.regulation_a > p.enter_absorb_a);
@@ -48,16 +48,16 @@ fn lfp_4s_50ah_matches_hand_calculation() {
 fn lfp_top_balance_uses_manufacturer_max() {
     // 3.65 V/cell — used only when BMS needs the headroom to balance.
     let p = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 50.0);
-    assert!(approx(p.absorb_v, 14.6));
-    assert!(approx(p.float_v, 13.5));
+    assert_approx(p.absorb_v, 14.6);
+    assert_approx(p.float_v, 13.5);
 }
 
 #[test]
 fn liion_3s_voltages_match_known_setpoints() {
     let p = Profile::for_pack(Chemistry::LiIon, 3, 50.0);
     // Longevity-tuned: 4.10 × 3 = 12.3, 4.00 × 3 = 12.0.
-    assert!(approx(p.absorb_v, 12.3));
-    assert!(approx(p.float_v, 12.0));
+    assert_approx(p.absorb_v, 12.3);
+    assert_approx(p.float_v, 12.0);
 }
 
 #[test]
@@ -82,12 +82,12 @@ fn voltages_scale_with_cell_count() {
     let p1 = Profile::for_pack(Chemistry::LiFePo4, 1, 50.0);
     let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
     let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 50.0);
-    assert!(approx(p1.absorb_v, 3.60));
-    assert!(approx(p4.absorb_v, 3.60 * 4.0));
-    assert!(approx(p16.absorb_v, 3.60 * 16.0));
-    assert!(approx(p1.float_v, 3.375));
-    assert!(approx(p4.float_v, 3.375 * 4.0));
-    assert!(approx(p16.float_v, 3.375 * 16.0));
+    assert_approx(p1.absorb_v, 3.60);
+    assert_approx(p4.absorb_v, 3.60 * 4.0);
+    assert_approx(p16.absorb_v, 3.60 * 16.0);
+    assert_approx(p1.float_v, 3.375);
+    assert_approx(p4.float_v, 3.375 * 4.0);
+    assert_approx(p16.float_v, 3.375 * 16.0);
 }
 
 #[test]
@@ -95,14 +95,14 @@ fn currents_scale_with_capacity_not_cells() {
     // Same capacity, different S → identical currents.
     let p4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
     let p16 = Profile::for_pack(Chemistry::LiFePo4, 16, 50.0);
-    assert!(approx(p4.regulation_a, p16.regulation_a));
-    assert!(approx(p4.enter_absorb_a, p16.enter_absorb_a));
-    assert!(approx(p4.exit_absorb_a, p16.exit_absorb_a));
+    assert_approx(p4.regulation_a, p16.regulation_a);
+    assert_approx(p4.enter_absorb_a, p16.enter_absorb_a);
+    assert_approx(p4.exit_absorb_a, p16.exit_absorb_a);
     // Same S, different capacity → currents scale linearly.
     let p100 = Profile::for_pack(Chemistry::LiFePo4, 4, 100.0);
-    assert!(approx(p100.regulation_a, 2.0 * p4.regulation_a));
-    assert!(approx(p100.enter_absorb_a, 2.0 * p4.enter_absorb_a));
-    assert!(approx(p100.exit_absorb_a, 2.0 * p4.exit_absorb_a));
+    assert_approx(p100.regulation_a, 2.0 * p4.regulation_a);
+    assert_approx(p100.enter_absorb_a, 2.0 * p4.enter_absorb_a);
+    assert_approx(p100.exit_absorb_a, 2.0 * p4.exit_absorb_a);
 }
 
 #[test]
@@ -141,7 +141,7 @@ fn safety_limits_track_chemistry_change() {
     // Top-balance pushes absorb to 14.6 V — OVP must move up too, not stay
     // at the 4S-daily 15.0 V. Without derived limits this is the footgun.
     let s = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 50.0).safety_limits(INPUT_NOMINAL_V);
-    assert!(approx(s.ovp_v, 15.2));
+    assert_approx(s.ovp_v, 15.2);
     assert!(s.ovp_v > 14.6, "OVP must clear absorb_v");
 }
 
@@ -152,8 +152,8 @@ fn safety_limits_track_cell_count_change() {
     assert!(s8.ovp_v > s4.ovp_v, "OVP scales with cell count");
     // OCP is current-only (and capacity-derived) and LVP is input-side —
     // both independent of S.
-    assert!(approx(s4.ocp_a, s8.ocp_a));
-    assert!(approx(s4.lvp_v, s8.lvp_v));
+    assert_approx(s4.ocp_a, s8.ocp_a);
+    assert_approx(s4.lvp_v, s8.lvp_v);
 }
 
 #[test]
@@ -190,8 +190,8 @@ fn different_chemistries_yield_different_setpoints() {
         ok_tick(&mut liion, b(12.0, -4.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(approx(lfp.target_voltage(), 14.4));
-    assert!(approx(liion.target_voltage(), 12.3));
+    assert_approx(lfp.target_voltage(), 14.4);
+    assert_approx(liion.target_voltage(), 12.3);
 }
 
 #[test]
@@ -199,10 +199,10 @@ fn single_cell_lfp_works() {
     // 1S 50 Ah LFP — float 3.375 V, absorb 3.60 V (daily). Same currents
     // as the 4S pack since they derive from capacity, not cell count.
     let mut s = active(Profile::for_pack(Chemistry::LiFePo4, 1, 50.0));
-    assert!(approx(s.target_voltage(), 3.375));
+    assert_approx(s.target_voltage(), 3.375);
     assert!(matches!(
         ok_tick(&mut s, b(3.4, -4.0), TICK),
         Action::UpdateVoltage { .. }
     ));
-    assert!(approx(s.target_voltage(), 3.60));
+    assert_approx(s.target_voltage(), 3.60);
 }

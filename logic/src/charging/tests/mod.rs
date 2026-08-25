@@ -36,6 +36,18 @@ fn approx(a: f32, b: f32) -> bool {
     (a - b).abs() < 1e-4
 }
 
+/// Assert two floats match, naming both in the failure. `assert!(approx(..))`
+/// reports only "assertion failed", which says nothing about how far off a
+/// derived value actually was. `#[track_caller]` keeps the reported line at
+/// the call site.
+#[track_caller]
+fn assert_approx(actual: f32, expected: f32) {
+    assert!(
+        approx(actual, expected),
+        "{actual} != {expected}"
+    );
+}
+
 /// Sub-OV-threshold voltage used by tests that only care about phase logic.
 /// Below the LFP fixture's CV plateau (14.4), so it does NOT arm the absorb
 /// timeout — represents the CC ramp.

@@ -154,7 +154,7 @@ fn protect_recovery_in_absorb_does_not_re_emit_its_own_voltage() {
         "no-op voltage write emitted: {a:?}"
     );
     assert_eq!(s.phase(), Phase::Absorb);
-    assert!(approx(s.expected_setpoints().v_set, profile.absorb_v));
+    assert_approx(s.expected_setpoints().v_set, profile.absorb_v);
 }
 
 #[test]
