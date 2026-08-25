@@ -33,23 +33,23 @@ xy-fake = []
 [dependencies]
 esp32-battery-logic = { path = "logic" }
 xy-modbus = { git = "https://github.com/xorza/xy-modbus.git", branch = "master", features = ["esp-idf-hal"] }
-log = "*"
-esp-idf-svc = "*"
-esp-idf-hal = "*"
+log = "0.4"
+esp-idf-svc = "0.52"
+esp-idf-hal = "0.46"
 ina228 = { git="https://github.com/xorza/ina228.git", branch = "master" }
-embedded-hal = "*"
-heapless = "*"
-hmac = "*"
-sha2 = { version = "*", default-features = false }
-serde = { version = "*", default-features = false, features = ["derive"] }
-serde-json-core = "*"
-strum = { version = "*", default-features = false, features = ["derive"] }
-mipidsi = { version = "*", optional = true }
-embedded-graphics = { version = "*", optional = true }
+embedded-hal = "1.0"
+heapless = "0.9"
+hmac = "0.13"
+sha2 = { version = "0.11", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde-json-core = "0.6"
+strum = { version = "0.28", default-features = false, features = ["derive"] }
+mipidsi = { version = "0.10", optional = true }
+embedded-graphics = { version = "0.8", optional = true }
 
 [build-dependencies]
-embuild = "*"
-flate2 = "*"
+embuild = "0.33"
+flate2 = "1.1"
 
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/mdns", version = "*" }

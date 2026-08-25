@@ -71,25 +71,25 @@ fn iteration_order_is_oldest_first() {
 fn ring_evicts_oldest_when_full() {
     let mut log = EventLog::new();
     // Fill capacity + 5 — first 5 must be evicted.
-    for ts in 0..(EventLog::CAPACITY as u32 + 5) {
+    for ts in 0..(CAPACITY as u32 + 5) {
         log.record(ts, Event::Xy(XyError::ReadStatus));
     }
-    assert_eq!(log.len(), EventLog::CAPACITY);
+    assert_eq!(log.len(), CAPACITY);
     let first_ts = log.recent().next().unwrap().ts;
     let last_ts = log.recent().last().unwrap().ts;
     assert_eq!(first_ts, 5);
-    assert_eq!(last_ts, EventLog::CAPACITY as u32 + 4);
+    assert_eq!(last_ts, CAPACITY as u32 + 4);
 }
 
 #[test]
 fn counters_survive_ring_eviction() {
     // Counter is the lifetime total — ring overflow must not lose it.
     let mut log = EventLog::new();
-    let pushes = EventLog::CAPACITY as u32 + 17;
+    let pushes = CAPACITY as u32 + 17;
     for _ in 0..pushes {
         log.record(1, Event::Xy(XyError::ReadStatus));
     }
-    assert_eq!(log.len(), EventLog::CAPACITY);
+    assert_eq!(log.len(), CAPACITY);
     assert_eq!(log.xy_count(XyError::ReadStatus), pushes);
 }
 
@@ -189,5 +189,5 @@ fn mixed_workload_keeps_each_source_consistent() {
     assert_eq!(log.ina_count(InaError::CurrentRead), 17);
     assert_eq!(log.xy_count(XyError::ReadStatus), 17);
     assert_eq!(log.charge_count(ChargeTransition::ProtectHold), 16);
-    assert_eq!(log.len(), EventLog::CAPACITY);
+    assert_eq!(log.len(), CAPACITY);
 }

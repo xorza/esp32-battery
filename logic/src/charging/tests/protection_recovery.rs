@@ -18,7 +18,7 @@ fn self_clearing_protection_drops_to_pending_without_latching() {
         let a = s.tick(poll_with_output(&s, BuckOutput::Off { cause }), TICK);
         assert!(matches!(a, Action::None), "{cause}");
         assert_eq!(s.fault(), None, "{cause}");
-        assert!(matches!(s.latch, LatchState::Pending { .. }), "{cause}");
+        assert!(s.is_pending(), "{cause}");
     }
 }
 
@@ -32,12 +32,12 @@ fn self_clearing_protection_accepts_buck_auto_re_enable() {
     for cause in SELF_CLEARING {
         let mut s = active(lfp_4s());
         s.tick(poll_with_output(&s, BuckOutput::Off { cause }), TICK);
-        assert!(matches!(s.latch, LatchState::Pending { .. }), "{cause}");
+        assert!(s.is_pending(), "{cause}");
 
         let a = s.tick(poll_with_output(&s, BuckOutput::On), TICK);
         assert!(matches!(a, Action::None), "{cause}");
         assert_eq!(s.fault(), None, "{cause}");
-        assert!(matches!(s.latch, LatchState::Active { .. }), "{cause}");
+        assert!(s.is_active(), "{cause}");
     }
 }
 
@@ -61,7 +61,7 @@ fn pending_waits_for_lvp_to_clear_before_enable() {
     let p_clear = expected_poll(&s, b(OK_V, -0.1));
     let a = s.tick(p_clear, TICK);
     accept_enable(&mut s, a);
-    assert!(matches!(s.latch, LatchState::Active { .. }));
+    assert!(s.is_active());
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn pending_at_boot_with_lvp_waits() {
         assert!(matches!(s.tick(p_lvp, TICK), Action::None));
     }
     assert_eq!(s.fault(), None);
-    assert!(matches!(s.latch, LatchState::Pending { .. }));
+    assert!(s.is_pending());
 }
 
 #[test]

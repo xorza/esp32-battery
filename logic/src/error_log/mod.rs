@@ -153,8 +153,6 @@ impl Default for EventLog {
 }
 
 impl EventLog {
-    pub const CAPACITY: usize = CAPACITY;
-
     pub fn new() -> Self {
         Self {
             recent: Deque::new(),

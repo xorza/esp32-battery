@@ -205,10 +205,6 @@ impl SensorData {
         self.history.samples()
     }
 
-    pub fn interval(&self) -> u32 {
-        self.history.interval()
-    }
-
     /// Drive the history pipeline forward by one tick. `now_epoch` is the
     /// wall-clock second the caller wants stamped on any committed sample;
     /// `None` (e.g. before NTP sync) gates out commits but still ages the

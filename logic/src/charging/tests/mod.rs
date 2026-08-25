@@ -5,7 +5,8 @@ use super::*;
 
 use crate::battery::Chemistry;
 use crate::charging::action::{Action, DisableTicket, EnableTicket, VoltageTicket};
-use crate::charging::charge_supervisor::{ChargeSupervisor, LatchState};
+use crate::charging::charge_supervisor::ChargeSupervisor;
+use crate::charging::charge_supervisor::internals::SupervisorInternals;
 use crate::charging::fault_reason::FaultReason;
 use crate::charging::inhibit_reason::InhibitReason;
 use crate::charging::phase::Phase;
@@ -96,7 +97,7 @@ fn expected_poll(s: &ChargeSupervisor, battery: Option<BatterySample>) -> PollRe
 /// The `OUTPUT_EN` a healthy buck reports for the supervisor's current
 /// latch state: on while regulating, off otherwise.
 fn expected_output(s: &ChargeSupervisor) -> BuckOutput {
-    if matches!(s.latch, LatchState::Active { .. }) {
+    if s.is_active() {
         BuckOutput::On
     } else {
         BuckOutput::Off {

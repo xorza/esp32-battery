@@ -35,7 +35,7 @@ use xy_modbus::Setpoints;
 /// - `Tripped { acked: false }`: a fault latched; emit `DisableOutput`.
 /// - `Tripped { acked: true }`: caller successfully disabled. Reboot-only
 ///   recovery — `tick` returns `Action::None` from here on.
-pub(super) enum LatchState {
+enum LatchState {
     Pending { reason: PendingReason },
     Active { pending_voltage: Option<Phase> },
     Tripped { reason: FaultReason, acked: bool },
@@ -56,7 +56,7 @@ pub(super) enum LatchState {
 ///   than latching. Setpoints are still what we programmed before the
 ///   self-disable, so drift check covers regulation safety.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum PendingReason {
+enum PendingReason {
     Boot,
     ProtectRecovery,
 }
@@ -116,7 +116,7 @@ pub struct ChargeSupervisor {
     exit: Debounce,
     battery_missing: Debounce,
     modbus_err: Debounce,
-    pub(super) latch: LatchState,
+    latch: LatchState,
     inhibit: Option<InhibitReason>,
     transitions: Deque<ChargeTransition, TRANSITION_BUFFER>,
 }
@@ -188,7 +188,7 @@ impl ChargeSupervisor {
         matches!(self.latch, LatchState::Active { .. }).then_some(self.phase)
     }
 
-    pub(super) fn target_voltage(&self) -> f32 {
+    fn target_voltage(&self) -> f32 {
         self.voltage_for_phase(self.phase)
     }
 
@@ -251,7 +251,7 @@ impl ChargeSupervisor {
     /// limits, etc.), it must use the same defer-and-ack pattern as
     /// `pending_voltage` for V_SET, otherwise a successful write to a new
     /// I_SET will trip `SettingsDrift` on the very next tick.
-    pub(super) fn expected_setpoints(&self) -> Setpoints {
+    fn expected_setpoints(&self) -> Setpoints {
         Setpoints {
             v_set: self.target_voltage(),
             i_set: self.profile.regulation_a,
@@ -633,5 +633,46 @@ impl ChargeSupervisor {
             acked: false,
         });
         Action::DisableOutput(DisableTicket { reason })
+    }
+}
+
+/// What the charging tests read out of a supervisor. `target_voltage` and
+/// `expected_setpoints` are production methods that were only ever widened
+/// past private for the tests; `LatchState` stays private here and the
+/// tests ask about it through predicates instead of matching the type.
+#[cfg(test)]
+pub(crate) mod internals {
+    use xy_modbus::Setpoints;
+
+    use crate::charging::charge_supervisor::{ChargeSupervisor, LatchState};
+
+    /// Widens the supervisor's private reads to the charging tests without
+    /// widening them in production. Bring it into scope to call these as
+    /// methods; the same-named inherent ones stay private to this file.
+    pub(crate) trait SupervisorInternals {
+        /// Output is off and the supervisor is deciding whether to bring it up.
+        fn is_pending(&self) -> bool;
+        /// Output is on and the phase machine is running.
+        fn is_active(&self) -> bool;
+        fn target_voltage(&self) -> f32;
+        fn expected_setpoints(&self) -> Setpoints;
+    }
+
+    impl SupervisorInternals for ChargeSupervisor {
+        fn is_pending(&self) -> bool {
+            matches!(self.latch, LatchState::Pending { .. })
+        }
+
+        fn is_active(&self) -> bool {
+            matches!(self.latch, LatchState::Active { .. })
+        }
+
+        fn target_voltage(&self) -> f32 {
+            ChargeSupervisor::target_voltage(self)
+        }
+
+        fn expected_setpoints(&self) -> Setpoints {
+            ChargeSupervisor::expected_setpoints(self)
+        }
     }
 }

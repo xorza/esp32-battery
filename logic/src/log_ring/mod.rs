@@ -26,10 +26,6 @@ impl Ring {
         }
     }
 
-    pub fn capacity(&self) -> usize {
-        self.data.len()
-    }
-
     pub fn write(&mut self, mut bytes: &[u8]) {
         let cap = self.data.len();
         // Oversized line: keep only the most recent `cap` bytes so wrapping

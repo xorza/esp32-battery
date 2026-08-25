@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::data::history::HISTORY_CAPACITY;
+use crate::data::history::internals::HistoryInternals;
 
 fn bat_reading(voltage: f32, current: f32) -> Ina228Reading {
     Ina228Reading {
@@ -44,7 +45,7 @@ fn fill(sd: &mut SensorData, n: u32, start_t: u32) -> u32 {
 fn default_is_empty() {
     let sd = SensorData::new();
     assert!(sd.history().is_empty());
-    assert_eq!(sd.interval(), 1);
+    assert_eq!(sd.history.interval(), 1);
 }
 
 #[test]
@@ -148,7 +149,7 @@ fn power_online_averaged_during_compaction() {
         let v = if i % 2 == 0 { 13.0 } else { 0.0 };
         update(&mut sd, bat_reading(13.0, 1.0), ps_reading(v, 1.0), i);
     }
-    assert_eq!(sd.interval(), 2);
+    assert_eq!(sd.history.interval(), 2);
     for s in &sd.history()[..HISTORY_CAPACITY / 2] {
         assert!((s.power_online - 0.5).abs() < 0.01);
     }

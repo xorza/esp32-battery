@@ -79,10 +79,6 @@ impl History {
         &self.samples
     }
 
-    pub fn interval(&self) -> u32 {
-        self.interval
-    }
-
     pub fn last_time(&self) -> Option<u32> {
         self.samples.last().map(|s| s.time_s)
     }
@@ -129,6 +125,24 @@ impl History {
         }
         self.samples.truncate(half);
         self.interval *= 2;
+    }
+}
+
+/// The compaction interval, for tests outside this module. `history`'s own
+/// tests read the field directly; `data`'s cannot, and nothing in production
+/// needs to know the interval.
+#[cfg(test)]
+pub(crate) mod internals {
+    use crate::data::history::History;
+
+    pub(crate) trait HistoryInternals {
+        fn interval(&self) -> u32;
+    }
+
+    impl HistoryInternals for History {
+        fn interval(&self) -> u32 {
+            self.interval
+        }
     }
 }
 

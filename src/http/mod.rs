@@ -218,8 +218,9 @@ where
 }
 
 /// Single 16 KiB BSS-resident scratch buffer shared by all JSON handlers.
-/// Sized to the largest consumer (`api::RESPONSE_BUF_SIZE`); smaller handlers
-/// just use a prefix. Each `EspHttpServer` runs on a single httpd task so
+/// Sized to the largest consumer — `/api`, whose history array dominates the
+/// payload; smaller handlers just use a prefix. Each `EspHttpServer` runs on
+/// a single httpd task so
 /// handlers within one server are serial, but the main HTTPS server and the
 /// captive HTTP server are separate tasks — the mutex makes the sharing safe
 /// either way and is uncontended on the hot path.

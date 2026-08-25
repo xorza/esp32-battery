@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-heapless = "*"
-log = "*"
-strum = { version = "*", default-features = false, features = ["derive"] }
+heapless = "0.9"
+log = "0.4"
+strum = { version = "0.28", default-features = false, features = ["derive"] }
 xy-modbus = { git = "https://github.com/xorza/xy-modbus", branch = "master", default-features = false }

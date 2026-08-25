@@ -23,9 +23,8 @@ pub use charging::phase::Phase;
 pub use charging::poll_result::{BatterySample, BuckOutput, PollResult};
 pub use charging::profile::Profile;
 pub use charging::voltage_writer::{VoltageWriteOutcome, VoltageWriter, apply_update_voltage};
-pub use charging::{INPUT_LVP_MARGIN_V, OV_MARGIN_V};
+pub use charging::INPUT_LVP_MARGIN_V;
 
-pub use data::history::HISTORY_CAPACITY;
 pub use data::{Ina228Reading, PsReading, Sample, SensorData};
 pub use error_log::{ChargeTransition, Event, EventLog, InaError, TimedEvent, XyError};
 
@@ -38,9 +37,8 @@ pub use net::net_action::NetAction;
 pub use net::net_phase::{LinkState, NetPhase, NetStatus};
 pub use net::net_poll::NetPoll;
 pub use net::net_supervisor::NetSupervisor;
-pub use net::{CAPTIVE_AFTER_DISCONNECT, CAPTIVE_TRYING_TIMEOUT};
 
-/// xy-modbus types that cross the logic/firmware boundary, re-exported so
-/// consumers need not depend on the driver crate directly. `XyError` is
-/// renamed: `error_log::XyError` is this crate's event kind.
-pub use xy_modbus::{ProtectionStatus, RtuError, SafetyLimits, Setpoints, XyError as BusError};
+/// xy-modbus types that appear in this crate's own signatures, re-exported
+/// so those signatures are nameable. `XyError` is renamed: `error_log::XyError`
+/// is this crate's event kind.
+pub use xy_modbus::{ProtectionStatus, SafetyLimits, Setpoints, XyError as BusError};
