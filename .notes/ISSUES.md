@@ -10,12 +10,6 @@
 - The `setup_mdns` doc comment in `src/wifi.rs` refers to ownership by `Net::Sta`, a type
   that does not exist.
 
-- `ChargeSupervisor::tick` latches `FaultReason::Overvoltage` from `Pending` on a single
-  undebounced sample, while the same condition in `Active` requires `OV_DURATION`.
-
-- `ChargeSupervisor::tick` can latch `ModbusUnhealthy` and `BatterySensorStale` from
-  `Pending`, where the buck output is already off. Recovery from the latch is reboot-only.
-
 - The `PendingReason::ProtectRecovery` transition in `ChargeSupervisor::tick` calls
   `reset_phase_timers` but leaves the `ov` debouncer accumulated.
 

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use esp32_battery_logic::data::{Sample, SensorData};
 
-const FAULT_DISPLAY_CAP: usize = 64;
+const REASON_DISPLAY_CAP: usize = 64;
 
 use crate::PACK_PROFILE;
 use crate::clock::uptime;
@@ -101,7 +101,26 @@ pub struct ApiResponse<'a> {
     /// human-readable form (with cause for `OutputUnexpectedlyOff`).
     pub fault: Option<&'static str>,
     pub fault_message: Option<&'a str>,
+    /// Snake_case identifier of the condition currently blocking bring-up,
+    /// or `null` if none. Mutually exclusive with `fault`: a latched fault
+    /// is terminal, an inhibit clears on its own.
+    pub inhibit: Option<&'static str>,
+    pub inhibit_message: Option<&'a str>,
     pub history: HistoryView<'a>,
+}
+
+/// Render a supervisor reason for display. `fault` and `inhibit` are both
+/// `Option<impl Display>` and differ only in which response field they land
+/// in, so they share this. An empty result means "nothing to report" and
+/// serializes as `null`.
+fn reason_message<T: core::fmt::Display>(
+    reason: Option<T>,
+) -> heapless::String<REASON_DISPLAY_CAP> {
+    let mut out = heapless::String::new();
+    if let Some(reason) = reason {
+        let _ = write!(out, "{reason}");
+    }
+    out
 }
 
 pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorData>>) {
@@ -114,10 +133,8 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
         let ps = store.ps_reading().unwrap_or_default();
         let mut profile = heapless::String::<32>::new();
         let _ = write!(profile, "{PACK_PROFILE}");
-        let mut fault_message = heapless::String::<FAULT_DISPLAY_CAP>::new();
-        if let Some(reason) = store.charge_fault {
-            let _ = write!(fault_message, "{reason}");
-        }
+        let fault_message = reason_message(store.charge_fault);
+        let inhibit_message = reason_message(store.charge_inhibit);
         let response = ApiResponse {
             uptime: uptime().as_secs() as u32,
             rssi: sta_rssi(),
@@ -142,6 +159,8 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
             phase: store.charge_phase.map(|p| p.label()),
             fault: store.charge_fault.map(|f| f.label()),
             fault_message: (!fault_message.is_empty()).then_some(fault_message.as_str()),
+            inhibit: store.charge_inhibit.map(|i| i.label()),
+            inhibit_message: (!inhibit_message.is_empty()).then_some(inhibit_message.as_str()),
             history: HistoryView(store.history()),
         };
         let history_len = response.history.0.len();

@@ -471,6 +471,7 @@ fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: Ev
             let mut sd = sensor_data.lock().unwrap();
             sd.charge_phase = supervisor.active_phase();
             sd.charge_fault = supervisor.fault();
+            sd.charge_inhibit = supervisor.inhibit();
         }
         thread::sleep(POLL_INTERVAL);
     }

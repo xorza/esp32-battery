@@ -9,6 +9,12 @@
 //! overvoltage, stuck-absorb, missing-battery, or unhealthy-Modbus
 //! conditions. Once latched, only a reboot clears it.
 //!
+//! A fault latches only while the buck is actually sourcing. The same
+//! conditions detected during `Pending` bring-up *inhibit* instead: the
+//! output is already off, so latching would disable nothing while still
+//! costing a reboot to clear. Inhibits are reported via `inhibit()` and
+//! clear on their own when the condition does.
+//!
 //! Sign convention: battery current is **negative when charging** (matches
 //! the INA228 wiring on this board). The supervisor takes signed amps and
 //! negates internally, so profile thresholds stay positive and read
@@ -235,6 +241,64 @@ impl FaultReason {
     }
 }
 
+/// Why the supervisor is declining to energise the buck this tick,
+/// with nothing latched. Every variant is self-clearing: the supervisor
+/// re-checks each tick and brings the buck up as soon as the condition
+/// lifts. Reported alongside `FaultReason` so a dashboard can tell
+/// "waiting for the input rail" from "the INA228 has been dead for
+/// eight seconds" — both of which look like a dark output otherwise.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InhibitReason {
+    /// Setpoint readback disagrees with what we commanded. Regulating
+    /// on unknown setpoints would latch; refusing to *start* on them
+    /// only waits. Mirrors `FaultReason::SettingsDrift`.
+    SettingsDrift,
+    /// Modbus reads have been failing past `MODBUS_UNHEALTHY_TIMEOUT`,
+    /// or no setpoint readback has landed yet this tick. Either way we
+    /// have no closed-loop confirmation to energise on.
+    ModbusUnhealthy,
+    /// No fresh battery sample for `BATTERY_MISSING_TIMEOUT`.
+    BatterySensorStale,
+    /// A sample is simply absent this tick — not yet stale enough to
+    /// count against the debounce.
+    NoBatterySample,
+    /// Pack sits above `absorb_v + OV_MARGIN_V`. Undebounced on purpose:
+    /// one sample over the line is enough to refuse bring-up, where the
+    /// same single sample is not enough to trip a regulating buck.
+    Overvoltage,
+    /// Buck is holding itself off on a self-clearing protection (input
+    /// UVLO / over-temp). `set_output(true)` would succeed at the
+    /// Modbus layer and change nothing, so we wait for the cause.
+    BuckProtection(ProtectionStatus),
+}
+
+impl InhibitReason {
+    /// Stable snake_case identifier, matching `FaultReason::label`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SettingsDrift => "settings_drift",
+            Self::ModbusUnhealthy => "modbus_unhealthy",
+            Self::BatterySensorStale => "battery_sensor_stale",
+            Self::NoBatterySample => "no_battery_sample",
+            Self::Overvoltage => "overvoltage",
+            Self::BuckProtection(_) => "buck_protection",
+        }
+    }
+}
+
+impl std::fmt::Display for InhibitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SettingsDrift => f.write_str("waiting: setpoint readback drift"),
+            Self::ModbusUnhealthy => f.write_str("waiting: modbus link unhealthy"),
+            Self::BatterySensorStale => f.write_str("waiting: battery sensor stale"),
+            Self::NoBatterySample => f.write_str("waiting: no battery sample"),
+            Self::Overvoltage => f.write_str("waiting: pack overvoltage"),
+            Self::BuckProtection(s) => write!(f, "waiting: buck protection ({s})"),
+        }
+    }
+}
+
 /// What the poll loop should do this tick.
 ///
 /// The supervisor boots in a `Pending` latch state — output is OFF and we
@@ -330,6 +394,55 @@ enum PendingReason {
     ProtectRecovery,
 }
 
+/// Which half of the machine a tick is running in. Replaces the
+/// `Option<PendingReason>` that used to be read as a bare "am I
+/// Pending?" flag — the distinction that actually matters is whether
+/// the buck is sourcing, and every safety decision keys off exactly
+/// that.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Output is off, waiting to decide it is safe to enable.
+    Pending(PendingReason),
+    /// Output is on and the buck is regulating.
+    Regulating,
+}
+
+impl Mode {
+    /// Whether a fault found in this mode has anything to disable.
+    fn latches(self) -> bool {
+        matches!(self, Mode::Regulating)
+    }
+
+    /// The latch/inhibit rule in one place: the same condition disables
+    /// a sourcing buck and merely blocks bring-up of an idle one.
+    fn fault(self, latched: FaultReason, inhibited: InhibitReason) -> Verdict {
+        if self.latches() {
+            Verdict::Latch(latched)
+        } else {
+            Verdict::Inhibit(inhibited)
+        }
+    }
+}
+
+/// Outcome of the ordered safety gauntlet, in descending authority:
+/// a `Latch` beats a mode change, which beats an `Inhibit`, which beats
+/// `Clear`. `safety_verdict` returns the first one it reaches, so the
+/// order of the checks inside it *is* the precedence.
+enum Verdict {
+    /// Disable the buck and stay disabled until a reboot.
+    Latch(FaultReason),
+    /// Buck self-disabled on a self-clearing protection while
+    /// regulating — step back to Pending and wait it out.
+    EnterProtectRecovery(ProtectionStatus),
+    /// Buck re-enabled itself once the protection cause cleared.
+    ResumeRegulating,
+    /// Hold the buck off without latching; re-checked next tick.
+    Inhibit(InhibitReason),
+    /// Every check passed; carries the validated battery sample so the
+    /// mode arms don't re-filter it.
+    Clear(BatterySample),
+}
+
 /// Time-based debouncer: counts elapsed while `cond` holds, resets when it
 /// doesn't. One per condition we care about (OV, absorb cap, exit taper,
 /// missing battery, modbus errors).
@@ -381,6 +494,7 @@ pub struct ChargeSupervisor {
     battery_missing: Debounce,
     modbus_err: Debounce,
     latch: LatchState,
+    inhibit: Option<InhibitReason>,
 }
 
 // ─── Impls ───────────────────────────────────────────────────────────────────
@@ -462,6 +576,7 @@ impl ChargeSupervisor {
             latch: LatchState::Pending {
                 reason: PendingReason::Boot,
             },
+            inhibit: None,
         }
     }
 
@@ -516,6 +631,14 @@ impl ChargeSupervisor {
         }
     }
 
+    /// Why the supervisor is holding the buck off without having latched,
+    /// if it is. `None` while regulating normally, and `None` once a fault
+    /// has latched — `fault()` covers that case. Unlike a fault, every
+    /// inhibit clears by itself when its cause does.
+    pub fn inhibit(&self) -> Option<InhibitReason> {
+        self.inhibit
+    }
+
     pub fn fault(&self) -> Option<FaultReason> {
         match self.latch {
             LatchState::Tripped { reason, .. } => Some(reason),
@@ -566,7 +689,7 @@ impl ChargeSupervisor {
         match self.latch {
             LatchState::Pending { .. } => {
                 let pending_voltage = resume_absorb.then_some(Phase::Absorb);
-                self.latch = LatchState::Active { pending_voltage };
+                self.set_latch(LatchState::Active { pending_voltage });
             }
             _ => panic!("ack_enable from non-Pending state"),
         }
@@ -588,9 +711,9 @@ impl ChargeSupervisor {
             panic!("ack_voltage_update without pending phase");
         };
         self.phase = next;
-        self.latch = LatchState::Active {
+        self.set_latch(LatchState::Active {
             pending_voltage: None,
-        };
+        });
         // A Float→Absorb transition can immediately follow an
         // Absorb→Float, with no intervening Float dwell to clear
         // stale counts.
@@ -612,81 +735,131 @@ impl ChargeSupervisor {
     /// stuck sensor mask overvoltage. Routes through the same
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
-        let pending_reason = match self.latch {
+        let mode = match self.latch {
             LatchState::Tripped {
                 reason,
                 acked: false,
             } => return Action::DisableOutput(reason),
             // Tripped+acked: reboot-only recovery, supervisor parks here.
             LatchState::Tripped { acked: true, .. } => return Action::None,
-            LatchState::Pending { reason } => Some(reason),
-            LatchState::Active { .. } => None,
+            LatchState::Pending { reason } => Mode::Pending(reason),
+            LatchState::Active { .. } => Mode::Regulating,
         };
 
+        let battery = match self.safety_verdict(&p, elapsed, mode) {
+            Verdict::Latch(reason) => return self.latch(reason),
+            Verdict::EnterProtectRecovery(cause) => {
+                self.set_latch(LatchState::Pending {
+                    reason: PendingReason::ProtectRecovery,
+                });
+                self.reset_phase_timers();
+                self.inhibit = Some(InhibitReason::BuckProtection(cause));
+                return Action::None;
+            }
+            Verdict::ResumeRegulating => {
+                self.set_latch(LatchState::Active {
+                    pending_voltage: None,
+                });
+                self.inhibit = None;
+                return Action::None;
+            }
+            Verdict::Inhibit(reason) => {
+                self.inhibit = Some(reason);
+                return Action::None;
+            }
+            Verdict::Clear(b) => {
+                self.inhibit = None;
+                b
+            }
+        };
+
+        match mode {
+            // Output has been OFF throughout Pending, so `b.voltage` is the
+            // pack's resting voltage — the true SoC signal. Below the CV
+            // plateau means not full, so the caller acks with
+            // resume_absorb = true. The supervisor stays Pending until it does.
+            Mode::Pending(_) => Action::EnableOutput {
+                resume_absorb: !self.at_cv_plateau(battery.voltage),
+            },
+            Mode::Regulating => self.regulate(battery, elapsed),
+        }
+    }
+
+    /// The ordered safety gauntlet. **The order of the checks below is the
+    /// specification** — each one may only be moved past checks it commutes
+    /// with, and `tests.rs` pins the precedence where two can fire on the
+    /// same tick.
+    ///
+    /// Whether a failure latches or merely inhibits is decided by `mode` and
+    /// nothing else. A fault latches only while the buck is sourcing; in
+    /// `Pending` the output is already off, so a latch would disable nothing
+    /// and cost a reboot to clear. `OutputOnInPending` is the one exception,
+    /// because there the output really is on.
+    ///
+    /// Debouncers are stepped in both modes so their windows stay coherent
+    /// across a mode change.
+    fn safety_verdict(&mut self, p: &PollResult, elapsed: Duration, mode: Mode) -> Verdict {
+        // 1. Commanded vs. reported setpoints. No debounce: the read itself
+        //    succeeded, so a mismatch is the device disagreeing with us
+        //    rather than transport noise.
         if let Some(sp) = p.setpoints {
             let want = self.expected_setpoints();
             if (sp.v_set - want.v_set).abs() >= SETPOINT_DRIFT_TOL
                 || (sp.i_set - want.i_set).abs() >= SETPOINT_DRIFT_TOL
             {
-                return self.latch(FaultReason::SettingsDrift);
+                return mode.fault(FaultReason::SettingsDrift, InhibitReason::SettingsDrift);
             }
         }
 
-        // Mismatch between latch state and what the buck reports.
-        // Active expects ON: any OFF means the buck self-disabled
-        // (hardware OVP/OCP, panel toggle, missing PROTECT read).
-        // Pending expects OFF: any ON means our boot disable / S_INI=0
-        // didn't stick — fail closed rather than trust unknown
-        // regulation.
+        // 2. Latch state vs. what OUTPUT_EN reports. Regulating expects ON:
+        //    any OFF means the buck self-disabled (its own hardware OVP/OCP,
+        //    a panel toggle). Pending expects OFF: an ON means our boot
+        //    disable / S_INI=0 didn't stick.
         //
-        // LVP (input UVLO) and OTP (over-temp) are exceptions: the buck
-        // is healthy, just waiting on a sensor-side condition to clear.
-        // Drop back to Pending and let the normal bring-up re-enable
-        // when the cause is gone. A multi-hour outage would otherwise
-        // require manual reboot. The XY7025 may also auto-re-enable
-        // OUTPUT_EN itself once the cause clears (these are sensor-driven
-        // protections, not true latches), so seeing On while waiting in
-        // ProtectRecovery is the expected recovery — snap to Active
-        // without latching. Setpoints are unchanged through the wait
-        // (drift check above just verified them), so regulation is at
-        // known targets either way.
-        match (pending_reason, p.output) {
-            (None, Some(BuckOutput::Off { cause: Lvp | Otp })) => {
-                self.latch = LatchState::Pending {
-                    reason: PendingReason::ProtectRecovery,
-                };
-                self.reset_phase_timers();
-                return Action::None;
+        //    LVP (input UVLO) and OTP (over-temp) are sensor-driven, not true
+        //    latches: the buck is healthy and waiting on a condition to
+        //    clear, and it may re-enable OUTPUT_EN by itself once it does.
+        //    So we step back to Pending and treat a later ON as the expected
+        //    recovery. Setpoints are untouched through the wait — check 1
+        //    just verified them — so regulation resumes at known targets.
+        match (mode, p.output) {
+            (
+                Mode::Regulating,
+                Some(BuckOutput::Off {
+                    cause: cause @ (Lvp | Otp),
+                }),
+            ) => {
+                return Verdict::EnterProtectRecovery(cause);
             }
-            (None, Some(BuckOutput::Off { cause })) => {
-                return self.latch(FaultReason::OutputUnexpectedlyOff(cause));
+            (Mode::Regulating, Some(BuckOutput::Off { cause })) => {
+                return Verdict::Latch(FaultReason::OutputUnexpectedlyOff(cause));
             }
-            (Some(PendingReason::ProtectRecovery), Some(BuckOutput::On)) => {
-                self.latch = LatchState::Active {
-                    pending_voltage: None,
-                };
-                return Action::None;
+            (Mode::Pending(PendingReason::ProtectRecovery), Some(BuckOutput::On)) => {
+                return Verdict::ResumeRegulating;
             }
-            // PendingReason::Boot + buck On: boot_sequence wrote
-            // set_output(false) and verified OUTPUT_EN=0, so an ON
-            // reading is a real anomaly (firmware bug, panel toggle,
-            // EMI on the button GPIO) — latch.
-            (Some(PendingReason::Boot), Some(BuckOutput::On)) => {
-                return self.latch(FaultReason::OutputOnInPending);
+            // Boot + ON: `boot_sequence` wrote set_output(false) and verified
+            // OUTPUT_EN=0, so an ON reading is a real anomaly (firmware bug,
+            // panel toggle, EMI on the button GPIO). Unlike every other
+            // Pending check there IS something sourcing to disable, so this
+            // one latches.
+            (Mode::Pending(PendingReason::Boot), Some(BuckOutput::On)) => {
+                return Verdict::Latch(FaultReason::OutputOnInPending);
             }
             _ => {}
         }
 
+        // 3. Modbus health. `p.setpoints.is_none()` doubles as the read-failed
+        //    signal — a successful read means the link is up.
         if self
             .modbus_err
             .step(p.setpoints.is_none(), elapsed, MODBUS_UNHEALTHY_TIMEOUT)
         {
-            return self.latch(FaultReason::ModbusUnhealthy);
+            return mode.fault(FaultReason::ModbusUnhealthy, InhibitReason::ModbusUnhealthy);
         }
 
-        // NaN-poisoned samples are treated as missing — they can't safely
-        // drive OV or the phase machine, and the sensor-stale debounce is
-        // the right place to fail closed.
+        // 4. Battery sample freshness. NaN/Inf counts as missing: a sensor
+        //    reporting non-finite values can't supervise charging, and
+        //    silently ignoring it would let a stuck sensor mask overvoltage.
         let battery = p
             .battery
             .filter(|b| b.voltage.is_finite() && b.current.is_finite());
@@ -694,57 +867,63 @@ impl ChargeSupervisor {
             .battery_missing
             .step(battery.is_none(), elapsed, BATTERY_MISSING_TIMEOUT)
         {
-            return self.latch(FaultReason::BatterySensorStale);
+            return mode.fault(
+                FaultReason::BatterySensorStale,
+                InhibitReason::BatterySensorStale,
+            );
         }
         let Some(b) = battery else {
-            return Action::None;
+            return Verdict::Inhibit(InhibitReason::NoBatterySample);
         };
 
-        // OV is undebounced in Pending — a pack already over the threshold
-        // at boot must never see EnableOutput. In Active the 3 s debounce
-        // filters transients caused by switching noise / load steps. Always
-        // step the debouncer so its state stays coherent for Active.
+        // 5. Overvoltage. Regulating needs the 3 s debounce so switching
+        //    noise and load steps don't trip a healthy charge. Pending needs
+        //    none: a single sample over the line is reason enough not to
+        //    energise, and since that only inhibits, one noisy reading can no
+        //    longer strand the unit off until a reboot.
         let ov = b.voltage > self.profile.absorb_v + OV_MARGIN_V;
         let ov_debounced = self.ov.step(ov, elapsed, OV_DURATION);
-        if ov_debounced || (pending_reason.is_some() && ov) {
-            return self.latch(FaultReason::Overvoltage);
+        if mode.latches() {
+            if ov_debounced {
+                return Verdict::Latch(FaultReason::Overvoltage);
+            }
+        } else if ov {
+            return Verdict::Inhibit(InhibitReason::Overvoltage);
         }
 
-        // All safety checks clear. In Pending we haven't enabled output yet
-        // — emit EnableOutput and stay Pending until the caller acks.
-        // Phase machine doesn't run yet (output is OFF, no current
-        // measurement is meaningful).
-        //
-        // Require at least one successful setpoint readback before
-        // energizing — `boot_sequence` already verified the writes, but
-        // demanding fresh closed-loop confirmation here means we never
-        // ask for output-on until the Modbus link is demonstrably alive.
-        // The modbus_err debounce above eventually fails closed on
-        // sustained read failures, but takes 5 s; this gate avoids
-        // emitting EnableOutput in the meantime.
-        if pending_reason.is_some() {
+        // 6. Bring-up-only gates. Not faults — they say "not yet", and only
+        //    mean anything while the output is off.
+        if matches!(mode, Mode::Pending(_)) {
+            // Demand a fresh setpoint readback before energising.
+            // `boot_sequence` already verified the writes, but requiring
+            // closed-loop confirmation here means we never ask for output-on
+            // until the link is demonstrably alive. Check 3 eventually
+            // inhibits on sustained failure, but takes 5 s; this covers the gap.
             if p.setpoints.is_none() {
-                return Action::None;
+                return Verdict::Inhibit(InhibitReason::ModbusUnhealthy);
             }
-            // Don't try to enable while the buck is still holding on a
-            // transient protection — set_output(true) would succeed at
-            // the Modbus layer but the buck would stay off, and we'd
-            // flap EnableOutput on every poll. Wait for LVP/OTP to clear.
-            if matches!(p.output, Some(BuckOutput::Off { cause: Lvp | Otp })) {
-                return Action::None;
+            // Enabling into a live LVP/OTP hold would succeed at the Modbus
+            // layer while the buck stayed off, flapping EnableOutput every poll.
+            if let Some(BuckOutput::Off {
+                cause: cause @ (Lvp | Otp),
+            }) = p.output
+            {
+                return Verdict::Inhibit(InhibitReason::BuckProtection(cause));
             }
-            // Output has been OFF through Pending, so `b.voltage` is the
-            // pack's resting voltage — the true SoC signal. Below the CV
-            // plateau ⇒ not full ⇒ caller acks with resume_absorb=true.
-            let resume_absorb = !self.at_cv_plateau(b.voltage);
-            return Action::EnableOutput { resume_absorb };
         }
 
-        // Re-emit UpdateVoltage until the caller acks the previous one.
-        // The phase machine and absorb-cap don't run while a write is in
-        // flight — drift check keeps matching the old V_SET (since
-        // `target_voltage` reflects the still-current phase), and the
-        // caller retries on every tick by writing again.
+        Verdict::Clear(b)
+    }
+
+    /// Active arm: output is on and every safety check just cleared. Runs the
+    /// deferred V_SET write, then the Float-Absorb phase machine and the
+    /// absorb time cap.
+    fn regulate(&mut self, b: BatterySample, elapsed: Duration) -> Action {
+        // Re-emit UpdateVoltage until the caller acks the previous one. The
+        // phase machine and absorb cap don't run while a write is in flight —
+        // the drift check keeps matching the old V_SET (since `target_voltage`
+        // reflects the still-current phase), and the caller retries on every
+        // tick by writing again.
         if let LatchState::Active {
             pending_voltage: Some(next),
         } = self.latch
@@ -767,12 +946,12 @@ impl ChargeSupervisor {
         };
         if next != self.phase {
             // Defer the phase commit until the caller acks — keeps
-            // `target_voltage` matching the buck's actual V_SET so a
-            // failed write doesn't trigger SettingsDrift on the next
-            // tick. Caller invokes `ack_voltage_update` on success.
-            self.latch = LatchState::Active {
+            // `target_voltage` matching the buck's actual V_SET so a failed
+            // write doesn't trigger SettingsDrift on the next tick. Caller
+            // invokes `ack_voltage_update` on success.
+            self.set_latch(LatchState::Active {
                 pending_voltage: Some(next),
-            };
+            });
             return self.update_voltage_for(next);
         }
 
@@ -786,11 +965,26 @@ impl ChargeSupervisor {
         Action::None
     }
 
+    /// Single write point for `self.latch`. Every transition routes through
+    /// here so there is one place to assert on, and one place a transition
+    /// log would hook into.
+    fn set_latch(&mut self, next: LatchState) {
+        // Tripped is absorbing — recovery is reboot-only. `ack_disable`
+        // mutates its `acked` flag in place rather than coming through here,
+        // so reaching this from Tripped means something tried to leave it.
+        debug_assert!(
+            !matches!(self.latch, LatchState::Tripped { .. }),
+            "attempted to leave Tripped"
+        );
+        self.latch = next;
+    }
+
     fn latch(&mut self, reason: FaultReason) -> Action {
-        self.latch = LatchState::Tripped {
+        self.inhibit = None;
+        self.set_latch(LatchState::Tripped {
             reason,
             acked: false,
-        };
+        });
         Action::DisableOutput(reason)
     }
 }

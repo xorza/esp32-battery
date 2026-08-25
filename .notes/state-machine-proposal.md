@@ -22,7 +22,10 @@ are fixable in isolation:
    already off. Latching there buys no safety and costs availability —
    on a UPS, that means the load runs on battery until someone reboots it.
 
-Ranked by value: **P1 > P3 > P4 > P2 > P5 > P6**.
+Ranked by value: **P1 > P3 > P4 > P2 > P5 > P6 > P7**.
+
+**P3 and P4 are done** — landed together, 174 host tests green. The
+remaining open items are P1, P2, P5, P6 and P7.
 
 ---
 
@@ -127,6 +130,30 @@ the supervisor simply does not emit from captive phases.
 
 ---
 
+### What shipped
+
+- `Mode { Pending(PendingReason), Regulating }` replaces the
+  `Option<PendingReason>` that was read as an "am I Pending?" flag.
+- `safety_verdict(&p, elapsed, mode) -> Verdict` holds the six ordered
+  checks; `tick` is now a dispatcher over `Clear / Inhibit / Latch /
+  EnterProtectRecovery / ResumeRegulating`, and the Active arm moved to
+  `regulate()`.
+- `Mode::fault(latched, inhibited)` is P4 in one predicate — the same
+  condition disables a sourcing buck and only blocks bring-up of an idle
+  one. `OutputOnInPending` stays a latch, because there the output
+  really is on.
+- OV in `Pending` no longer latches on one sample; it inhibits from the
+  first sample and lifts when the pack drops back under
+  `absorb_v + OV_MARGIN_V`. Same for `SettingsDrift`, `ModbusUnhealthy`
+  and `BatterySensorStale`.
+- All six `self.latch = ...` writes route through `set_latch()`, which
+  `debug_assert!`s that nothing leaves `Tripped`.
+- New `InhibitReason` with `label()` + `Display`, surfaced through
+  `SensorData::charge_inhibit` to `/api` as `inhibit` /
+  `inhibit_message`, mirroring `fault` / `fault_message`.
+- `drift_outranks_overvoltage_while_regulating` pins the check ordering;
+  the three former Pending-latch tests now assert inhibit-and-recover.
+
 ## P2 — Replace the panic-enforced ack protocol with linear tickets
 
 **Problem.** Three `panic!`s guard the ack protocol
@@ -169,7 +196,7 @@ type errors. Call sites in `xy.rs` barely change.
 
 ---
 
-## P3 — Separate the safety gauntlet from the mode machine
+## P3 — Separate the safety gauntlet from the mode machine — DONE
 
 **Problem.** `tick` runs eight checks in a fixed order, and that order is
 load-bearing: drift → output-mismatch → modbus-health → battery-stale →
@@ -218,7 +245,7 @@ log, for free.
 
 ---
 
-## P4 — Latch only when there is something to disable
+## P4 — Latch only when there is something to disable — DONE
 
 **Problem, and this is the safety one.** `Pending` means *the buck output
 is off and we haven't decided it's safe to turn on*. From that state, the
@@ -364,7 +391,7 @@ is not worth the purity.
 
 | Step | Work | Why here |
 |---|---|---|
-| P3 + P4 | One file, mechanical | Biggest readability and safety win per line changed; P4 needs P3's `Verdict` |
+| ~~P3 + P4~~ | **Done** | Landed as one pass: `Mode`, `Verdict`, `safety_verdict`, `set_latch`, `InhibitReason`, wired to `/api` |
 | P2 + P7(a) | One file, mechanical | Same call sites as P3; do them in the same pass |
 | P5 | Small | Needs P3's single setter to exist |
 | P6 | Small, needs dep approval | Needs the above to be worth proving |

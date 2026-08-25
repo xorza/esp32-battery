@@ -8,7 +8,7 @@ mod history;
 
 pub use history::HISTORY_CAPACITY;
 
-use crate::charging::{FaultReason, Phase};
+use crate::charging::{FaultReason, InhibitReason, Phase};
 use history::History;
 
 // --- Sample shapes ----------------------------------------------------------
@@ -146,9 +146,16 @@ pub struct SensorData {
     /// Pending bring-up / latched off. Written by the XY supervisor each tick.
     pub charge_phase: Option<Phase>,
     /// Latched supervisor fault, if any. `None` during normal operation;
-    /// `Some(reason)` while the buck is being held off. The fault stays set
-    /// until a reboot (or, for recoverable causes, a successful restart).
+    /// `Some(reason)` once the buck has been latched off, and it stays set
+    /// until a reboot. Conditions that recover on their own report through
+    /// `charge_inhibit` instead and never reach this field.
     pub charge_fault: Option<FaultReason>,
+    /// Why the supervisor is holding the buck off without having latched.
+    /// `None` while regulating normally or once a fault has latched. Unlike
+    /// `charge_fault` this self-clears, so it distinguishes "waiting for the
+    /// input rail" from "the INA228 is dead" — both of which otherwise look
+    /// like a dark output with no phase.
+    pub charge_inhibit: Option<InhibitReason>,
 }
 
 impl Default for SensorData {
@@ -166,6 +173,7 @@ impl SensorData {
             ps_offline: false,
             charge_phase: None,
             charge_fault: None,
+            charge_inhibit: None,
         }
     }
 

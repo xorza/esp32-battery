@@ -1118,25 +1118,55 @@ fn full_pack_stays_float_after_bringup() {
 }
 
 #[test]
-fn pending_overvolt_latches_without_debounce() {
-    // Pack already over the OV threshold at boot → MUST latch on the
-    // first tick, not wait out the 3 s OV debounce. The whole point of
-    // Pending is to never enable output in an unsafe state.
+fn pending_overvolt_inhibits_from_first_sample_and_clears() {
+    // Pack already over the OV threshold at boot must never see
+    // EnableOutput — from the very first sample, with no 3 s debounce.
+    // But the output is already off, so there is nothing to disable:
+    // this inhibits rather than latching, and lifts on its own once the
+    // pack comes back under the line.
+    let absorb = lfp_4s().absorb_v; // 14.4
+    let trip = absorb + OV_MARGIN_V; // 14.6
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let absorb = lfp_4s().absorb_v;
-    let a = ok_tick(&mut s, b(absorb + OV_MARGIN_V + 0.5, -0.1), TICK);
-    assert!(matches_disable(&a, FaultReason::Overvoltage));
+
+    let a = ok_tick(&mut s, b(trip + 0.5, -0.1), TICK);
+    assert!(matches!(a, Action::None));
+    assert_eq!(s.inhibit(), Some(InhibitReason::Overvoltage));
+    assert_eq!(s.fault(), None);
+
+    // Hold it over the line well past OV_DURATION: still no latch. The
+    // debounced trip belongs to the regulating path only.
+    for _ in 0..(OV_DURATION.as_secs() * 3) {
+        let a = ok_tick(&mut s, b(trip + 0.5, -0.1), TICK);
+        assert!(matches!(a, Action::None));
+        assert_eq!(s.fault(), None);
+    }
+
+    // 14.55 is under the 14.6 trip and at/above the CV plateau
+    // (14.4 - 0.1), so the pack reads as full: bring-up parks in Float.
+    let a = ok_tick(&mut s, b(trip - 0.05, -0.1), TICK);
+    assert!(matches!(
+        a,
+        Action::EnableOutput {
+            resume_absorb: false
+        }
+    ));
+    assert_eq!(s.inhibit(), None);
 }
 
 #[test]
-fn pending_drift_latches_without_enabling() {
-    let mut s = ChargeSupervisor::new(lfp_4s());
+fn drift_outranks_overvoltage_while_regulating() {
+    // Both conditions true on the same tick. The gauntlet checks
+    // setpoint drift (1) before overvoltage (5), and that precedence is
+    // load-bearing: drift means we do not know what the buck is
+    // regulating to, which is the more urgent of the two.
+    let mut s = active(lfp_4s());
+    let absorb = lfp_4s().absorb_v;
     let p = PollResult {
         setpoints: Some(Setpoints {
             v_set: 12.0,
             i_set: 10.0,
         }),
-        ..expected_poll(&s, b(OK_V, -0.1))
+        ..expected_poll(&s, b(absorb + OV_MARGIN_V + 0.5, -0.1))
     };
     assert!(matches_disable(
         &s.tick(p, TICK),
@@ -1145,16 +1175,66 @@ fn pending_drift_latches_without_enabling() {
 }
 
 #[test]
-fn pending_no_battery_waits_then_latches() {
-    // No battery sample → no enable. After BATTERY_MISSING_TIMEOUT,
-    // BatterySensorStale latches.
+fn pending_drift_inhibits_without_enabling() {
+    // Drift while the output is off blocks bring-up but latches nothing
+    // — and a return to the commanded setpoints releases it.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p = PollResult {
+        setpoints: Some(Setpoints {
+            v_set: 12.0,
+            i_set: 10.0,
+        }),
+        ..expected_poll(&s, b(OK_V, -0.1))
+    };
+    assert!(matches!(s.tick(p, TICK), Action::None));
+    assert_eq!(s.inhibit(), Some(InhibitReason::SettingsDrift));
+    assert_eq!(s.fault(), None);
+
+    // OK_V (13.5) is below the CV plateau, so the pack is not full and
+    // bring-up resumes Absorb.
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(
+        a,
+        Action::EnableOutput {
+            resume_absorb: true
+        }
+    ));
+    assert_eq!(s.inhibit(), None);
+}
+
+#[test]
+fn pending_no_battery_inhibits_indefinitely() {
+    // No battery sample means no enable, ever — but with the output
+    // already off there is nothing to disable, so a dead sensor at boot
+    // no longer strands the unit behind a reboot. The inhibit reason
+    // sharpens from "none yet" to "stale" once the debounce fires.
     let mut s = ChargeSupervisor::new(lfp_4s());
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
         let a = ok_tick(&mut s, None, TICK);
         assert!(matches!(a, Action::None));
+        assert_eq!(s.inhibit(), Some(InhibitReason::NoBatterySample));
     }
+    // 10th tick: elapsed reaches BATTERY_MISSING_TIMEOUT.
     let a = ok_tick(&mut s, None, TICK);
-    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+    assert!(matches!(a, Action::None));
+    assert_eq!(s.inhibit(), Some(InhibitReason::BatterySensorStale));
+    assert_eq!(s.fault(), None);
+
+    // Well past the timeout it still only waits.
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() * 2) {
+        assert!(matches!(ok_tick(&mut s, None, TICK), Action::None));
+        assert_eq!(s.fault(), None);
+    }
+
+    // Sensor comes back: bring-up proceeds on the next tick.
+    let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    assert!(matches!(
+        a,
+        Action::EnableOutput {
+            resume_absorb: true
+        }
+    ));
+    assert_eq!(s.inhibit(), None);
 }
 
 #[test]
