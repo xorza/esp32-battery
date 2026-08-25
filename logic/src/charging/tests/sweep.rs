@@ -116,6 +116,7 @@ fn invariants_hold_under_randomized_input() {
         // UpdateVoltage is committed.
         let mut committed_v = profile.float_v;
         let mut latched = false;
+        let mut last_fault = None;
 
         for tick in 0..TICKS {
             let p = random_poll(&mut rng, &s);
@@ -138,11 +139,17 @@ fn invariants_hold_under_randomized_input() {
                 ),
             }
 
-            // A latched fault is terminal and supersedes any inhibit.
-            assert!(
-                !(s.fault().is_some() && s.inhibit().is_some()),
-                "seed {seed} tick {tick}: fault and inhibit both set"
-            );
+            // A fault is terminal, so it never clears once set. It does not
+            // supersede an inhibit — a parked supervisor waiting out a
+            // protection carries both — but nothing may un-fault.
+            if let Some(before) = last_fault {
+                assert_eq!(
+                    s.fault(),
+                    Some(before),
+                    "seed {seed} tick {tick}: a latched fault changed or cleared"
+                );
+            }
+            last_fault = s.fault();
 
             // A latch is absorbing. The output may still need disabling
             // again — a buck that resurfaces gets told twice — but nothing

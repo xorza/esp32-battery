@@ -47,10 +47,14 @@ pub struct ChargeStatus {
     /// Conditions that recover on their own report through
     /// [`Self::inhibit`] instead and never reach this field.
     pub fault: Option<FaultReason>,
-    /// Why the supervisor is holding the buck off without having latched.
-    /// `None` while regulating normally or once a fault has latched. Unlike
-    /// [`Self::fault`] this self-clears, so it distinguishes "waiting for the
-    /// input rail" from "the INA228 is dead" — both of which otherwise look
-    /// like a dark output with no phase.
+    /// Why the supervisor is holding the buck off right now. `None` while
+    /// regulating normally. Unlike [`Self::fault`] this self-clears, so it
+    /// distinguishes "waiting for the input rail" from "the INA228 is
+    /// dead" — both of which otherwise look like a dark output with no
+    /// phase.
+    ///
+    /// Can be set alongside [`Self::fault`]: a parked unit that then loses
+    /// its rail is waiting one out with its charge already stopped. The
+    /// pair reads as "charging over, and currently down on <cause>".
     pub inhibit: Option<InhibitReason>,
 }

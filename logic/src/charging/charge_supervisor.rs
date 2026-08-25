@@ -123,10 +123,15 @@ impl ChargeSupervisor {
         self.state.parked()
     }
 
-    /// Why the supervisor is holding the buck off without having latched,
-    /// if it is. `None` while regulating normally, and `None` once a fault
-    /// has latched — `fault()` covers that case. Unlike a fault, every
-    /// inhibit clears by itself when its cause does.
+    /// Why the supervisor is holding the buck off right now, if it is.
+    /// `None` while regulating normally. Unlike a fault, every inhibit
+    /// clears by itself when its cause does.
+    ///
+    /// Not mutually exclusive with [`Self::fault`]: a parked supervisor
+    /// whose rail then drops is holding a protection out *and* carrying
+    /// the fault that stopped its charge, and both are worth reporting.
+    /// `fault` says charging is over; this says what the output is waiting
+    /// on this second.
     pub fn inhibit(&self) -> Option<InhibitReason> {
         self.inhibit
     }
@@ -439,12 +444,12 @@ impl ChargeSupervisor {
             // Any other cause is the buck's own hardware OVP/OCP or a panel
             // toggle — it is not coming back on its own.
             (s, Some(BuckOutput::Off { cause })) if s.sourcing() => {
-                // A parked machine does not wait anything out. It is already
-                // in a degraded mode a human has to clear, and the point of
-                // the park — keeping the load fed — is gone the moment the
-                // output drops. Waiting would mean silently resuming a park
-                // whose fault nobody has looked at.
-                if cause.is_self_clearing() && !s.parked() {
+                // Whether this state can wait a protection out is the
+                // table's call, read back rather than decided here: a
+                // sourcing state with no `SelfDisabled` cell has nowhere
+                // to hold and latches instead. `HoldParked` is what lets a
+                // parked unit wait one out without coming back charging.
+                if cause.is_self_clearing() && s.next(ChargeEvent::SelfDisabled).is_some() {
                     self.step(ChargeEvent::SelfDisabled);
                     None
                 } else {

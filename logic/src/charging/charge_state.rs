@@ -27,6 +27,12 @@ pub(crate) enum ChargeState {
     /// As [`ChargeState::HoldFloat`], entered from [`ChargeState::Absorb`],
     /// so the device is still at the absorb target.
     HoldAbsorb,
+    /// As [`ChargeState::HoldFloat`], entered from [`ChargeState::Parked`],
+    /// and resuming to it rather than to `Float`. Without this a parked
+    /// unit that lost its rail would come back charging, undoing a fault
+    /// nobody has looked at — which is why the hold has to remember that
+    /// it was parked, not merely that it held the float target.
+    HoldParked,
     /// Sourcing at the float target, watching for `enter_absorb_a`.
     Float,
     /// Sourcing at the absorb target, watching the taper and clocking
@@ -116,6 +122,12 @@ pub(super) enum ChargeEvent {
 /// bring-up state — every park-class fault is raised from a sourcing path —
 /// and nothing parks *out of* a park, which the supervisor escalates to a
 /// disable instead.
+///
+/// The `SelfDisabled` column doubles as the answer to "can this state wait
+/// a protection out?", which `reconcile` reads back rather than deciding
+/// for itself. `ToParked` is the one sourcing state with no cell: it is
+/// mid-step-down, so the output state a hold would claim is not settled
+/// yet, and it latches instead.
 #[rustfmt::skip]
 const TRANSITIONS: [[Option<ChargeState>; ChargeEvent::COUNT]; ChargeState::COUNT] = {
     const X: Option<ChargeState> = None;
@@ -129,17 +141,19 @@ const TRANSITIONS: [[Option<ChargeState>; ChargeEvent::COUNT]; ChargeState::COUN
     const PRK: Option<ChargeState> = Some(ChargeState::Parked);
     const HLDF: Option<ChargeState> = Some(ChargeState::HoldFloat);
     const HLDA: Option<ChargeState> = Some(ChargeState::HoldAbsorb);
+    const HLDP: Option<ChargeState> = Some(ChargeState::HoldParked);
     [
         //          Fault  Park SelfDis SelfEn Enabled BelowFull TaperUp TaperDn VWritten Disabled
         /* Boot   */ [TRIP,   X,    X,     X,   FLT,     TOA,      X,      X,      X,       X],
         /* HoldF  */ [TRIP,   X,    X,   FLT,   FLT,     TOA,      X,      X,      X,       X],
         /* HoldA  */ [TRIP,   X,    X,   ABS,   ABS,     ABS,      X,      X,      X,       X],
+        /* HoldP  */ [TRIP,   X,    X,   PRK,   PRK,     PRK,      X,      X,      X,       X],
         /* Float  */ [TRIP, PRK, HLDF,     X,     X,       X,    TOA,      X,      X,       X],
         /* Absorb */ [TRIP, TOP, HLDA,     X,     X,       X,      X,    TOF,      X,       X],
         /* ToAbs  */ [TRIP, PRK, HLDF,     X,     X,       X,      X,      X,    ABS,       X],
         /* ToFlt  */ [TRIP, TOP, HLDA,     X,     X,       X,      X,      X,    FLT,       X],
         /* ToPark */ [TRIP,   X,    X,     X,     X,       X,      X,      X,    PRK,       X],
-        /* Parked */ [TRIP,   X,    X,     X,     X,       X,      X,      X,      X,       X],
+        /* Parked */ [TRIP,   X, HLDP,     X,     X,       X,      X,      X,      X,       X],
         /* Tripng */ [   X,   X,    X,     X,     X,       X,      X,      X,      X,    LTCH],
         /* Latchd */ [   X,   X,    X,  TRIP,     X,       X,      X,      X,      X,       X],
     ]
@@ -169,11 +183,17 @@ impl ChargeState {
 
     /// Output is off and the supervisor is deciding whether to bring it up.
     pub(super) fn bringing_up(self) -> bool {
-        matches!(self, Self::Boot | Self::HoldFloat | Self::HoldAbsorb)
+        matches!(
+            self,
+            Self::Boot | Self::HoldFloat | Self::HoldAbsorb | Self::HoldParked
+        )
     }
 
-    /// Parked on a fault, or on the way there. Still sourcing — the load is
-    /// fed — but charging has stopped and will not resume without a reboot.
+    /// Parked on a fault, or on the way there: the buck is up and the load
+    /// is fed, but charging has stopped and will not resume without a
+    /// reboot. Deliberately excludes `HoldParked`, where the output is
+    /// down and the load is *not* fed — that is the distinction the
+    /// dashboard's `parked` flag exists to draw.
     pub(super) fn parked(self) -> bool {
         matches!(self, Self::ToParked | Self::Parked)
     }
@@ -183,7 +203,7 @@ impl ChargeState {
     /// `Boot` is a fault, which is the whole reason the two are distinct
     /// states rather than one "output off" flag.
     pub(super) fn holding(self) -> bool {
-        matches!(self, Self::HoldFloat | Self::HoldAbsorb)
+        matches!(self, Self::HoldFloat | Self::HoldAbsorb | Self::HoldParked)
     }
 
     /// Which target the device's V_SET is holding — what the per-tick
@@ -195,9 +215,12 @@ impl ChargeState {
             // A retarget's ticket is uncommitted until the write lands, so
             // `To*` names the target the device still holds, not the one
             // it is moving to.
-            Self::Boot | Self::HoldFloat | Self::Float | Self::ToAbsorb | Self::Parked => {
-                Some(Phase::Float)
-            }
+            Self::Boot
+            | Self::HoldFloat
+            | Self::HoldParked
+            | Self::Float
+            | Self::ToAbsorb
+            | Self::Parked => Some(Phase::Float),
             Self::HoldAbsorb | Self::Absorb | Self::ToFloat | Self::ToParked => Some(Phase::Absorb),
             Self::Tripping | Self::Latched => None,
         }
@@ -384,7 +407,7 @@ mod tests {
     #[test]
     fn transitions_log_the_move_they_mean() {
         use ChargeState::*;
-        let cases: [(ChargeState, ChargeState, Option<ChargeTransition>); 14] = [
+        let cases: [(ChargeState, ChargeState, Option<ChargeTransition>); 16] = [
             (Boot, Float, Some(ChargeTransition::Energised)),
             (Boot, ToAbsorb, Some(ChargeTransition::Energised)),
             (HoldFloat, Float, Some(ChargeTransition::ProtectCleared)),
@@ -405,6 +428,10 @@ mod tests {
             (Absorb, ToParked, Some(ChargeTransition::Parked)),
             (Float, Parked, Some(ChargeTransition::Parked)),
             (ToParked, Parked, None),
+            // A hold out of a park is the same protection story as any
+            // other hold, and resuming it is not a fresh park.
+            (Parked, HoldParked, Some(ChargeTransition::ProtectHold)),
+            (HoldParked, Parked, Some(ChargeTransition::ProtectCleared)),
         ];
         for (from, to, want) in cases {
             assert_eq!(from.logged_as(to), want, "{from:?} → {to:?}");
