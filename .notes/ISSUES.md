@@ -1,16 +1,17 @@
 # Open issues
 
-- `ChargeState::Latched` returns `Action::None` on every subsequent tick. If
-  the buck's output comes back on after a latch (front-panel toggle, a
-  device-side re-enable), the supervisor never notices and never re-disables.
+- `reconcile` answers `Action::None` for `ChargeState::Latched` whatever the
+  buck reports. If its output comes back on after a latch (front-panel toggle,
+  a device-side re-enable), the supervisor never notices and never
+  re-disables.
 
 - `MAX_ABSORB` is clocked with `Debounce::step`, so any tick where the pack
   leaves the `ABSORB_CV_BAND_V` window zeroes the accumulator. A load that
   periodically pulls the buck out of CV keeps the absorb cap from firing.
   There is no cap on total time in Absorb, and none at all on the CC ramp.
 
-- Protection holds are unbounded: `Verdict::SelfDisabled` and
-  `Verdict::SelfEnabled` can alternate indefinitely. An input rail that
+- Protection holds are unbounded: `ChargeEvent::SelfDisabled` and
+  `ChargeEvent::SelfEnabled` can alternate indefinitely. An input rail that
   sags under charge current gives a repeating LVP hold/resume loop with no
   flap limit and no back-off on `regulation_a`.
 
@@ -23,10 +24,6 @@
   charge current plus the UPS load, and the load does not appear in the
   derivation. A load surge trips device OCP, which latches
   `OutputUnexpectedlyOff` and drops the load onto the pack until a reboot.
-
-- `Verdict::SelfEnabled` is returned from check 2 of `safety_verdict`,
-  ahead of the modbus-health, battery-freshness and overvoltage checks, so the
-  supervisor resumes sourcing for one tick without those having run.
 
 - No pack temperature reaches the supervisor. Charging below 0 °C is not
   inhibited for any chemistry. The buck's OTP covers its own die only.

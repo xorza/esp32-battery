@@ -19,7 +19,80 @@ fn self_clearing_protection_drops_to_pending_without_latching() {
         assert!(matches!(a, Action::None), "{cause}");
         assert_eq!(s.fault(), None, "{cause}");
         assert!(s.state().bringing_up(), "{cause}");
+        // Derived by the gauntlet's bring-up gate on the same tick the
+        // hold is entered, not set by hand on the way in.
+        assert_eq!(
+            s.inhibit(),
+            Some(InhibitReason::BuckProtection(cause)),
+            "{cause}"
+        );
     }
+}
+
+/// Reconciliation runs before the gauntlet, so a buck that re-enabled
+/// itself is judged as the sourcing buck it now is — on the tick it
+/// resumes, not the one after. Evaluating first left a whole tick where
+/// the machine said "holding" and the hardware said "sourcing".
+#[test]
+fn resume_is_judged_on_the_tick_it_happens() {
+    // The sensor dies during the hold. With the output off that only
+    // inhibits, however long it lasts; the moment the buck sources again
+    // the very same condition has to latch.
+    let mut s = active(lfp_4s());
+    let p_lvp = poll_with_output(
+        &s,
+        BuckOutput::Off {
+            cause: ProtectionStatus::Lvp,
+        },
+    );
+    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    for _ in 0..BATTERY_MISSING_TIMEOUT.as_secs() {
+        let p = PollResult {
+            battery: None,
+            ..p_lvp
+        };
+        assert!(matches!(s.tick(p, TICK), Action::None), "a hold must not latch");
+    }
+    assert_eq!(s.inhibit(), Some(InhibitReason::BatterySensorStale));
+    assert_eq!(s.fault(), None);
+
+    let p_on = PollResult {
+        battery: None,
+        output: Some(BuckOutput::On),
+        ..p_lvp
+    };
+    assert!(matches_disable(
+        &s.tick(p_on, TICK),
+        FaultReason::BatterySensorStale
+    ));
+}
+
+#[test]
+fn resume_with_drifted_setpoints_latches_rather_than_waiting() {
+    // Drift while the output is off only inhibits — there is nothing to
+    // disable. But the buck reporting ON removes that option: something is
+    // sourcing under setpoints we do not recognise, so the resume and the
+    // latch land on the same tick.
+    let mut s = active(lfp_4s());
+    let p_lvp = poll_with_output(
+        &s,
+        BuckOutput::Off {
+            cause: ProtectionStatus::Lvp,
+        },
+    );
+    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    let p_on = PollResult {
+        output: Some(BuckOutput::On),
+        setpoints: Some(Setpoints {
+            v_set: 12.0,
+            i_set: 10.0,
+        }),
+        ..p_lvp
+    };
+    assert!(matches_disable(
+        &s.tick(p_on, TICK),
+        FaultReason::SettingsDrift
+    ));
 }
 
 #[test]

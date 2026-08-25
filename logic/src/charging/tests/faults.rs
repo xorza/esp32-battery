@@ -335,6 +335,44 @@ fn drift_outranks_overvoltage_while_regulating() {
 }
 
 #[test]
+fn output_disagreement_outranks_setpoint_drift() {
+    // Both wrong on the same tick. What OUTPUT_EN is doing is the more
+    // urgent fact of the two: a buck that is off is not regulating to
+    // anything, so "we do not know its setpoints" says strictly less; and a
+    // buck that is on while we believe it off is sourcing under setpoints
+    // we never confirmed, which used to merely *inhibit* on the drift and
+    // go on waiting with the output live.
+    let drifted = Some(Setpoints {
+        v_set: 12.0,
+        i_set: 10.0,
+    });
+
+    let mut s = active(lfp_4s());
+    let p = PollResult {
+        output: Some(BuckOutput::Off {
+            cause: ProtectionStatus::Ocp,
+        }),
+        setpoints: drifted,
+        battery: b(OK_V, -0.1),
+    };
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ocp)
+    ));
+
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p = PollResult {
+        output: Some(BuckOutput::On),
+        setpoints: drifted,
+        battery: b(OK_V, -0.1),
+    };
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::OutputOnInPending
+    ));
+}
+
+#[test]
 fn buck_self_disable_in_active_latches() {
     // Active supervisor + buck reports output OFF (own OVP/OCP/LVP/over-temp
     // tripped, or panel toggled) → latch OutputUnexpectedlyOff.

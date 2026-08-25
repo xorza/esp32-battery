@@ -19,21 +19,15 @@ use crate::charging::{
     MODBUS_UNHEALTHY_TIMEOUT, OV_DURATION, OV_MARGIN_V, SETPOINT_DRIFT_TOL, TRANSITION_BUFFER,
 };
 use crate::error_log::ChargeTransition;
-use xy_modbus::ProtectionStatus;
 use xy_modbus::Setpoints;
 
 /// Outcome of the ordered safety gauntlet, in descending authority: a
-/// `Latch` beats a state change, which beats an `Inhibit`, which beats
-/// `Clear`. `safety_verdict` returns the first one it reaches, so the
-/// order of the checks inside it *is* the precedence.
+/// `Latch` beats an `Inhibit`, which beats `Clear`. `gauntlet` returns the
+/// first one it reaches, so the order of the checks inside it *is* the
+/// precedence.
 enum Verdict {
     /// Disable the buck and stay disabled until a reboot.
     Latch(FaultReason),
-    /// Buck self-disabled on a self-clearing protection while
-    /// regulating — step back to a hold and wait it out.
-    SelfDisabled(ProtectionStatus),
-    /// Buck re-enabled itself once the protection cause cleared.
-    SelfEnabled,
     /// Hold the buck off without latching; re-checked next tick.
     Inhibit(InhibitReason),
     /// Every check passed; carries the validated battery sample so
@@ -257,6 +251,13 @@ impl ChargeSupervisor {
     /// battery sample; `elapsed` is wall time since the previous tick.
     /// Returns the action the caller should take.
     ///
+    /// Two phases, in this order and for a reason. [`Self::reconcile`] asks
+    /// what the buck is *actually* doing and moves the machine to agree
+    /// with it; [`Self::gauntlet`] then asks whether that is safe. Running
+    /// them the other way round evaluates against a state the device has
+    /// already left — which is how a buck that re-enabled itself used to
+    /// resume for a whole tick before anything checked on it.
+    ///
     /// `p.setpoints.is_some()` doubles as the modbus-healthy signal — a
     /// successful read means the link is up. Drift (commanded vs.
     /// reported V_SET / I_SET) latches `SettingsDrift` immediately; no
@@ -268,26 +269,16 @@ impl ChargeSupervisor {
     /// stuck sensor mask overvoltage. Routes through the same
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
-        match self.state {
-            ChargeState::Tripping => {
-                return Action::DisableOutput(DisableTicket {
-                    reason: self
-                        .fault
-                        .expect("Tripping carries the fault that put it there"),
-                });
-            }
-            // Reboot-only recovery: the supervisor parks here.
-            ChargeState::Latched => return Action::None,
-            _ => {}
+        if let Some(a) = self.reconcile(&p) {
+            return a;
         }
 
         // The gauntlet steps debouncers but never writes `self.state`, so
         // the dispatch below still reads the state its verdict was formed
-        // against.
-        let battery = match self.safety_verdict(&p, elapsed) {
+        // against — which `reconcile` has already brought into agreement
+        // with the device.
+        let battery = match self.gauntlet(&p, elapsed) {
             Verdict::Latch(reason) => return self.on_fault(reason),
-            Verdict::SelfDisabled(cause) => return self.on_self_disabled(cause),
-            Verdict::SelfEnabled => return self.on_self_enabled(),
             Verdict::Inhibit(reason) => {
                 self.inhibit = Some(reason);
                 return Action::None;
@@ -319,22 +310,65 @@ impl ChargeSupervisor {
         Action::DisableOutput(DisableTicket { reason })
     }
 
-    /// The buck self-disabled on a cause it clears by itself. Step back to
-    /// the hold for the target it is still holding and wait; there is
-    /// nothing to write, the output is already off.
-    fn on_self_disabled(&mut self, cause: ProtectionStatus) -> Action {
-        self.step(ChargeEvent::SelfDisabled);
-        self.inhibit = Some(InhibitReason::BuckProtection(cause));
-        Action::None
-    }
-
-    /// The buck brought its own output back once the cause cleared.
-    /// Setpoints went untouched through the hold — check 1 verifies that
-    /// every tick — so regulation resumes at known targets.
-    fn on_self_enabled(&mut self) -> Action {
-        self.step(ChargeEvent::SelfEnabled);
-        self.inhibit = None;
-        Action::None
+    /// Bring the machine into agreement with what OUTPUT_EN reports, before
+    /// anything is evaluated against it.
+    ///
+    /// `Some` means the tick is already decided: the state is terminal, or
+    /// the disagreement was itself the fault. `None` means the machine now
+    /// agrees with the device and [`Self::gauntlet`] should run — so a buck
+    /// that just came back on gets *this* tick's safety checks applied to
+    /// it as a sourcing buck, not the next one's.
+    ///
+    /// This is also the only place a state moves before the gauntlet, which
+    /// is what lets the gauntlet document itself as read-only.
+    fn reconcile(&mut self, p: &PollResult) -> Option<Action> {
+        match (self.state, p.output) {
+            // Re-emit until the caller confirms the write; dropping the
+            // ticket is how a failed disable becomes a retry.
+            (ChargeState::Tripping, _) => Some(Action::DisableOutput(DisableTicket {
+                reason: self
+                    .fault
+                    .expect("Tripping carries the fault that put it there"),
+            })),
+            // Reboot-only recovery: the supervisor parks here.
+            (ChargeState::Latched, _) => Some(Action::None),
+            // A self-clearing cause (see `ProtectionPolicy`) is the buck
+            // waiting on a condition rather than failing, and it may
+            // re-enable OUTPUT_EN by itself once the condition lifts. Step
+            // back to the hold for the target it is still holding; the
+            // gauntlet's bring-up gate turns the cause into this tick's
+            // inhibit, so nothing has to set one by hand here.
+            //
+            // Any other cause is the buck's own hardware OVP/OCP or a panel
+            // toggle — it is not coming back on its own.
+            (s, Some(BuckOutput::Off { cause })) if s.sourcing() => {
+                if cause.is_self_clearing() {
+                    self.step(ChargeEvent::SelfDisabled);
+                    None
+                } else {
+                    Some(self.on_fault(FaultReason::OutputUnexpectedlyOff(cause)))
+                }
+            }
+            // The buck brought its own output back. Setpoints went
+            // untouched through the hold — the gauntlet's first check
+            // verifies that on this very tick — so regulation resumes at
+            // known targets. This is why `Boot` and `Hold*` are separate
+            // states rather than one "output off" flag: the same reading
+            // means recovery from one and an anomaly from the other.
+            (s, Some(BuckOutput::On)) if s.holding() => {
+                self.step(ChargeEvent::SelfEnabled);
+                None
+            }
+            // `boot_sequence` wrote set_output(false) and verified
+            // OUTPUT_EN=0, so an ON reading here is a real anomaly
+            // (firmware bug, panel toggle, EMI on the button GPIO). Unlike
+            // every other bring-up condition there IS something sourcing
+            // under setpoints we have not confirmed, so this one latches.
+            (ChargeState::Boot, Some(BuckOutput::On)) => {
+                Some(self.on_fault(FaultReason::OutputOnInPending))
+            }
+            _ => None,
+        }
     }
 
     /// The latch/inhibit rule in one place: the same condition disables a
@@ -347,21 +381,24 @@ impl ChargeSupervisor {
         }
     }
 
-    /// The ordered safety gauntlet. **The order of the checks below is the
-    /// specification** — each one may only be moved past checks it commutes
-    /// with, and `tests/` pins the precedence where two can fire on the
-    /// same tick.
+    /// The ordered safety gauntlet, run against the state
+    /// [`Self::reconcile`] has already agreed with the device. **The order
+    /// of the checks below is the specification** — each one may only be
+    /// moved past checks it commutes with, and `tests/` pins the precedence
+    /// where two can fire on the same tick.
     ///
     /// Whether a failure latches or merely inhibits is decided by the state
     /// and nothing else. A fault latches only while the buck is sourcing;
     /// in a bring-up state the output is already off, so a latch would
-    /// disable nothing and cost a reboot to clear. `OutputOnInPending` is
-    /// the one exception, because there the output really is on.
+    /// disable nothing and cost a reboot to clear. The one condition that
+    /// latches an idle machine is a buck reporting output ON, and that
+    /// belongs to `reconcile` rather than here — by the time the gauntlet
+    /// runs, "not sourcing" really does mean nothing is sourcing.
     ///
     /// Debouncers are stepped in both cases so their windows stay coherent
     /// across a move between them. `self.state` is only read here, never
     /// written — `tick` relies on that to dispatch on it afterwards.
-    fn safety_verdict(&mut self, p: &PollResult, elapsed: Duration) -> Verdict {
+    fn gauntlet(&mut self, p: &PollResult, elapsed: Duration) -> Verdict {
         // 1. Commanded vs. reported setpoints. No debounce: the read itself
         //    succeeded, so a mismatch is the device disagreeing with us
         //    rather than transport noise.
@@ -375,38 +412,7 @@ impl ChargeSupervisor {
             }
         }
 
-        // 2. State vs. what OUTPUT_EN reports. Sourcing expects ON: any OFF
-        //    means the buck self-disabled (its own hardware OVP/OCP, a
-        //    panel toggle). Boot expects OFF: an ON means our boot disable
-        //    / S_INI=0 didn't stick.
-        //
-        //    A self-clearing cause (see `ProtectionPolicy`) is the buck
-        //    waiting on a condition rather than failing, and it may
-        //    re-enable OUTPUT_EN by itself once the condition lifts. So we
-        //    step back to a hold and treat a later ON as the expected
-        //    recovery — which is exactly why `Boot` and `Hold*` are
-        //    separate states rather than one "output off" flag.
-        match (self.state, p.output) {
-            (s, Some(BuckOutput::Off { cause })) if s.sourcing() => {
-                return if cause.is_self_clearing() {
-                    Verdict::SelfDisabled(cause)
-                } else {
-                    Verdict::Latch(FaultReason::OutputUnexpectedlyOff(cause))
-                };
-            }
-            (s, Some(BuckOutput::On)) if s.holding() => return Verdict::SelfEnabled,
-            // Boot + ON: `boot_sequence` wrote set_output(false) and
-            // verified OUTPUT_EN=0, so an ON reading is a real anomaly
-            // (firmware bug, panel toggle, EMI on the button GPIO). Unlike
-            // every other bring-up check there IS something sourcing to
-            // disable, so this one latches.
-            (ChargeState::Boot, Some(BuckOutput::On)) => {
-                return Verdict::Latch(FaultReason::OutputOnInPending);
-            }
-            _ => {}
-        }
-
-        // 3. Modbus health. `p.setpoints.is_none()` doubles as the read-failed
+        // 2. Modbus health. `p.setpoints.is_none()` doubles as the read-failed
         //    signal — a successful read means the link is up.
         if self
             .modbus_err
@@ -416,7 +422,7 @@ impl ChargeSupervisor {
                 .fault_or_inhibit(FaultReason::ModbusUnhealthy, InhibitReason::ModbusUnhealthy);
         }
 
-        // 4. Battery sample freshness. NaN/Inf counts as missing: a sensor
+        // 3. Battery sample freshness. NaN/Inf counts as missing: a sensor
         //    reporting non-finite values can't supervise charging, and
         //    silently ignoring it would let a stuck sensor mask overvoltage.
         let battery = p
@@ -435,7 +441,7 @@ impl ChargeSupervisor {
             return Verdict::Inhibit(InhibitReason::NoBatterySample);
         };
 
-        // 5. Overvoltage. Regulating needs the 3 s debounce so switching
+        // 4. Overvoltage. Regulating needs the 3 s debounce so switching
         //    noise and load steps don't trip a healthy charge. Bring-up
         //    needs none: a single sample over the line is reason enough not
         //    to energise, and since that only inhibits, one noisy reading
@@ -450,13 +456,13 @@ impl ChargeSupervisor {
             return Verdict::Inhibit(InhibitReason::Overvoltage);
         }
 
-        // 6. Bring-up-only gates. Not faults — they say "not yet", and only
+        // 5. Bring-up-only gates. Not faults — they say "not yet", and only
         //    mean anything while the output is off.
         if self.state.bringing_up() {
             // Demand a fresh setpoint readback before energising.
             // `boot_sequence` already verified the writes, but requiring
             // closed-loop confirmation here means we never ask for output-on
-            // until the link is demonstrably alive. Check 3 eventually
+            // until the link is demonstrably alive. Check 2 eventually
             // inhibits on sustained failure, but takes 5 s; this covers the gap.
             if p.setpoints.is_none() {
                 return Verdict::Inhibit(InhibitReason::ModbusUnhealthy);
