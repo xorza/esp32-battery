@@ -254,16 +254,10 @@ impl<'d> MixedWifi<'d> {
     /// while the STA half retries against the new SSID.
     pub fn set_sta_creds(&mut self, creds: &WifiCredentials) {
         info!("Updating STA creds for '{}' (live)", creds.ssid);
-        self.driver
-            .wifi
-            .set_configuration(&Configuration::Mixed(sta_config(creds), ap_config()))
-            .unwrap();
-        // Drop the old (failing) association attempt; kick off a fresh
-        // connect against the new creds. Errors are non-fatal — the
+        self.apply_sta_config(Some(creds));
+        // Kick off a fresh connect against the new creds. Non-fatal — the
         // supervisor's per-tick reconnect retries on its own.
-        let _ = self.driver.wifi.disconnect();
         let _ = self.driver.wifi.connect();
-        self.sta_configured = true;
     }
 
     /// Drop the credentials the STA half is retrying, without stopping the
@@ -273,15 +267,20 @@ impl<'d> MixedWifi<'d> {
     /// credentials the supervisor has already forgotten.
     pub fn clear_sta_creds(&mut self) {
         info!("Clearing STA creds (live)");
+        self.apply_sta_config(None);
+    }
+
+    /// Swap the STA half's configuration without stopping the radio, so
+    /// the captive AP stays associated with the user's phone throughout.
+    /// Drops any association in flight; `None` leaves the STA half bare.
+    fn apply_sta_config(&mut self, creds: Option<&WifiCredentials>) {
+        let sta = creds.map_or_else(ClientConfiguration::default, sta_config);
         self.driver
             .wifi
-            .set_configuration(&Configuration::Mixed(
-                ClientConfiguration::default(),
-                ap_config(),
-            ))
+            .set_configuration(&Configuration::Mixed(sta, ap_config()))
             .unwrap();
         let _ = self.driver.wifi.disconnect();
-        self.sta_configured = false;
+        self.sta_configured = creds.is_some();
     }
 
     /// Returns post-attempt connection state. Until creds are configured,

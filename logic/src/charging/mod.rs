@@ -503,6 +503,11 @@ impl Debounce {
         }
     }
 
+    /// Clear the accumulated window.
+    fn reset(&mut self) {
+        self.elapsed = Duration::ZERO;
+    }
+
     /// Like `step`, but a false `cond` *drains* the accumulator by `dt`
     /// (floored at zero) instead of zeroing it. Firing at `>= timeout` then
     /// means "net time-true exceeded the window" — equivalently, `cond` held
@@ -654,8 +659,8 @@ impl ChargeSupervisor {
     /// pre-armed from a load transient that happened before the
     /// transition.
     fn reset_phase_timers(&mut self) {
-        self.absorb.elapsed = Duration::ZERO;
-        self.exit.elapsed = Duration::ZERO;
+        self.absorb.reset();
+        self.exit.reset();
     }
 
     pub fn phase(&self) -> Phase {
@@ -852,7 +857,7 @@ impl ChargeSupervisor {
                 // voltage decays. A partly-accumulated OV window from before
                 // the self-disable would otherwise carry across and trip the
                 // next regulating stretch early.
-                self.ov = Debounce::default();
+                self.ov.reset();
                 self.inhibit = Some(InhibitReason::BuckProtection(cause));
                 return Action::None;
             }
