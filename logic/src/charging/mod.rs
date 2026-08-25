@@ -780,8 +780,17 @@ impl ChargeSupervisor {
             matches!(self.latch, LatchState::Pending { .. }),
             "enable ticket committed outside Pending"
         );
+        // Arming the phase we are already in would emit an UpdateVoltage
+        // whose target equals the live V_SET — a wasted Modbus write, and
+        // a tick where the phase machine is skipped for nothing. Reachable
+        // after a protect-hold: the pack can drain below the CV plateau
+        // during a long input outage while the phase is still Absorb.
+        let resume = ticket
+            .resume_absorb
+            .then_some(Phase::Absorb)
+            .filter(|&p| p != self.phase);
         self.set_latch(LatchState::Active {
-            pending_voltage: ticket.resume_absorb.then_some(Phase::Absorb),
+            pending_voltage: resume,
         });
     }
 

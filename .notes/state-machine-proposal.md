@@ -24,8 +24,8 @@ are fixable in isolation:
 
 Ranked by value: **P1 > P3 > P4 > P2 > P5 > P6 > P7**.
 
-**P2, P3, P4, P5 and P7 are done** — 177 host tests green. The
-remaining open items are P1 and P6.
+**P2, P3, P4, P5, P6 and P7 are done** — 180 host tests green. The
+only remaining item is P1.
 
 ---
 
@@ -47,6 +47,43 @@ remaining open items are P1 and P6.
 The proposals below extend these patterns rather than replacing them.
 
 ---
+
+### What shipped (P6)
+
+`proptest` was declined: it would have roughly tripled the logic crate's
+14-package test tree, and its main draw — shrinking a failing sequence —
+buys little here because every property is a per-tick invariant, so a
+failure already names the exact tick.
+
+Instead, `invariants_hold_under_randomized_input` runs 200 seeds × 1200
+ticks of a deterministic xorshift64 sweep, committing or dropping each
+ticket at 80% so the ack protocol is exercised too. Per tick it asserts:
+
+- `expected_setpoints().v_set` equals the last **committed**
+  `UpdateVoltage.target_v` — the invariant `SettingsDrift` polices.
+- `fault()` and `inhibit()` are never both set.
+- After the first `DisableOutput`, only `None` or `DisableOutput` follow.
+- `EnableOutput` never fires on a sample above `absorb_v + OV_MARGIN_V`.
+- `cycle_output` is exactly "is this a step down", strictly both ways.
+
+Plus a meta-assert on path coverage, because a sweep that quietly stops
+reaching a state would otherwise pass vacuously.
+
+**It found a real bug on its first run.** `commit_enable` armed
+`pending_voltage: Some(Absorb)` even when the phase was already Absorb,
+emitting an `UpdateVoltage` whose target equalled the live V_SET — a
+wasted Modbus write and a skipped phase-machine tick. Reachable on a UPS:
+the buck drops on input UVLO while in Absorb, the pack drains below the
+CV plateau during the outage, and the rail returns. Fixed by filtering
+the arm against the current phase, with
+`protect_recovery_in_absorb_does_not_re_emit_its_own_voltage` as the
+regression test.
+
+Tuning the sweep was itself informative: with a uniform 0–12 A current
+draw the Absorb→Float step-down — the transition that must cycle the
+output to protect the low-side FET — fired **zero** times in 100k ticks,
+because the leaky exit window could never net its 60 s. That path needs a
+tapering pack to be reachable at all.
 
 ## P1 — Make the network FSM testable (sans-IO, again)
 
@@ -374,7 +411,7 @@ seconds and then tripped on ModbusUnhealthy."
   supersedes it and fires when the fault latches rather than when the
   disable write happens to land.
 
-## P6 — Property tests over random input sequences
+## P6 — Property tests over random input sequences — DONE (hand-rolled, no dep)
 
 **Needs your go-ahead: this adds `proptest` as a dev-dependency of
 `esp32-battery-logic` (host-only, never in firmware).**
@@ -437,7 +474,7 @@ is not worth the purity.
 | ~~P3 + P4~~ | **Done** | Landed as one pass: `Mode`, `Verdict`, `safety_verdict`, `set_latch`, `InhibitReason`, wired to `/api` |
 | ~~P2 + P7(a)~~ | **Done** | `EnableTicket` / `VoltageTicket` / `DisableTicket` + `commit_*`; `apply_update_voltage` takes a ticket and returns `VoltageWriteOutcome` |
 | ~~P5~~ | **Done** | Three `debug_assert!`s in `set_latch` + one in `step_leaky`; `ChargeTransition` ring drained into `EventLog`, counts on `/api/errors` |
-| P6 | Small, needs dep approval | Needs the above to be worth proving |
+| ~~P6~~ | **Done** | Hand-rolled deterministic sweep — `proptest` declined, no new dependency |
 | P1 | Largest | Independent of the rest; schedule on its own |
 
 P3, P4, P2 and P7 all land in `logic/src/charging/mod.rs` and its call
