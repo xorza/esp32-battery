@@ -50,10 +50,28 @@ Landed with two deviations from what was written below:
 
 ---
 
-## Phase 1 — Make the safety timers actually time-based
+## Phase 1 — Make the safety timers actually time-based — **DONE**
 
 Highest severity. This changes the supervisor's input contract, so it goes
 before any reshaping of the supervisor itself.
+
+Landed with two corrections to what was written below:
+
+- **Step 6 was wrong about the tests.** The charging suite already had
+  `ov_trip_accumulates_elapsed_time_not_tick_count`, which drives `tick` with
+  500 ms / 1.5 s / 600 ms steps and pins exactly the property in question. The
+  supervisor was never the defect — only its caller was. The new tests are on
+  the data layer, which genuinely had no time-based coverage.
+- **Step 9 was applied at ingest, not at `ocv_soc`.** `LiveReadings::update_*`
+  now rejects non-finite readings outright, which settles the policy for the
+  supervisor, `/api` and history in one place. That also fixes a latent bug the
+  review missed: a single NaN reaching `SampleAccum` makes every average
+  computed from that accumulator NaN, and pairwise compaction then spreads it
+  across the buffer.
+
+No clamp was added on the measured interval. The task watchdog reboots at 10 s
+and is fed at the top of the loop, so `elapsed` is already bounded; an
+arbitrary ceiling would be a tolerance with no stated reason behind it.
 
 5. **Feed measured elapsed into `ChargeSupervisor::tick`.** The xy loop already
    has `clock::uptime()`; take it at the top of each iteration and pass the real

@@ -108,6 +108,13 @@ impl Chemistry {
 /// Estimated charge percentage (0.0–100.0) from pack bus voltage, for the
 /// given chemistry and series cell count. Divides to per-cell voltage, then
 /// linearly interpolates the chemistry's OCV curve.
+///
+/// A non-finite voltage is not a reading — the same rule the supervisor and
+/// `LiveReadings::update_battery` apply. Those two can say "absent"; this
+/// returns `f32`, so the floor is the closest it can get. It is unreachable
+/// from the firmware, which drops non-finite samples at ingest, and exists
+/// for direct callers: `interpolate` would otherwise fall through every
+/// comparison (all false against NaN) and hit its `unreachable!`.
 pub(crate) fn ocv_soc(chemistry: Chemistry, cells: u8, pack_voltage_v: f32) -> f32 {
     assert!(cells > 0);
     if !pack_voltage_v.is_finite() {

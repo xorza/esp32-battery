@@ -28,6 +28,8 @@
 
 use std::time::Duration;
 
+use crate::data::STALE_WINDOW;
+
 pub(crate) mod action;
 pub(crate) mod charge_supervisor;
 pub(crate) mod debounce;
@@ -92,10 +94,23 @@ const ABSORB_CV_BAND_V: f32 = 0.1;
 /// full pack (which the hard reset could never get past).
 const EXIT_DEBOUNCE: Duration = Duration::from_secs(60);
 /// How long `battery.is_none()` must persist before we fail closed.
-/// Counts *after* the data layer has already flipped to `None` per its
-/// own `STALE_TICKS` debounce — total time from last INA reading to a
-/// latched buck-off is `data::STALE_TICKS + BATTERY_MISSING_TIMEOUT`.
+///
+/// This is the last of three windows a dead INA228 has to cross, and the
+/// only place their total is written down. In order: the INA thread
+/// publishes one averaged reading per `SAMPLES_PER_UPDATE × SAMPLE_INTERVAL`
+/// (1 s, in `src/ina.rs`); `data::STALE_WINDOW` (5 s) then has to expire
+/// before `battery_reading()` starts returning `None`; and only then does
+/// this window start. Worst case from the last good conversion to a latched
+/// buck-off is their sum, 16 s — all three charged in wall time, so the
+/// figure holds even when a loop runs slow.
 const BATTERY_MISSING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pins the two windows this crate owns. The INA publish period is the
+/// firmware's, so 1 s of the documented 16 s is out of reach from here.
+const _: () = assert!(
+    STALE_WINDOW.as_secs() + BATTERY_MISSING_TIMEOUT.as_secs() == 15,
+    "sensor-loss budget changed — re-derive the total documented on \
+     BATTERY_MISSING_TIMEOUT"
+);
 /// How long Modbus reads to the XY can keep failing before we fail closed.
 const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 

@@ -24,7 +24,7 @@ use esp32_battery_logic::{PsReading, SensorData};
 use xy_modbus::{ModelCheck, ProtectionStatus, SafetyLimits, Status};
 
 use crate::board::XyPins;
-use crate::clock::EventRecorder;
+use crate::clock::{EventRecorder, LoopTimer};
 use crate::reboot;
 use crate::task_wdt;
 use crate::{PACK_PROFILE, SAFETY};
@@ -454,10 +454,14 @@ fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: Ev
     // Tracks the last-seen PROTECT cause so a latch is logged to the event
     // log once per episode, not on every poll while it stays latched.
     let mut last_protection = ProtectionStatus::Normal;
+    // Lapped after `poll`, so a tick is charged its own Modbus traffic as
+    // well as `POLL_INTERVAL` — which is the whole span the supervisor's
+    // windows are meant to cover.
+    let mut timer = LoopTimer::start();
     loop {
         wdt.reset();
         let p = poll(&mut xy, &sensor_data, &recorder, &mut last_protection);
-        let action = supervisor.tick(p, POLL_INTERVAL);
+        let action = supervisor.tick(p, timer.lap());
         apply_action(&mut xy, &mut supervisor, action, &recorder);
         // The supervisor has no clock, so it buffers latch transitions and
         // we timestamp them here.

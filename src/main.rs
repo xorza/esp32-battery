@@ -36,7 +36,7 @@ use xy_modbus::SafetyLimits;
 
 use esp32_battery_logic::{NetAction, NetPhase, NetPoll, NetSupervisor, WifiCredentials};
 
-use crate::clock::{EventRecorder, uptime};
+use crate::clock::{EventRecorder, LoopTimer, uptime};
 use crate::net::{NetResources, NetStatusHandle, ResetSignal, SubmissionStatus};
 
 /// Supervisor loop period.
@@ -170,10 +170,15 @@ fn main() {
     };
     net_status.store(supervisor.phase().lcd_status());
 
+    // `try_connect` below can block for seconds on a slow association, so an
+    // iteration is not `TICK_PERIOD` long and the staleness clocks are charged
+    // the measured interval instead.
+    let mut timer = LoopTimer::start();
     loop {
         thread::sleep(TICK_PERIOD);
-        let now = uptime();
-        sensor_data.lock().unwrap().tick(clock.epoch_s());
+        let elapsed = timer.lap();
+        let now = timer.now();
+        sensor_data.lock().unwrap().tick(clock.epoch_s(), elapsed);
 
         resources.debug_assert_matches_phase(supervisor.phase());
         let poll = NetPoll {

@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use log::{info, warn};
 
@@ -48,9 +49,45 @@ impl EspClock {
 /// preferred over `Instant` because no baseline needs to be threaded
 /// through call sites and the value is directly meaningful as "elapsed
 /// since boot".
-pub fn uptime() -> std::time::Duration {
+pub fn uptime() -> Duration {
     let micros = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-    std::time::Duration::from_micros(micros)
+    Duration::from_micros(micros)
+}
+
+/// Measures one loop iteration against the next.
+///
+/// Both supervisor loops charge time-based windows — the charge supervisor's
+/// debounces, the sensor staleness clocks — and neither runs at its nominal
+/// period: an xy iteration also pays that tick's Modbus traffic, and a main
+/// iteration can block for seconds inside a slow association. Handing those
+/// windows the nominal period instead of the measured one makes every single
+/// one of them fire late.
+#[derive(Debug)]
+pub struct LoopTimer {
+    last: Duration,
+}
+
+impl LoopTimer {
+    pub fn start() -> Self {
+        Self { last: uptime() }
+    }
+
+    /// Advance to the current instant, returning the interval since the
+    /// previous advance. Nothing clamps the result: both callers feed a task
+    /// watchdog that reboots the device long before an interval could grow
+    /// large enough to matter.
+    pub fn lap(&mut self) -> Duration {
+        let now = uptime();
+        let elapsed = now.saturating_sub(self.last);
+        self.last = now;
+        elapsed
+    }
+
+    /// The instant the last [`lap`](Self::lap) observed, so a caller needing
+    /// both the interval and the timestamp reads the hardware counter once.
+    pub fn now(&self) -> Duration {
+        self.last
+    }
 }
 
 /// Pairs the event log with the wall clock used to timestamp entries.

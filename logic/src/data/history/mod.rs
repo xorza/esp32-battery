@@ -20,7 +20,7 @@ const _: () = assert!(
     "HISTORY_CAPACITY must be even"
 );
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct SampleAccum {
     voltage: f32,
     battery_current: f32,
@@ -49,6 +49,7 @@ impl SampleAccum {
     }
 }
 
+#[derive(Debug)]
 pub struct History {
     samples: heapless::Vec<Sample, HISTORY_CAPACITY>,
     /// Current sampling interval: how many raw samples per stored entry.

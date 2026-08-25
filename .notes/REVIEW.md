@@ -4,35 +4,6 @@ Findings only — no fixes, no designs. **Delete an item once it is addressed**;
 this file lists open findings and nothing else. Groups are ordered by severity
 and benefit; items within a group share one root cause.
 
-## Safety timers are specified in wall time but driven by tick counts
-
-- [ ] `src/xy.rs:460` passes the constant `POLL_INTERVAL` as `elapsed` to
-      `ChargeSupervisor::tick`, never a measured interval. `Debounce` documents
-      itself as "time-based so the debounce isn't sensitive to poll cadence"
-      (`logic/src/charging/debounce.rs:5`), and every window — OV 3 s, absorb
-      cap 2 h, exit taper 60 s, missing battery 10 s, modbus 5 s — inherits
-      that claim. The xy loop's real period is `POLL_INTERVAL` plus the Modbus
-      transactions in that iteration (up to a 500 ms response timeout each,
-      plus `STEP_DOWN_SETTLE` and up to four writes on a step-down), so every
-      window fires late by an amount nothing bounds.
-- [ ] `logic/src/data/mod.rs:49` defines staleness as `STALE_TICKS: u32 = 5`
-      counted in ticks, while its sibling `BATTERY_MISSING_TIMEOUT`
-      (`logic/src/charging/mod.rs:98`) is a `Duration`.
-      `logic/src/charging/mod.rs:95-97` documents the end-to-end latency as
-      "`data::STALE_TICKS + BATTERY_MISSING_TIMEOUT`" — a tick count added to a
-      duration in prose.
-- [ ] `LiveReadings::age` is driven from the `main` loop
-      (`src/main.rs:176`), which blocks inside `resources.try_connect` on
-      `wifi.connect()` + `wait_netif_up()` (`src/wifi.rs:223`, `:297`). A slow
-      or failing association stretches both the staleness window and the
-      history sample cadence, while `History::interval` keeps reporting 1/2/4
-      as though the samples were evenly spaced.
-- [ ] The total time from a dead INA228 to a latched buck is the sum of three
-      independently specified windows measured in two units and on two threads
-      (INA averaging 10 × 100 ms in `src/ina.rs:18-19`, `STALE_TICKS` on the
-      main loop, `BATTERY_MISSING_TIMEOUT` on the xy loop). No single place
-      states the resulting number.
-
 ## Untrusted input is validated by assertions, and a failed assertion reboots
 
 - [ ] `WifiCredentials::new` (`logic/src/net/wifi_credentials.rs:21`) validates
@@ -55,11 +26,6 @@ and benefit; items within a group share one root cause.
 - [ ] `http::json_err` (`src/http/mod.rs:193`) `.expect`s when a message
       exceeds its 192-byte buffer — a panic, and therefore a device reboot, on
       an HTTP error path.
-- [ ] `battery::ocv_soc` returns `0.0` for a non-finite pack voltage
-      (`logic/src/battery/mod.rs:113`), while `ChargeSupervisor::tick` treats a
-      non-finite sample as *missing* (`logic/src/charging/charge_supervisor.rs:481-484`).
-      One bad reading is "0 % charged" on the dashboard and "no sample" to the
-      supervisor.
 
 ## The network state is re-encoded five times along one path
 
@@ -171,6 +137,11 @@ and benefit; items within a group share one root cause.
 
 ## The history pipeline pays for adaptive resolution it never reaches
 
+- [ ] `History` commits one raw sample per `SensorData::tick` regardless of
+      how long that tick took, so `interval` ("how many raw samples per stored
+      entry") no longer implies a fixed span once the main loop jitters. The
+      `time_s` stamps stay honest, but sample *density* along the x-axis does
+      not, and nothing records the span an averaged sample covers.
 - [ ] `History` carries a `SampleAccum`, an `acc_count`, a doubling `interval`
       and `compact_if_needed`, but `MAX_INTERVAL` is `4`
       (`logic/src/data/history/mod.rs:16`) — two doublings, capping coverage at

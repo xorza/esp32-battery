@@ -6,23 +6,33 @@
 
 pub(crate) mod history;
 
+use std::time::Duration;
 
 use crate::charging::fault_reason::FaultReason;
 use crate::charging::inhibit_reason::InhibitReason;
 use crate::charging::phase::Phase;
 use history::History;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Ina228Reading {
     pub voltage: f32,
     pub current: f32,
     pub power: f32,
 }
 
+impl Ina228Reading {
+    /// Every field is a real number. A sensor reporting NaN/Inf is not
+    /// reporting a reading, and one that reaches the history accumulator
+    /// poisons every average computed from it.
+    fn is_finite(&self) -> bool {
+        self.voltage.is_finite() && self.current.is_finite() && self.power.is_finite()
+    }
+}
+
 /// Power-supply reading sourced from the XY7025 Modbus client (no charge register).
 /// `v_set`/`i_set` are the programmed CV/CC targets (diagnostic — surfaces what
 /// the buck is actually told to do vs. what it outputs).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct PsReading {
     pub voltage: f32,
     pub current: f32,
@@ -31,8 +41,19 @@ pub struct PsReading {
     pub i_set: f32,
 }
 
+impl PsReading {
+    /// See [`Ina228Reading::is_finite`].
+    fn is_finite(&self) -> bool {
+        self.voltage.is_finite()
+            && self.current.is_finite()
+            && self.power.is_finite()
+            && self.v_set.is_finite()
+            && self.i_set.is_finite()
+    }
+}
+
 /// A single timestamped data point for charting (both sensors).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Sample {
     pub time_s: u32,
     pub voltage: f32,
@@ -42,11 +63,12 @@ pub struct Sample {
     pub power_online: f32,
 }
 
-/// Ticks a sensor's reading can go unrefreshed before `tick` treats it as
-/// absent. At 1 Hz ticks this is ~5 s — enough to ride out a single missed
-/// poll, short enough that a stuck producer flips the dashboard / history
-/// to its zero fallback before the user notices.
-const STALE_TICKS: u32 = 5;
+/// How long a sensor's reading may go unrefreshed before `tick` treats it as
+/// absent. Long enough to ride out a single missed poll, short enough that a
+/// stuck producer flips the dashboard / history to its zero fallback before
+/// the user notices. Charged in wall time, not ticks, so a main loop that
+/// stalls (a slow association attempt, say) does not silently extend it.
+pub(crate) const STALE_WINDOW: Duration = Duration::from_secs(5);
 
 /// Minimum XY output voltage (V) to consider the PS "online". Uses voltage,
 /// not current, so an enabled PSU with no load (fully-charged battery) still
@@ -54,14 +76,15 @@ const STALE_TICKS: u32 = 5;
 /// any real rail.
 const POWER_ONLINE_VOLTAGE_THRESHOLD: f32 = 2.0;
 
+#[derive(Debug)]
 struct LiveReadings {
     latest_battery: Option<Ina228Reading>,
     latest_ps: Option<PsReading>,
-    /// Ticks since the last `update_*`. Initialised to `u32::MAX` so a
-    /// fresh `LiveReadings` treats both sensors as absent until the first
-    /// live reading lands.
-    battery_ticks_stale: u32,
-    ps_ticks_stale: u32,
+    /// Time since the last accepted `update_*`. Initialised to
+    /// `Duration::MAX` so a fresh `LiveReadings` treats both sensors as
+    /// absent until the first live reading lands.
+    battery_stale: Duration,
+    ps_stale: Duration,
 }
 
 impl LiveReadings {
@@ -69,37 +92,45 @@ impl LiveReadings {
         Self {
             latest_battery: None,
             latest_ps: None,
-            battery_ticks_stale: u32::MAX,
-            ps_ticks_stale: u32::MAX,
+            battery_stale: Duration::MAX,
+            ps_stale: Duration::MAX,
         }
     }
 
     fn update_battery(&mut self, bat: Ina228Reading) {
+        if !bat.is_finite() {
+            log::warn!("dropping non-finite battery reading");
+            return;
+        }
         self.latest_battery = Some(bat);
-        self.battery_ticks_stale = 0;
+        self.battery_stale = Duration::ZERO;
     }
 
     fn update_ps(&mut self, ps: PsReading) {
+        if !ps.is_finite() {
+            log::warn!("dropping non-finite PS reading");
+            return;
+        }
         self.latest_ps = Some(ps);
-        self.ps_ticks_stale = 0;
+        self.ps_stale = Duration::ZERO;
     }
 
-    /// Age both staleness counters by one tick. Called once per supervisor
-    /// tick before any reads.
-    fn age(&mut self) {
-        self.battery_ticks_stale = self.battery_ticks_stale.saturating_add(1);
-        self.ps_ticks_stale = self.ps_ticks_stale.saturating_add(1);
+    /// Age both staleness clocks by the wall time since the previous tick.
+    /// Called once per `SensorData::tick`, before any reads.
+    fn age(&mut self, elapsed: Duration) {
+        self.battery_stale = self.battery_stale.saturating_add(elapsed);
+        self.ps_stale = self.ps_stale.saturating_add(elapsed);
     }
 
     fn battery(&self) -> Option<Ina228Reading> {
-        if self.battery_ticks_stale > STALE_TICKS {
+        if self.battery_stale > STALE_WINDOW {
             return None;
         }
         self.latest_battery
     }
 
     fn ps(&self) -> Option<PsReading> {
-        if self.ps_ticks_stale > STALE_TICKS {
+        if self.ps_stale > STALE_WINDOW {
             return None;
         }
         self.latest_ps
@@ -125,6 +156,7 @@ impl LiveReadings {
 /// unreachable in practice. Don't switch these calls to `lock().ok()` or
 /// poison-handling: the reboot path is the recovery, and silently
 /// continuing past a poisoned lock would mask a real fault.
+#[derive(Debug)]
 pub struct SensorData {
     live: LiveReadings,
     history: History,
@@ -205,17 +237,19 @@ impl SensorData {
         self.history.samples()
     }
 
-    /// Drive the history pipeline forward by one tick. `now_epoch` is the
-    /// wall-clock second the caller wants stamped on any committed sample;
-    /// `None` (e.g. before NTP sync) gates out commits but still ages the
-    /// staleness counters.
+    /// Drive the history pipeline forward by one tick. `elapsed` is the wall
+    /// time since the previous call — the staleness clocks charge that, not a
+    /// tick count, so a caller whose loop stalls does not silently widen
+    /// [`STALE_WINDOW`]. `now_epoch` is the wall-clock second to stamp on any
+    /// committed sample; `None` (e.g. before NTP sync) gates out commits but
+    /// still ages the staleness clocks.
     ///
     /// Commits one raw sample per call using whichever readings are
     /// currently fresh — stale producers contribute zeros, so history stays
     /// continuous and the dead side surfaces as flat-line zero on the
     /// dashboard.
-    pub fn tick(&mut self, now_epoch: Option<u32>) {
-        self.live.age();
+    pub fn tick(&mut self, now_epoch: Option<u32>, elapsed: Duration) {
+        self.live.age(elapsed);
 
         let Some(time_s) = now_epoch else {
             return;

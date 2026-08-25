@@ -1,6 +1,12 @@
 use super::*;
 
+use std::time::Duration;
+
 use crate::data::history::{HISTORY_CAPACITY, internals::HistoryInternals};
+
+/// One nominal main-loop period. The staleness clocks charge wall time, so
+/// tests that care about the window say so in `Duration` instead.
+const TICK: Duration = Duration::from_secs(1);
 
 fn bat_reading(voltage: f32, current: f32) -> Ina228Reading {
     Ina228Reading {
@@ -24,7 +30,7 @@ fn ps_reading(voltage: f32, current: f32) -> PsReading {
 fn update(sd: &mut SensorData, bat: Ina228Reading, p: PsReading, now: u32) {
     sd.update_battery(bat);
     sd.update_ps(p);
-    sd.tick(Some(now));
+    sd.tick(Some(now), TICK);
 }
 
 /// Push n uniform samples (v=13, c1=1, c2=2). Returns the next time_s value.
@@ -82,10 +88,10 @@ fn one_commit_per_tick_regardless_of_update_order() {
     sd.update_battery(bat_reading(13.0, 1.0));
     sd.update_ps(ps_reading(13.0, 2.0));
     sd.update_battery(bat_reading(13.0, 1.0));
-    sd.tick(Some(1));
+    sd.tick(Some(1), TICK);
     assert_eq!(sd.history().len(), 1);
 
-    sd.tick(Some(2));
+    sd.tick(Some(2), TICK);
     assert_eq!(sd.history().len(), 2);
 }
 
@@ -113,7 +119,7 @@ fn update_skipped_when_no_time() {
     let mut sd = SensorData::new();
     sd.update_ps(ps_reading(13.0, 2.0));
     sd.update_battery(bat_reading(13.0, 1.5));
-    sd.tick(None);
+    sd.tick(None, TICK);
     assert!(sd.history().is_empty());
     assert!((sd.battery_reading().unwrap().current - 1.5).abs() < 0.001);
     assert!((sd.ps_reading().unwrap().current - 2.0).abs() < 0.001);
@@ -180,7 +186,7 @@ fn no_commit_before_ntp_sync() {
     for _ in 0..100 {
         sd.update_ps(ps_reading(13.0, 2.0));
         sd.update_battery(bat_reading(13.0, 1.0));
-        sd.tick(None);
+        sd.tick(None, TICK);
     }
     assert!(sd.history().is_empty(), "no samples before NTP sync");
 }
@@ -190,7 +196,7 @@ fn battery_only_still_commits_with_ps_zeros() {
     let mut sd = SensorData::new();
     for i in 0..10u32 {
         sd.update_battery(bat_reading(13.0, 1.5));
-        sd.tick(Some(100 + i));
+        sd.tick(Some(100 + i), TICK);
     }
     assert_eq!(sd.history().len(), 10);
     for s in sd.history() {
@@ -201,13 +207,87 @@ fn battery_only_still_commits_with_ps_zeros() {
 }
 
 #[test]
+fn staleness_is_charged_in_wall_time_not_tick_count() {
+    // The same 6 s of unrefreshed reading, delivered as one tick and as six.
+    // A regression that counts calls keeps the single-tick reading fresh.
+    let cases: [(&str, &[Duration]); 2] =
+        [("one 6 s tick", &[Duration::from_secs(6)]), ("six 1 s ticks", &[TICK; 6])];
+    for (label, steps) in cases {
+        let mut sd = SensorData::new();
+        sd.update_battery(bat_reading(13.0, 1.0));
+        for step in steps {
+            sd.tick(None, *step);
+        }
+        assert!(
+            sd.battery_reading().is_none(),
+            "{label}: reading outlived its window"
+        );
+    }
+
+    // And the boundary holds from the other side: exactly the window is
+    // still fresh, so the drop above is the window expiring, not an
+    // off-by-one that would fire early on any cadence.
+    let mut sd = SensorData::new();
+    sd.update_battery(bat_reading(13.0, 1.0));
+    sd.tick(None, STALE_WINDOW);
+    assert!(
+        sd.battery_reading().is_some(),
+        "reading dropped at exactly STALE_WINDOW"
+    );
+}
+
+#[test]
+fn non_finite_readings_are_dropped_at_ingest() {
+    // A NaN/Inf field is not a reading. It must not displace the last good
+    // one, and must not reach `SampleAccum` — one NaN there makes every
+    // average computed from that accumulator NaN as well.
+    let mut sd = SensorData::new();
+    sd.update_battery(bat_reading(13.0, 1.0));
+    sd.update_ps(ps_reading(13.0, 2.0));
+    sd.tick(Some(500), TICK);
+
+    sd.update_battery(Ina228Reading {
+        voltage: f32::NAN,
+        current: 1.0,
+        power: 1.0,
+    });
+    sd.update_ps(PsReading {
+        current: f32::INFINITY,
+        ..ps_reading(13.0, 2.0)
+    });
+    sd.tick(Some(501), TICK);
+
+    assert_eq!(sd.battery_reading().unwrap().voltage, 13.0);
+    assert_eq!(sd.ps_reading().unwrap().current, 2.0);
+    assert_eq!(sd.history().len(), 2);
+    for s in sd.history() {
+        assert!(
+            s.voltage.is_finite() && s.battery_current.is_finite() && s.ps_current.is_finite(),
+            "non-finite sample reached history: {s:?}"
+        );
+    }
+
+    // The staleness clock keeps running through the drops, so a sensor stuck
+    // on NaN still goes absent — and the supervisor still latches on it.
+    for _ in 0..6 {
+        sd.update_battery(Ina228Reading {
+            voltage: f32::NAN,
+            current: 1.0,
+            power: 1.0,
+        });
+        sd.tick(None, TICK);
+    }
+    assert!(sd.battery_reading().is_none());
+}
+
+#[test]
 fn ps_goes_stale_after_threshold() {
-    // STALE_TICKS = 5 ticks of unrefreshed reading before the filter trips.
+    // STALE_WINDOW = 5 s of unrefreshed reading before the filter trips.
     const STALE: u32 = 5;
     let mut sd = SensorData::new();
     sd.update_battery(bat_reading(13.0, 1.0));
     sd.update_ps(ps_reading(13.0, 2.5));
-    sd.tick(Some(1000));
+    sd.tick(Some(1000), TICK);
     assert_eq!(sd.history().len(), 1);
     assert_eq!(sd.history()[0].ps_current, 2.5);
     assert_eq!(sd.history()[0].power_online, 1.0);
@@ -217,13 +297,13 @@ fn ps_goes_stale_after_threshold() {
 
     for i in 1..STALE {
         sd.update_battery(bat_reading(13.0, 1.0));
-        sd.tick(Some(1000 + i));
+        sd.tick(Some(1000 + i), TICK);
     }
     let ps_late = sd.ps_reading().expect("PS still fresh at STALE_TICKS");
     assert_eq!(ps_late.current, 2.5);
 
     sd.update_battery(bat_reading(13.0, 1.0));
-    sd.tick(Some(1000 + STALE));
+    sd.tick(Some(1000 + STALE), TICK);
     assert!(sd.ps_reading().is_none());
     let latest = sd.history().last().unwrap();
     assert_eq!(latest.ps_current, 0.0);
@@ -236,14 +316,14 @@ fn battery_stale_commits_zeros() {
     let mut sd = SensorData::new();
     sd.update_battery(bat_reading(13.0, 1.0));
     sd.update_ps(ps_reading(13.0, 2.0));
-    sd.tick(Some(2000));
+    sd.tick(Some(2000), TICK);
     assert_eq!(sd.history().len(), 1);
     assert_eq!(sd.history()[0].voltage, 13.0);
 
     let ticks = STALE + 3;
     for i in 1..=ticks {
         sd.update_ps(ps_reading(13.0, 2.0));
-        sd.tick(Some(2000 + i));
+        sd.tick(Some(2000 + i), TICK);
     }
     assert_eq!(sd.history().len(), 1 + ticks as usize);
     assert!(sd.battery_reading().is_none());
