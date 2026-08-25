@@ -1,0 +1,393 @@
+//! Conditions that latch the buck off, and the debounce windows that
+//! decide when they do.
+
+use super::*;
+
+/// Commit a `DisableOutput` the way the firmware does.
+fn accept_disable(s: &mut ChargeSupervisor, a: Action) {
+    let Action::DisableOutput(ticket) = a else {
+        panic!("expected DisableOutput, got {a:?}");
+    };
+    s.commit_disable(ticket);
+}
+
+/// Drive `s` from Active into `Tripped(OutputUnexpectedlyOff(cause), acked: true)`.
+/// Cause must be non-recoverable (i.e. not Lvp/Otp, which are handled
+/// in-place and never latch).
+fn latch_self_disable(s: &mut ChargeSupervisor, cause: ProtectionStatus) {
+    let p = poll_with_output(s, BuckOutput::Off { cause });
+    let a = s.tick(p, TICK);
+    assert!(matches_disable(
+        &a,
+        FaultReason::OutputUnexpectedlyOff(cause)
+    ));
+    accept_disable(s, a);
+}
+
+/// A debounced fault: how to feed it, the window it needs before latching,
+/// and what it latches as. The three share one shape, so they share their
+/// tests. Nothing says how to *clear* one, because a single healthy tick
+/// satisfies all three conditions at once.
+#[derive(Debug)]
+struct DebouncedFault {
+    name: &'static str,
+    window: Duration,
+    fault: FaultReason,
+    feed: fn(&mut ChargeSupervisor, Duration) -> Action,
+}
+
+const DEBOUNCED_FAULTS: [DebouncedFault; 3] = [
+    DebouncedFault {
+        name: "battery sensor stale",
+        window: BATTERY_MISSING_TIMEOUT,
+        fault: FaultReason::BatterySensorStale,
+        feed: |s, dt| ok_tick(s, None, dt),
+    },
+    DebouncedFault {
+        name: "modbus unhealthy",
+        window: MODBUS_UNHEALTHY_TIMEOUT,
+        fault: FaultReason::ModbusUnhealthy,
+        feed: |s, dt| fail_tick(s, b(OK_V, -0.1), dt),
+    },
+    DebouncedFault {
+        // absorb_v for lfp_4s is 14.4 and the margin 0.2, so 14.7 trips.
+        name: "overvoltage",
+        window: OV_DURATION,
+        fault: FaultReason::Overvoltage,
+        feed: |s, dt| ok_tick(s, b(14.7, -0.1), dt),
+    },
+];
+
+#[test]
+fn nan_or_inf_in_sample_treated_as_missing() {
+    // Within the missing-battery debounce, a non-finite sample is
+    // ignored just like None — no fault yet, no phase change, but no
+    // charitable bypass either.
+    let mut s = active(lfp_4s());
+    for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(matches!(ok_tick(&mut s, b(OK_V, v), TICK), Action::None));
+        assert!(matches!(ok_tick(&mut s, b(v, -1.0), TICK), Action::None));
+    }
+    assert_eq!(s.phase(), Phase::Float);
+    assert_eq!(s.fault(), None);
+}
+
+#[test]
+fn nan_voltage_eventually_latches_battery_stale() {
+    // Sustained NaN voltage = sensor stuck. Must NOT silently bypass OV
+    // or the phase machine — must drive through the same sensor-stale
+    // path as truly missing samples.
+    let mut s = active(lfp_4s());
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
+        assert!(matches!(
+            ok_tick(&mut s, b(f32::NAN, -0.1), TICK),
+            Action::None
+        ));
+    }
+    assert_eq!(s.fault(), None);
+    let a = ok_tick(&mut s, b(f32::NAN, -0.1), TICK);
+    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+}
+
+#[test]
+fn nan_current_eventually_latches_battery_stale() {
+    // Same as above but for current. A stuck-NaN current sensor would
+    // otherwise silently hold whatever phase we were in.
+    let mut s = active(lfp_4s());
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, f32::NAN), TICK);
+    }
+    assert_eq!(s.fault(), None);
+    let a = ok_tick(&mut s, b(OK_V, f32::NAN), TICK);
+    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+}
+
+#[test]
+fn nan_then_recovery_clears_stale_debounce() {
+    // A brief NaN burst followed by recovery must NOT latch — the
+    // debounce should reset on the first finite sample.
+    let mut s = active(lfp_4s());
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
+        ok_tick(&mut s, b(f32::NAN, f32::NAN), TICK);
+    }
+    // One finite tick clears the debounce.
+    ok_tick(&mut s, b(OK_V, -0.1), TICK);
+    // Now we can NaN-burst again without latching.
+    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
+        ok_tick(&mut s, b(f32::NAN, -0.1), TICK);
+    }
+    assert_eq!(s.fault(), None);
+}
+
+#[test]
+fn ov_trip_accumulates_elapsed_time_not_tick_count() {
+    // Same budget reached three ways. A regression that counts calls
+    // instead of `+= elapsed` passes the first row and fails the others.
+    let ms = Duration::from_millis;
+    let cases: [(&str, &[Duration]); 2] = [
+        ("6 x 500 ms = 3.0 s", &[ms(500); 6]),
+        ("1500 + 1000 + 600 = 3100 ms", &[ms(1500), ms(1000), ms(600)]),
+    ];
+    for (label, steps) in cases {
+        let mut s = active(lfp_4s());
+        let (trip, before) = steps.split_last().expect("each row trips on its last tick");
+        for step in before {
+            let a = ok_tick(&mut s, b(14.7, -0.1), *step);
+            assert!(matches!(a, Action::None), "{label}: tripped early");
+        }
+        assert!(
+            matches_disable(&ok_tick(&mut s, b(14.7, -0.1), *trip), FaultReason::Overvoltage),
+            "{label}: did not trip at the budget"
+        );
+    }
+}
+
+#[test]
+fn ov_below_threshold_does_not_trip() {
+    // absorb_v + OV_MARGIN_V ≈ 14.6. 14.55 is unambiguously below in f32.
+    let mut s = active(lfp_4s());
+    for _ in 0..(OV_DURATION.as_secs() + 5) {
+        ok_tick(&mut s, b(14.55, -0.1), TICK);
+    }
+    assert_eq!(s.fault(), None);
+}
+
+#[test]
+fn debounced_faults_latch_only_after_their_full_window() {
+    for c in DEBOUNCED_FAULTS {
+        let mut s = active(lfp_4s());
+        for _ in 0..(c.window.as_secs() - 1) {
+            let a = (c.feed)(&mut s, TICK);
+            assert!(matches!(a, Action::None), "{}: latched early", c.name);
+        }
+        assert_eq!(s.fault(), None, "{}", c.name);
+        let a = (c.feed)(&mut s, TICK);
+        assert!(matches_disable(&a, c.fault), "{}: no latch at the window", c.name);
+        assert_eq!(s.fault(), Some(c.fault), "{}", c.name);
+
+        // The window is elapsed time, not a tick count: one tick spanning
+        // the whole of it latches just the same.
+        let mut s = active(lfp_4s());
+        let a = (c.feed)(&mut s, c.window);
+        assert!(
+            matches_disable(&a, c.fault),
+            "{}: single big-elapsed tick did not latch",
+            c.name
+        );
+    }
+}
+
+#[test]
+fn debounced_faults_reset_on_a_single_healthy_tick() {
+    // One healthy tick is a fresh sample, a successful read, and a voltage
+    // under the line all at once, so the same tick clears whichever window
+    // happens to be accumulating.
+    for c in DEBOUNCED_FAULTS {
+        let mut s = active(lfp_4s());
+        for _ in 0..(c.window.as_secs() - 1) {
+            (c.feed)(&mut s, TICK);
+        }
+        ok_tick(&mut s, b(OK_V, -0.1), TICK);
+        // Counter is back to zero, so a whole window-minus-one fits again.
+        for _ in 0..(c.window.as_secs() - 1) {
+            let a = (c.feed)(&mut s, TICK);
+            assert!(matches!(a, Action::None), "{}: window was not reset", c.name);
+        }
+        assert_eq!(s.fault(), None, "{}", c.name);
+    }
+}
+
+#[test]
+fn setpoint_drift_in_either_field_latches_immediately() {
+    // Float targets for lfp_4s are 13.5 V and 10 A; the tolerance is
+    // 0.02, so either of these is well past it. No debounce — the read
+    // itself succeeded, so a mismatch is the device disagreeing with us.
+    let drifted = [
+        Setpoints { v_set: 12.0, i_set: 10.0 },
+        Setpoints { v_set: 13.5, i_set: 5.0 },
+    ];
+    for sp in drifted {
+        let mut s = active(lfp_4s());
+        let p = PollResult {
+            setpoints: Some(sp),
+            ..expected_poll(&s, b(OK_V, -0.1))
+        };
+        assert!(
+            matches_disable(&s.tick(p, TICK), FaultReason::SettingsDrift),
+            "{sp:?}"
+        );
+    }
+}
+
+#[test]
+fn latch_keeps_emitting_disable_until_acked() {
+    let mut s = active(lfp_4s());
+    for _ in 0..BATTERY_MISSING_TIMEOUT.as_secs() {
+        ok_tick(&mut s, None, TICK);
+    }
+    assert!(s.fault().is_some());
+
+    // First tick after latch: still wants disable.
+    let a = ok_tick(&mut s, b(13.5, -0.1), TICK);
+    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+    // Re-tick with healthy inputs: still disable (caller's set_output failed).
+    let a = ok_tick(&mut s, b(13.5, -0.1), TICK);
+    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
+
+    accept_disable(&mut s, a);
+    // Now the supervisor goes quiet — no further commands to the buck.
+    for _ in 0..10 {
+        assert!(matches!(ok_tick(&mut s, b(13.5, -4.0), TICK), Action::None));
+    }
+}
+
+#[test]
+fn latched_supervisor_does_not_change_phase() {
+    let mut s = active(lfp_4s());
+    for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
+        fail_tick(&mut s, b(13.5, -0.1), TICK);
+    }
+    let a = ok_tick(&mut s, b(13.5, -0.1), TICK);
+    accept_disable(&mut s, a);
+    // Heavy charging current would normally drive Float→Absorb.
+    ok_tick(&mut s, b(13.5, -5.0), TICK);
+    assert_eq!(s.phase(), Phase::Float);
+}
+
+#[test]
+#[should_panic]
+fn commit_disable_without_fault_panics() {
+    // Unreachable through the public API — a DisableTicket is only minted
+    // by a tick that latched. Constructed here to prove the guard holds
+    // for a ticket stashed across ticks.
+    let mut s = active(lfp_4s());
+    s.commit_disable(DisableTicket {
+        reason: FaultReason::Overvoltage,
+    });
+}
+
+#[test]
+fn first_fault_wins_over_simultaneous_conditions() {
+    // Both modbus and battery faulting at once. Modbus is checked first.
+    let mut s = active(lfp_4s());
+    for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
+        fail_tick(&mut s, None, TICK);
+    }
+    assert_eq!(s.fault(), Some(FaultReason::ModbusUnhealthy));
+}
+
+#[test]
+fn setpoint_within_tolerance_no_drift_fault() {
+    // 0.01 V off — one register quantum, under the 0.02 tolerance.
+    let mut s = active(lfp_4s());
+    let p = PollResult {
+        setpoints: Some(Setpoints {
+            v_set: 13.51,
+            i_set: 10.0,
+        }),
+        ..expected_poll(&s, b(13.5, -0.1))
+    };
+    assert!(matches!(s.tick(p, TICK), Action::None));
+    assert_eq!(s.fault(), None);
+}
+
+#[test]
+fn setpoint_drift_does_not_overwrite_existing_latch() {
+    // First latch wins — modbus-unhealthy debounce trips before the next
+    // good readback can latch SettingsDrift.
+    let mut s = active(lfp_4s());
+    for _ in 0..MODBUS_UNHEALTHY_TIMEOUT.as_secs() {
+        fail_tick(&mut s, b(13.5, -0.1), TICK);
+    }
+    assert_eq!(s.fault(), Some(FaultReason::ModbusUnhealthy));
+    let p = PollResult {
+        setpoints: Some(Setpoints {
+            v_set: 12.0,
+            i_set: 10.0,
+        }),
+        ..expected_poll(&s, b(13.5, -0.1))
+    };
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::ModbusUnhealthy
+    ));
+}
+
+#[test]
+fn drift_outranks_overvoltage_while_regulating() {
+    // Both conditions true on the same tick. The gauntlet checks
+    // setpoint drift (1) before overvoltage (5), and that precedence is
+    // load-bearing: drift means we do not know what the buck is
+    // regulating to, which is the more urgent of the two.
+    let mut s = active(lfp_4s());
+    let absorb = lfp_4s().absorb_v;
+    let p = PollResult {
+        setpoints: Some(Setpoints {
+            v_set: 12.0,
+            i_set: 10.0,
+        }),
+        ..expected_poll(&s, b(absorb + OV_MARGIN_V + 0.5, -0.1))
+    };
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::SettingsDrift
+    ));
+}
+
+#[test]
+fn buck_self_disable_in_active_latches() {
+    // Active supervisor + buck reports output OFF (own OVP/OCP/LVP/over-temp
+    // tripped, or panel toggled) → latch OutputUnexpectedlyOff.
+    let mut s = active(lfp_4s());
+    let p = poll_with_output(&s, BuckOutput::Off { cause: ProtectionStatus::Normal });
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Normal)
+    ));
+}
+
+#[test]
+fn latched_fault_stays_parked_in_none() {
+    // Reboot-only recovery: once a fault latches and is acked, tick
+    // returns Action::None forever — no Action::RestartSupervisor,
+    // regardless of how long the world looks healthy. The caller's
+    // reboot is the only way out (LVP/OTP are intercepted before
+    // latching and don't reach here).
+    let mut s = active(lfp_4s());
+    latch_self_disable(&mut s, ProtectionStatus::Ocp);
+    let p = expected_poll(&s, b(OK_V, -0.1));
+    for _ in 0..600 {
+        assert!(matches!(s.tick(p, TICK), Action::None));
+    }
+    assert!(matches!(
+        s.fault(),
+        Some(FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ocp))
+    ));
+}
+
+#[test]
+fn buck_output_on_in_pending_latches() {
+    // Pending expects the buck OFF — boot_sequence wrote set_output(false)
+    // and S_INI=0. If OUTPUT_EN reads ON anyway, regulation is happening
+    // under unknown conditions; latch immediately, no debounce.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p = poll_with_output(&s, BuckOutput::On);
+    assert!(matches_disable(
+        &s.tick(p, TICK),
+        FaultReason::OutputOnInPending
+    ));
+}
+
+#[test]
+fn boot_pending_with_buck_on_still_latches() {
+    // At cold boot, boot_sequence already wrote set_output(false) and
+    // verified OUTPUT_EN=0 — so a poll showing buck=On is a genuine
+    // anomaly (firmware bug / panel toggle / EMI). Stays the immediate
+    // latch it always was; only ProtectRecovery gets the soft transition.
+    let mut s = ChargeSupervisor::new(lfp_4s());
+    let p_on = poll_with_output(&s, BuckOutput::On);
+    assert!(matches_disable(
+        &s.tick(p_on, TICK),
+        FaultReason::OutputOnInPending
+    ));
+}
