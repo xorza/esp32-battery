@@ -17,8 +17,8 @@ pub struct EnableTicket {
 
 impl EnableTicket {
     /// Whether the first regulating tick steps V_SET straight to absorb
-    /// (the pack rested below the CV plateau, so it isn't full) or parks
-    /// in Float. Exposed for logging; committing uses it either way.
+    /// (the pack's resting SoC was short of full) or parks in Float.
+    /// Exposed for logging; committing uses it either way.
     pub fn resume_absorb(&self) -> bool {
         self.resume_absorb
     }

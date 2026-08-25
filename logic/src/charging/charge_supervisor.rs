@@ -105,11 +105,35 @@ impl ChargeSupervisor {
         self.transitions.pop_front()
     }
 
-    /// Pack voltage within `ABSORB_CV_BAND_V` of `absorb_v` — i.e. at or
-    /// above the CV plateau. Doubles as "full" at bring-up and "clock the
-    /// absorb timeout" once in Absorb.
+    /// Pack voltage within `ABSORB_CV_BAND_V` of `absorb_v` — i.e. the buck
+    /// is holding the pack at the CV plateau right now. Clocks the absorb
+    /// cap, and nothing else: see [`Self::rested_full`] for why "at CV" is
+    /// not the same question as "full".
     fn at_cv_plateau(&self, voltage: f32) -> bool {
         voltage >= self.profile.absorb_v - ABSORB_CV_BAND_V
+    }
+
+    /// Whether the pack's resting voltage says it is full, which is what
+    /// decides if bring-up owes it a step up to absorb.
+    ///
+    /// Deliberately not [`Self::at_cv_plateau`]. That answers "is the buck
+    /// holding the pack at CV", which is the right question for the absorb
+    /// cap and the wrong one here: through bring-up the output has been
+    /// off, so this reading is resting OCV, and a full LFP pack rests near
+    /// `float_v` — nowhere near the plateau. Proximity to the plateau
+    /// therefore called every real pack empty and forced an Absorb cycle,
+    /// plus the output-cycling step-down that ends it, on every reboot.
+    ///
+    /// OCV is a *rested* measurement, so a sample still carrying
+    /// meaningful current is not trusted and the answer falls back to "not
+    /// full" — erring toward charging, the same direction the old test
+    /// erred in every case. A pack that has not had time to relax since
+    /// the output went off still reads high; the current gate narrows that
+    /// but cannot close it, and a rest timer is not worth its complexity
+    /// against a failure that costs one unnecessary absorb.
+    fn rested_full(&self, b: BatterySample) -> bool {
+        b.current.abs() < self.profile.exit_absorb_a
+            && self.profile.soc(b.voltage) >= self.profile.full_rest_soc()
     }
 
     fn voltage_for_phase(&self, phase: Phase) -> f32 {
@@ -212,13 +236,13 @@ impl ChargeSupervisor {
     /// `EnableOutput`, so a failed write is retried.
     ///
     /// The ticket carries `resume_absorb`, so the caller cannot disagree
-    /// with the supervisor about it: `true` means the pack rested below
-    /// the CV plateau, and the first regulating tick steps V_SET up to
-    /// `absorb_v`. A pack power-cycled above ~75% rests too near `float_v`
-    /// to ever draw `enter_absorb_a`, so without this it would stall in
-    /// Float and never finish charging. Stepping to a target the device
-    /// already holds is the table's business, not the caller's — see the
-    /// `HoldAbsorb` row.
+    /// with the supervisor about it: `true` means the pack's resting SoC
+    /// was short of its float target's, and the first regulating tick
+    /// steps V_SET up to `absorb_v`. A part-charged pack rests too near
+    /// `float_v` to ever draw `enter_absorb_a`, so without this it would
+    /// stall in Float and never finish charging. Stepping to a target the
+    /// device already holds is the table's business, not the caller's —
+    /// see the `HoldAbsorb` row.
     pub fn commit_enable(&mut self, ticket: EnableTicket) {
         self.step(if ticket.resume_absorb {
             ChargeEvent::EnabledBelowFull
@@ -298,13 +322,13 @@ impl ChargeSupervisor {
             }
         };
 
-        // Output has been OFF throughout bring-up, so `battery.voltage` is
-        // the pack's resting voltage — the true SoC signal. Below the CV
-        // plateau means not full, so the caller acks with
-        // resume_absorb = true. The supervisor stays put until it does.
+        // Output has been OFF throughout bring-up, so `battery` is a
+        // resting reading — the one thing that can say how full the pack
+        // actually is. Anything short of full owes a step up to absorb,
+        // and the supervisor stays put until the caller acks.
         if self.state.bringing_up() {
             return Action::EnableOutput(EnableTicket {
-                resume_absorb: !self.at_cv_plateau(battery.voltage),
+                resume_absorb: !self.rested_full(battery),
             });
         }
         self.regulate(battery, elapsed)

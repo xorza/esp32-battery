@@ -5,11 +5,6 @@
   sags under charge current gives a repeating LVP hold/resume loop with no
   flap limit and no back-off on `regulation_a`.
 
-- `at_cv_plateau(battery.voltage)` decides `resume_absorb` at bring-up from the
-  pack's resting voltage, but a full LFP pack rests near `float_v`, so the test
-  is false for every real bring-up. Every reboot forces an Absorb cycle, and
-  the Absorb→Float step-down that ends it cycles the buck output under load.
-
 - `ocp_a` is derived as `regulation_a * 1.5`, but the buck's output current is
   charge current plus the UPS load, and the load does not appear in the
   derivation. A load surge trips device OCP, which latches

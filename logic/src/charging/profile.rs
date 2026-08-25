@@ -29,6 +29,28 @@ const OCP_CEILING: f32 = 27.0;
 const LVP_FLOOR: f32 = 10.0;
 const LVP_CEILING: f32 = 95.0;
 
+/// How far below the float target's *own* resting SoC a pack may sit and
+/// still count as full at bring-up, so it parks in Float instead of being
+/// owed a step up to absorb.
+///
+/// Expressed as SoC rather than a voltage because only the chemistry's OCV
+/// curve can turn a resting terminal voltage into "how full is it" — the
+/// LFP plateau is flat enough that 0.1 V/cell spans most of the pack.
+///
+/// Expressed as a *margin against `soc(float_v)`* rather than an absolute
+/// figure because "full" is a property of the profile, not of the
+/// chemistry's 100 % point. Li-ion charged to the longevity-tuned 4.10 V
+/// rests at ~91 % of a 4.20 V-referenced full and floats at ~82 %, where
+/// LFP floats at 97.5 %. Any absolute bar that suits one calls the other
+/// empty and puts it straight back into absorb — which is the bug this
+/// gate exists to fix, reintroduced one chemistry over.
+///
+/// 5 points is wide enough for the droop of a pack that has been floating
+/// and then rested — on the flat LFP plateau that is only ~17 mV/cell —
+/// and narrow enough that a pack at 90 % still gets topped up, as it
+/// should.
+const FULL_SOC_MARGIN: f32 = 5.0;
+
 #[derive(Copy, Clone, Debug)]
 pub struct Profile {
     pub chemistry: Chemistry,
@@ -82,6 +104,14 @@ impl Profile {
     /// this pack's chemistry and cell count.
     pub fn soc(&self, pack_voltage_v: f32) -> f32 {
         battery::ocv_soc(self.chemistry, self.cells, pack_voltage_v)
+    }
+
+    /// Resting state-of-charge at or above which a pack counts as full, so
+    /// bring-up parks in Float instead of owing it a step up to absorb.
+    /// Derived from this profile's own float target — see
+    /// [`FULL_SOC_MARGIN`] for why it cannot be an absolute figure.
+    pub(super) fn full_rest_soc(&self) -> f32 {
+        self.soc(self.float_v) - FULL_SOC_MARGIN
     }
 
     /// Derive hard trip thresholds for the buck's own protection. The buck

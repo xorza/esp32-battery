@@ -58,6 +58,14 @@ const OK_V: f32 = 13.5;
 /// Arms the `MAX_ABSORB` clock; stays under the OV trip (14.6).
 const CV_V: f32 = 14.4;
 
+/// Resting voltage of a genuinely part-charged 4S LFP pack: 3.25 V/cell,
+/// which the chemistry's OCV curve puts at exactly 40 % — far under
+/// `RESUME_ABSORB_SOC`. Distinct from `OK_V`, which is `float_v` and reads
+/// as *full* at rest (3.375 V/cell ⇒ 97.5 %). That two voltages 0.5 V apart
+/// sit on opposite sides of "full" is the whole reason the resume gate asks
+/// the OCV curve instead of measuring distance to the CV plateau.
+const LOW_V: f32 = 13.0;
+
 /// Wall time elapsed per simulated tick. Tests choose 1 s so iteration
 /// counts read as seconds when comparing against duration budgets.
 const TICK: Duration = Duration::from_secs(1);

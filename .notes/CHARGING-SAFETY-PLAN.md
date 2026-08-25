@@ -276,7 +276,10 @@ spread past the window does not; the counter clears after a quiet stretch.
 
 ## Issue 4 — `resume_absorb` is `true` for every real bring-up
 
-**Severity: medium.** Not dangerous, but it means every reboot forces an
+**DONE**, but not as written below: an absolute `RESUME_ABSORB_SOC` cannot
+serve both chemistries, so the bar is `soc(float_v) - FULL_SOC_MARGIN`,
+derived per profile. See the note at the end of this section.
+Severity: medium. Not dangerous, but it means every reboot forces an
 Absorb cycle plus the output-cycling step-down that ends it, and the
 comment claiming a full pack parks in Float describes something that never
 happens.
@@ -320,6 +323,16 @@ A real fix is a rest timer, which is not worth the complexity here.
 **Tests:** a 4S pack resting at 13.5 V does **not** resume Absorb (the
 regression this fixes); at 13.2 V it does; at 13.5 V *while drawing 5 A* it
 does, because the OCV is not trusted. Hand-compute each SoC from the curve.
+
+**What shipped differed.** `RESUME_ABSORB_SOC = 95.0` was wrong for Li-ion:
+a cell charged to the longevity-tuned 4.10 V rests at ~91 % of a 4.20 V
+reference and floats at ~82 %, so an absolute bar set for LFP's 97.5 %
+float would call every Li-ion pack empty — this issue's own bug, one
+chemistry over. The shipped rule is `soc(b.voltage) >= soc(float_v) -
+FULL_SOC_MARGIN` with the margin at 5 points, which reduces to the same
+92.5 % bar for the 4S LFP pack and derives its own for anything else.
+`full_is_relative_to_the_profile_not_the_chemistry_hundred_percent_point`
+pins it.
 
 ---
 
@@ -493,8 +506,8 @@ whole point of the state existing.
 | 0 | Groundwork A: reconcile → evaluate | 6 | one-tick window closes; check precedence changes | **done** |
 | 1 | `Latched` table cell | 1 | re-disables a resurfaced output | **done** |
 | 2 | leaky absorb clock + `MAX_CHARGE` | 2 | new `ChargeTimeout` fault | **done** |
-| 3 | `rested_full` on SoC | 4 | full packs stop forcing an Absorb cycle | next |
-| 4 | Groundwork B + I_SET/OCP + `ChargeOvercurrent` | 5 | I_SET rises by the load budget | |
+| 3 | `rested_full` on SoC | 4 | full packs stop forcing an Absorb cycle | **done** |
+| 4 | Groundwork B + I_SET/OCP + `ChargeOvercurrent` | 5 | I_SET rises by the load budget | next |
 | 5 | `HoldBudget` | 3 | new `ProtectionFlapping` fault | |
 | 6 | `FaultResponse` + `ToParked`/`Parked` | 8 (partial) | three faults stop killing the load | |
 | 7 | pack temperature | 7 | hardware first | |
