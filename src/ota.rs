@@ -55,6 +55,16 @@ fn read_hmac_tag(req: &mut Request<&mut EspHttpConnection>) -> Result<[u8; 32], 
     Ok(tag)
 }
 
+/// Derive a 32-byte subkey from the build-time OTA key, domain-separated by
+/// `domain`. Lets another subsystem hold a per-device secret without a second
+/// build-time key to manage, and without the key itself leaving this module.
+pub(crate) fn derive_subkey(domain: &str, salt: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(&*OTA_KEY).expect("HMAC key length must be valid");
+    mac.update(domain.as_bytes());
+    mac.update(salt);
+    mac.finalize().into_bytes().into()
+}
+
 fn handle_upload(req: &mut Request<&mut EspHttpConnection>) -> Result<usize, &'static str> {
     let expected_hmac = read_hmac_tag(req)?;
 

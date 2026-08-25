@@ -1,3 +1,16 @@
+//! The radio: the two mode wrappers, the setup AP, and the scan cache.
+//!
+//! `WifiDriver` is built once at boot and immediately consumed into either
+//! `StaWifi` (dashboard up, AP torn down) or `MixedWifi` (captive portal up,
+//! STA half retrying behind it). A mode switch consumes one wrapper and
+//! produces the other, so "the radio is in mode X" is something the caller
+//! holds rather than a call order it has to remember.
+//!
+//! The two free functions at the top read live radio state out of esp-idf's
+//! own globals, which needs no `Wifi` handle — that is what lets `/api` and
+//! the LCD thread read RSSI and IP without contending for the supervisor's
+//! radio.
+
 use esp_idf_hal::modem::WifiModemPeripheral;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::ipv4::{
@@ -15,14 +28,47 @@ use log::{info, warn};
 
 use esp32_battery_logic::WifiCredentials;
 
+use core::fmt::Write as _;
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 pub const HOSTNAME: &str = "battery";
 const HTTP_PORT: u16 = 80;
 pub const AP_SSID: &str = "Battery-Setup";
-pub const AP_PASS: &str = "01010101";
+/// Setup-AP passphrase, derived per unit rather than written down here — a
+/// constant would let anyone who has read this repository onto any unit's
+/// setup AP for as long as one is up.
+///
+/// `HMAC(ota key, "ap-pass" ‖ SoftAP MAC)`, rendered as 12 hex characters.
+/// The MAC alone would buy nothing, since it is the BSSID and goes out in
+/// every beacon; the build-time OTA key is what makes the result unguessable
+/// from radio range. 48 bits is far past reach for an AP that is only up
+/// while the unit has no working credentials.
+///
+/// The owner reads it off the LCD's WiFi Setup screen, or out of the boot log
+/// on a build with no panel. That second route also puts it in the `/api/log`
+/// ring — which is reachable only from the dashboard, i.e. only once the unit
+/// is already on the network this passphrase exists to get it onto.
+pub static AP_PASS: LazyLock<heapless::String<12>> = LazyLock::new(|| {
+    let mut mac = [0u8; 6];
+    // WIFI_SOFTAP: the address this AP will actually beacon under, so the
+    // passphrase is tied to the interface it protects.
+    let err = unsafe {
+        esp_idf_svc::sys::esp_read_mac(
+            mac.as_mut_ptr(),
+            esp_idf_svc::sys::esp_mac_type_t_ESP_MAC_WIFI_SOFTAP,
+        )
+    };
+    assert_eq!(err, 0, "esp_read_mac(WIFI_SOFTAP) failed");
+
+    let subkey = crate::ota::derive_subkey("ap-pass", &mac);
+    let mut pass = heapless::String::new();
+    for byte in &subkey[..6] {
+        write!(pass, "{byte:02x}").expect("12 hex chars fit a String<12>");
+    }
+    pass
+});
 pub const AP_GATEWAY: [u8; 4] = [192, 168, 71, 1];
 const MAX_SCAN_APS: usize = 10;
 /// Max staleness before `refresh_scan_if_stale` runs another `scan_n`.
@@ -98,7 +144,7 @@ fn sta_config(creds: &WifiCredentials) -> ClientConfiguration {
 fn ap_config() -> AccessPointConfiguration {
     AccessPointConfiguration {
         ssid: AP_SSID.try_into().unwrap(),
-        password: AP_PASS.try_into().unwrap(),
+        password: AP_PASS.as_str().try_into().unwrap(),
         auth_method: esp_idf_svc::wifi::AuthMethod::WPA2Personal,
         channel: 1,
         max_connections: 4,
@@ -120,11 +166,9 @@ pub fn setup_mdns() -> EspMdns {
     mdns
 }
 
-/// Raw radio driver. Created once at boot and immediately consumed into
-/// either `StaWifi` or `MixedWifi` via `into_sta` / `into_mixed`. Mode
-/// switches consume the current mode wrapper and produce the other one,
-/// so the type system enforces "the radio is in mode X" at every call
-/// site instead of relying on a documented call ordering.
+/// Raw radio driver, before a mode has been chosen. Holds the netif pair —
+/// DHCP client for STA, router with the AP subnet for the AP half — so both
+/// modes are configured the same way whichever one it is consumed into.
 pub struct WifiDriver<'d> {
     wifi: BlockingWifi<EspWifi<'d>>,
 }
@@ -211,7 +255,9 @@ impl<'d> WifiDriver<'d> {
     }
 
     pub fn into_mixed(mut self, creds: Option<&WifiCredentials>) -> MixedWifi<'d> {
-        info!("Starting AP: {}", AP_SSID);
+        // Logged so a build without a panel still has somewhere to read the
+        // passphrase; on one with a panel the WiFi Setup screen shows it.
+        info!("Starting AP: {} / {}", AP_SSID, AP_PASS.as_str());
         // Always Mixed mode so the STA interface is available for scanning.
         self.start_with(Self::mixed_config(creds));
         info!("AP started");

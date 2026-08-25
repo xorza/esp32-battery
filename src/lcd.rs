@@ -493,7 +493,12 @@ where
         let badge = trying.then_some(("Connecting...", COLOR_DISCHARGING));
         self.title_row(LOWER_TITLE_TOP, "WiFi Setup", Rgb565::WHITE, badge);
         self.kv_row(LOWER_ROW1_TOP, "SSID", crate::wifi::AP_SSID, COLOR_VOLTAGE);
-        self.kv_row(LOWER_ROW2_TOP, "PASS", crate::wifi::AP_PASS, COLOR_VOLTAGE);
+        self.kv_row(
+            LOWER_ROW2_TOP,
+            "PASS",
+            crate::wifi::AP_PASS.as_str(),
+            COLOR_VOLTAGE,
+        );
 
         let [a, b, c, d] = crate::wifi::AP_GATEWAY;
         let mut buf = heapless::String::<32>::new();

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use esp_idf_svc::http::server::EspHttpServer;
@@ -34,7 +34,9 @@ impl NetStatusHandle {
         self.0.store(s as u8, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)] // consumed by the lcd thread
+    /// Read by the LCD thread, which is the only consumer — so a build
+    /// without a panel does not carry it.
+    #[cfg(feature = "lcd")]
     pub fn load(&self) -> NetStatus {
         let v = self.0.load(Ordering::Relaxed);
         NetStatus::from_repr(v).expect("invalid NetStatus discriminant")
@@ -80,11 +82,11 @@ impl SubmissionStatusHandle {
 /// `CaptiveIdle`. An atomic so the HTTP handler thread can signal
 /// without holding any FSM lock.
 #[derive(Clone)]
-pub struct ResetSignal(Arc<std::sync::atomic::AtomicBool>);
+pub struct ResetSignal(Arc<AtomicBool>);
 
 impl ResetSignal {
     pub fn new() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        Self(Arc::new(AtomicBool::new(false)))
     }
 
     pub fn raise(&self) {
@@ -127,10 +129,9 @@ impl CaptiveBundle {
 }
 
 /// The resources a phase owns. Only two shapes exist, because the five
-/// phases collapse to two: Mixed radio with the captive bundle, or
-/// STA-only with the dashboard. `debug_assert_matches_phase` keeps the
-/// mapping honest each tick, which is what the old fused enum enforced
-/// by construction.
+/// phases collapse to two: Mixed radio with the captive bundle, or STA-only
+/// with the dashboard. Which shape is live is *not* enforced against the
+/// phase by construction — see [`Self::warn_out_of_step`].
 pub enum NetResources {
     Mixed {
         wifi: MixedWifi<'static>,
