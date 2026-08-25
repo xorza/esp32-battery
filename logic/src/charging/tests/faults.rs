@@ -404,6 +404,48 @@ fn latched_fault_stays_parked_in_none() {
 }
 
 #[test]
+fn latched_supervisor_re_disables_a_resurfaced_output() {
+    // A latch is only as good as the output actually being off. Someone
+    // presses the front panel, or the buck re-enables itself: the fault
+    // that latched it has not gone anywhere, so the supervisor must say so
+    // again rather than sit in Action::None watching a pack charge.
+    let mut s = active(lfp_4s());
+    latch_self_disable(&mut s, ProtectionStatus::Ocp);
+    let fault = FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ocp);
+    // Drain bring-up and the original latch so what is asserted below is
+    // the re-disables alone.
+    drain_transitions(&mut s);
+
+    // Two full episodes, to prove the cycle is stable rather than a
+    // one-shot that leaves the machine somewhere odd.
+    for episode in 0..2 {
+        let a = s.tick(poll_with_output(&s, BuckOutput::On), TICK);
+        assert!(matches_disable(&a, fault), "episode {episode}");
+        // The ticket goes uncommitted, so — exactly as on the first latch
+        // — the next tick asks again.
+        let a = s.tick(poll_with_output(&s, BuckOutput::On), TICK);
+        assert!(matches_disable(&a, fault), "episode {episode}: no retry");
+        accept_disable(&mut s, a);
+        assert_eq!(s.state(), ChargeState::Latched, "episode {episode}");
+        // Output confirmed off again: quiet, and still the same fault.
+        let p = poll_with_output(
+            &s,
+            BuckOutput::Off {
+                cause: ProtectionStatus::Normal,
+            },
+        );
+        assert!(matches!(s.tick(p, TICK), Action::None), "episode {episode}");
+        assert_eq!(s.fault(), Some(fault), "episode {episode}");
+    }
+
+    assert_eq!(
+        drain_transitions(&mut s),
+        [ChargeTransition::Latched, ChargeTransition::Latched],
+        "a buck that keeps resurfacing must keep showing up in the log"
+    );
+}
+
+#[test]
 fn buck_output_on_in_pending_latches() {
     // Boot expects the buck OFF — boot_sequence wrote set_output(false)
     // and S_INI=0. If OUTPUT_EN reads ON anyway, regulation is happening

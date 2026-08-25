@@ -56,7 +56,7 @@ fn phase_changes_are_not_latch_transitions() {
     // may reach the log — otherwise every Float↔Absorb swing would drown
     // the transitions that matter.
     let mut s = active(lfp_4s());
-    while s.pop_transition().is_some() {}
+    drain_transitions(&mut s);
     enter_absorb(&mut s);
     assert_eq!(s.state(), ChargeState::Absorb);
     assert_eq!(s.pop_transition(), None);
@@ -65,7 +65,7 @@ fn phase_changes_are_not_latch_transitions() {
 #[test]
 fn transition_ring_drops_oldest_when_undrained() {
     let mut s = active(lfp_4s());
-    while s.pop_transition().is_some() {}
+    drain_transitions(&mut s);
     let p_lvp = poll_with_output(&s, BuckOutput::Off {
         cause: ProtectionStatus::Lvp,
     });
@@ -76,10 +76,7 @@ fn transition_ring_drops_oldest_when_undrained() {
         s.tick(p_lvp, TICK);
         s.tick(p_on, TICK);
     }
-    let mut drained = Vec::new();
-    while let Some(t) = s.pop_transition() {
-        drained.push(t);
-    }
+    let drained = drain_transitions(&mut s);
     assert_eq!(drained.len(), TRANSITION_BUFFER);
     // The first hold/clear pair fell out, so what remains starts on a
     // hold and still alternates.

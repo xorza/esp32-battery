@@ -176,13 +176,25 @@ fn enter_absorb(s: &mut ChargeSupervisor) {
     assert_eq!(s.state(), ChargeState::Absorb);
 }
 
+/// Drain the buffered transitions the way the firmware's poll loop does.
+/// Tests that only care about a later stretch drain first and discard.
+fn drain_transitions(s: &mut ChargeSupervisor) -> Vec<ChargeTransition> {
+    let mut out = Vec::new();
+    while let Some(t) = s.pop_transition() {
+        out.push(t);
+    }
+    out
+}
+
 /// A poll where the buck reports `output` and everything else is drift-free.
-/// Built from `expected_setpoints` rather than `expected_poll` so it stays
-/// valid across the state changes these tests drive.
+/// Takes the output as an argument rather than deriving it like
+/// `expected_poll` does, so it stays valid across the state changes these
+/// tests drive — including into a latched state, which keeps no setpoint
+/// expectation of its own.
 fn poll_with_output(s: &ChargeSupervisor, output: BuckOutput) -> PollResult {
     PollResult {
         output: Some(output),
-        setpoints: Some(s.expected_setpoints()),
+        setpoints: Some(s.readback_setpoints()),
         battery: b(OK_V, -0.1),
     }
 }

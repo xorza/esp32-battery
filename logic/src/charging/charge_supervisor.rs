@@ -301,13 +301,24 @@ impl ChargeSupervisor {
         self.regulate(battery, elapsed)
     }
 
+    /// The disable owed for the fault already latched. Both terminal
+    /// states produce it: `Tripping` every tick until the write is
+    /// confirmed, and `Latched` whenever the output turns up on again.
+    fn disable_for_latched_fault(&self) -> Action {
+        Action::DisableOutput(DisableTicket {
+            reason: self
+                .fault
+                .expect("a latched state carries the fault that put it there"),
+        })
+    }
+
     /// A fault latched. Emits the disable and keeps emitting it until the
     /// caller confirms — dropping the ticket is how a failed write retries.
     fn on_fault(&mut self, reason: FaultReason) -> Action {
         self.fault = Some(reason);
         self.inhibit = None;
         self.step(ChargeEvent::Fault);
-        Action::DisableOutput(DisableTicket { reason })
+        self.disable_for_latched_fault()
     }
 
     /// Bring the machine into agreement with what OUTPUT_EN reports, before
@@ -325,12 +336,17 @@ impl ChargeSupervisor {
         match (self.state, p.output) {
             // Re-emit until the caller confirms the write; dropping the
             // ticket is how a failed disable becomes a retry.
-            (ChargeState::Tripping, _) => Some(Action::DisableOutput(DisableTicket {
-                reason: self
-                    .fault
-                    .expect("Tripping carries the fault that put it there"),
-            })),
-            // Reboot-only recovery: the supervisor parks here.
+            (ChargeState::Tripping, _) => Some(self.disable_for_latched_fault()),
+            // A latch is only as good as the output actually being off. A
+            // buck that comes back on — front panel, a device-side
+            // re-enable — has not made the fault go away, so say it again
+            // rather than watch a pack charge under a supervisor that gave
+            // up. Back to `Tripping`, which re-emits until confirmed.
+            (ChargeState::Latched, Some(BuckOutput::On)) => {
+                self.step(ChargeEvent::SelfEnabled);
+                Some(self.disable_for_latched_fault())
+            }
+            // Output confirmed off: reboot-only recovery, nothing to do.
             (ChargeState::Latched, _) => Some(Action::None),
             // A self-clearing cause (see `ProtectionPolicy`) is the buck
             // waiting on a condition rather than failing, and it may
@@ -349,23 +365,29 @@ impl ChargeSupervisor {
                     Some(self.on_fault(FaultReason::OutputUnexpectedlyOff(cause)))
                 }
             }
-            // The buck brought its own output back. Setpoints went
-            // untouched through the hold — the gauntlet's first check
-            // verifies that on this very tick — so regulation resumes at
-            // known targets. This is why `Boot` and `Hold*` are separate
-            // states rather than one "output off" flag: the same reading
-            // means recovery from one and an anomaly from the other.
-            (s, Some(BuckOutput::On)) if s.holding() => {
-                self.step(ChargeEvent::SelfEnabled);
-                None
-            }
-            // `boot_sequence` wrote set_output(false) and verified
-            // OUTPUT_EN=0, so an ON reading here is a real anomaly
-            // (firmware bug, panel toggle, EMI on the button GPIO). Unlike
-            // every other bring-up condition there IS something sourcing
-            // under setpoints we have not confirmed, so this one latches.
-            (ChargeState::Boot, Some(BuckOutput::On)) => {
-                Some(self.on_fault(FaultReason::OutputOnInPending))
+            // Output on while we believe it off. Out of a hold that is the
+            // recovery being waited for: setpoints went untouched through
+            // it — the gauntlet's first check verifies that on this very
+            // tick — so regulation resumes at known targets. This is why
+            // `Boot` and `Hold*` are separate states rather than one
+            // "output off" flag: the same reading means recovery from one
+            // and an anomaly from the other.
+            //
+            // Anywhere else in bring-up it is an anomaly (firmware bug,
+            // panel toggle, EMI on the button GPIO) — `boot_sequence` wrote
+            // set_output(false) and verified OUTPUT_EN=0. Unlike every
+            // other bring-up condition there IS something sourcing under
+            // setpoints we never confirmed, so that one latches. Guarding
+            // on `bringing_up` rather than naming `Boot` is what makes a
+            // bring-up state added later fail closed instead of falling
+            // through to the catch-all and being ignored while it sources.
+            (s, Some(BuckOutput::On)) if s.bringing_up() => {
+                if s.holding() {
+                    self.step(ChargeEvent::SelfEnabled);
+                    None
+                } else {
+                    Some(self.on_fault(FaultReason::OutputOnInPending))
+                }
             }
             _ => None,
         }

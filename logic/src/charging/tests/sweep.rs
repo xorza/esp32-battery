@@ -75,6 +75,12 @@ fn random_poll(rng: &mut Rng, s: &ChargeSupervisor) -> PollResult {
                 _ => ProtectionStatus::Normal,
             },
         }),
+        // A latched buck that turns up ON again — front panel, or a
+        // device-side re-enable. Gated on the state because it only means
+        // anything there, which also keeps it from perturbing the
+        // enable/step counters: by the time it can fire, the run's charging
+        // is over and only `saw_disable` can still move.
+        4..=60 if s.state() == ChargeState::Latched => Some(BuckOutput::On),
         _ => Some(expected_output(s)),
     };
     PollResult {
@@ -132,7 +138,9 @@ fn invariants_hold_under_randomized_input() {
                 "seed {seed} tick {tick}: fault and inhibit both set"
             );
 
-            // Tripped is absorbing: nothing may re-energise after a latch.
+            // A latch is absorbing. The output may still need disabling
+            // again — a buck that resurfaces gets told twice — but nothing
+            // may ever re-energise from here.
             if latched {
                 assert!(
                     matches!(a, Action::None | Action::DisableOutput(_)),

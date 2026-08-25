@@ -54,7 +54,10 @@ pub(super) enum ChargeEvent {
     Fault,
     /// The buck self-disabled on a self-clearing cause while sourcing.
     SelfDisabled,
-    /// The buck re-enabled its own output once the cause cleared.
+    /// The buck's output came back on without us asking. Out of a hold
+    /// that is the recovery being waited for; out of `Latched` it is a
+    /// pack charging under a supervisor that already gave up, and the
+    /// answer is to go disable it again.
     SelfEnabled,
     /// Caller confirmed `set_output(true)`, with the pack resting at the
     /// CV plateau — it is full, so regulation starts at the target the
@@ -85,6 +88,10 @@ pub(super) enum ChargeEvent {
 /// one is left to the exit taper. And `ToAbsorb`/`ToFloat` fall back to
 /// the hold for the target the device still holds, not the one they were
 /// moving to, because an uncommitted ticket never reached the register.
+/// The third is `Latched` accepting `SelfEnabled` back into `Tripping`: a
+/// latch is only as good as the output actually being off, so a buck that
+/// resurfaces is re-disabled rather than ignored. Nothing in the column
+/// leads anywhere that sources.
 #[rustfmt::skip]
 const TRANSITIONS: [[Option<ChargeState>; ChargeEvent::COUNT]; ChargeState::COUNT] = {
     const X: Option<ChargeState> = None;
@@ -106,7 +113,7 @@ const TRANSITIONS: [[Option<ChargeState>; ChargeEvent::COUNT]; ChargeState::COUN
         /* ToAbs  */ [TRIP, HLDF,     X,     X,       X,      X,      X,    ABS,       X],
         /* ToFlt  */ [TRIP, HLDA,     X,     X,       X,      X,      X,    FLT,       X],
         /* Tripng */ [   X,    X,     X,     X,       X,      X,      X,      X,    LTCH],
-        /* Latchd */ [   X,    X,     X,     X,       X,      X,      X,      X,       X],
+        /* Latchd */ [   X,    X,  TRIP,     X,       X,      X,      X,      X,       X],
     ]
 };
 
@@ -248,6 +255,12 @@ mod tests {
                 let Some(to) = from.next(event) else { continue };
                 reached[to as usize] = true;
                 assert_ne!(from, to, "{from:?} on {event:?} is a self-loop");
+                if matches!(from, ChargeState::Tripping | ChargeState::Latched) {
+                    assert!(
+                        !to.sourcing(),
+                        "{from:?} on {event:?} re-energises after a latch"
+                    );
+                }
                 match event {
                     // A fault always disables, and only a sourcing or
                     // bring-up state can still take one.
@@ -262,12 +275,17 @@ mod tests {
                         assert!(to.holding(), "{from:?} → {to:?}");
                         assert_eq!(to.setpoint_phase(), from.setpoint_phase(), "{from:?}");
                     }
-                    // Recovery and bring-up both start regulating, and
-                    // neither may change the V_SET without a write.
+                    // Out of a hold this is recovery — start regulating,
+                    // without changing V_SET, which no write has moved.
+                    // Out of `Latched` it is the opposite: go re-disable.
                     ChargeEvent::SelfEnabled => {
-                        assert!(from.holding(), "{from:?}");
-                        assert!(to.sourcing(), "{from:?} → {to:?}");
-                        assert_eq!(to.setpoint_phase(), from.setpoint_phase(), "{from:?}");
+                        if from.holding() {
+                            assert!(to.sourcing(), "{from:?} → {to:?}");
+                            assert_eq!(to.setpoint_phase(), from.setpoint_phase(), "{from:?}");
+                        } else {
+                            assert_eq!(from, ChargeState::Latched, "{from:?}");
+                            assert_eq!(to, ChargeState::Tripping, "{from:?}");
+                        }
                     }
                     ChargeEvent::Enabled | ChargeEvent::EnabledBelowFull => {
                         assert!(from.bringing_up(), "{from:?}");
@@ -296,10 +314,6 @@ mod tests {
         for (i, r) in reached.iter().enumerate() {
             assert!(*r, "{:?} is unreachable", ChargeState::VARIANTS[i]);
         }
-        // Terminal: nothing leaves the latched state without a reboot.
-        for &event in ChargeEvent::VARIANTS {
-            assert_eq!(ChargeState::Latched.next(event), None, "{event:?}");
-        }
     }
 
     /// The event log's four entries against the moves that produce them.
@@ -308,7 +322,7 @@ mod tests {
     #[test]
     fn transitions_log_the_move_they_mean() {
         use ChargeState::*;
-        let cases: [(ChargeState, ChargeState, Option<ChargeTransition>); 10] = [
+        let cases: [(ChargeState, ChargeState, Option<ChargeTransition>); 11] = [
             (Boot, Float, Some(ChargeTransition::Energised)),
             (Boot, ToAbsorb, Some(ChargeTransition::Energised)),
             (HoldFloat, Float, Some(ChargeTransition::ProtectCleared)),
@@ -317,6 +331,9 @@ mod tests {
             (ToFloat, HoldAbsorb, Some(ChargeTransition::ProtectHold)),
             (Absorb, Tripping, Some(ChargeTransition::Latched)),
             (Boot, Tripping, Some(ChargeTransition::Latched)),
+            // Each re-disable is its own episode — that a buck keeps
+            // resurfacing is exactly what the log should show.
+            (Latched, Tripping, Some(ChargeTransition::Latched)),
             // Retargets are already covered by the phase log, and the
             // disable ack is covered by the latch entry that preceded it.
             (Float, ToAbsorb, None),

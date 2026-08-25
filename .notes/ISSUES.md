@@ -1,10 +1,5 @@
 # Open issues
 
-- `reconcile` answers `Action::None` for `ChargeState::Latched` whatever the
-  buck reports. If its output comes back on after a latch (front-panel toggle,
-  a device-side re-enable), the supervisor never notices and never
-  re-disables.
-
 - `MAX_ABSORB` is clocked with `Debounce::step`, so any tick where the pack
   leaves the `ABSORB_CV_BAND_V` window zeroes the accumulator. A load that
   periodically pulls the buck out of CV keeps the absorb cap from firing.
