@@ -36,3 +36,16 @@ pub struct BatterySample {
     pub voltage: f32,
     pub current: f32,
 }
+
+impl BatterySample {
+    /// Charging current as a positive number.
+    ///
+    /// The INA228 wiring on this board reads battery current **negative
+    /// while charging**, so every threshold in `charging` is stated
+    /// positive and compared against this. Named rather than left as a
+    /// unary minus at each site: a dropped sign here reads a discharging
+    /// pack as one taking charge.
+    pub(super) fn charging_a(self) -> f32 {
+        -self.current
+    }
+}

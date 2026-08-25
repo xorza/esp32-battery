@@ -22,10 +22,10 @@ pub use charging::fault_reason::FaultReason;
 pub use charging::inhibit_reason::InhibitReason;
 pub use charging::phase::Phase;
 pub use charging::poll_result::{BatterySample, BuckOutput, PollResult};
-pub use charging::profile::Profile;
+pub use charging::profile::{BuckSetup, Profile, SupplyBudget};
 pub use charging::voltage_writer::{VoltageWriteOutcome, VoltageWriter, apply_update_voltage};
 pub use charging::protection_policy::ProtectionPolicy;
-pub use charging::{INPUT_LVP_MARGIN_V, SETPOINT_DRIFT_TOL};
+pub use charging::SETPOINT_DRIFT_TOL;
 
 pub use data::charge_status::ChargeStatus;
 pub use data::{Ina228Reading, PsReading, Sample, SensorData};

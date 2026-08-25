@@ -91,7 +91,9 @@ state the new order in the doc comment as the specification.
 
 ## Groundwork B — separate pack profile from board supply
 
-**Prerequisite for issue 5.**
+**DONE**, with `SupplyBudget` and `BuckSetup` living in `profile.rs` as
+satellites of `Profile` rather than in their own module, and `load_a`
+shipped at `0.0` pending a measurement. Prerequisite for issue 5.
 
 ### Why
 
@@ -338,7 +340,8 @@ pins it.
 
 ## Issue 5 — OCP ignores the load; charge current is never supervised
 
-**Severity: high for a UPS with a real load.** Two halves, and the second
+**DONE.** `ChargeOvercurrent` latches for now; it becomes a park in phase 6.
+Severity: high for a UPS with a real load. Two halves, and the second
 is what makes the first safe.
 
 ### 5a. Size I_SET and OCP for charge + load
@@ -507,8 +510,8 @@ whole point of the state existing.
 | 1 | `Latched` table cell | 1 | re-disables a resurfaced output | **done** |
 | 2 | leaky absorb clock + `MAX_CHARGE` | 2 | new `ChargeTimeout` fault | **done** |
 | 3 | `rested_full` on SoC | 4 | full packs stop forcing an Absorb cycle | **done** |
-| 4 | Groundwork B + I_SET/OCP + `ChargeOvercurrent` | 5 | I_SET rises by the load budget | next |
-| 5 | `HoldBudget` | 3 | new `ProtectionFlapping` fault | |
+| 4 | Groundwork B + I_SET/OCP + `ChargeOvercurrent` | 5 | I_SET rises by the load budget | **done** |
+| 5 | `HoldBudget` | 3 | new `ProtectionFlapping` fault | next |
 | 6 | `FaultResponse` + `ToParked`/`Parked` | 8 (partial) | three faults stop killing the load | |
 | 7 | pack temperature | 7 | hardware first | |
 
@@ -527,9 +530,11 @@ that table in the same commit as each variant.
 
 ## Decisions needed before implementing
 
-1. **Load budget (phase 4).** Worst-case continuous current on the buck
-   output. Everything in 5a/5b is sized from it, and it moves the maximum
-   supportable pack capacity.
+1. **Load budget (phase 4).** STILL OPEN — shipped as `SUPPLY.load_a = 0.0`
+   in `main.rs`, which reproduces the pre-budget I_SET and OCP exactly. Until
+   it is measured, a real UPS load silently derates charging by whatever it
+   draws. Setting it is a one-line edit; the compile-time ceilings will
+   refuse a combination the hardware cannot deliver.
 2. ~~**`MAX_CHARGE` (phase 2).**~~ Shipped at 8 h. Revisit once the load
    budget lands in phase 4 — the slowest legitimate empty→full runs at the
    *delivered* current, `i_set_a - load_a`, not `regulation_a`, so a large

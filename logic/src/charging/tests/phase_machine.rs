@@ -7,7 +7,7 @@ use super::*;
 
 #[test]
 fn starts_in_float_at_float_voltage() {
-    let s = ChargeSupervisor::new(lfp_4s());
+    let s = supervisor(lfp_4s());
     // Boot is an output-off state, but it holds the float target that
     // `boot_sequence` wrote — which is what the drift check compares
     // against from the very first tick.

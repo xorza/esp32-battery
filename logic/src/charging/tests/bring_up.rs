@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn pending_emits_enable_on_first_healthy_tick() {
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
     assert!(matches!(a, Action::EnableOutput { .. }));
 }
@@ -14,7 +14,7 @@ fn pending_emits_enable_on_first_healthy_tick() {
 fn pending_re_emits_enable_until_committed() {
     // Until the caller commits an EnableTicket, every tick re-emits EnableOutput
     // — mirrors the DisableOutput retry behavior on failed disable writes.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     for _ in 0..3 {
         let a = ok_tick(&mut s, b(OK_V, -0.1), TICK);
         assert!(matches!(a, Action::EnableOutput { .. }));
@@ -27,7 +27,7 @@ fn low_pack_resumes_absorb_after_bringup() {
     // near float_v, so it can't draw enter_absorb_a (3 A here). The old
     // current-only gate left it stuck in Float forever. Now the resting
     // SoC at bring-up routes it back into Absorb regardless of current.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     // LOW_V = 13.0 is 40 % on the OCV curve; current -0.1 A is far under
     // enter_absorb_a — exactly the stuck scenario.
     let a = ok_tick(&mut s, b(LOW_V, -0.1), TICK);
@@ -56,7 +56,7 @@ fn full_pack_stays_float_after_bringup() {
     // reboot the unit ever performed.
     let profile = lfp_4s();
     for rest_v in [CV_V, profile.float_v] {
-        let mut s = ChargeSupervisor::new(profile);
+        let mut s = supervisor(profile);
         let a = ok_tick(&mut s, b(rest_v, -0.1), TICK);
         assert!(
             !accept_enable(&mut s, a),
@@ -95,7 +95,7 @@ fn resume_gate_reads_resting_soc_and_only_when_rested() {
         (profile.float_v, profile.exit_absorb_a, true),
     ];
     for (rest_v, current, want_resume) in cases {
-        let mut s = ChargeSupervisor::new(profile);
+        let mut s = supervisor(profile);
         let a = ok_tick(&mut s, b(rest_v, current), TICK);
         assert_eq!(
             accept_enable(&mut s, a),
@@ -115,7 +115,7 @@ fn full_is_relative_to_the_profile_not_the_chemistry_hundred_percent_point() {
     // own float target, so a pack rested there is full for both.
     for chemistry in [Chemistry::LiFePo4, Chemistry::LiIon] {
         let profile = Profile::for_pack(chemistry, 3, 50.0);
-        let mut s = ChargeSupervisor::new(profile);
+        let mut s = supervisor(profile);
         let a = ok_tick(&mut s, b(profile.float_v, -0.1), TICK);
         assert!(
             !accept_enable(&mut s, a),
@@ -142,7 +142,7 @@ fn pending_overvolt_inhibits_from_first_sample_and_clears() {
     // pack comes back under the line.
     let absorb = lfp_4s().absorb_v; // 14.4
     let trip = absorb + OV_MARGIN_V; // 14.6
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
 
     let a = ok_tick(&mut s, b(trip + 0.5, -0.1), TICK);
     assert!(matches!(a, Action::None));
@@ -171,7 +171,7 @@ fn pending_overvolt_inhibits_from_first_sample_and_clears() {
 fn pending_drift_inhibits_without_enabling() {
     // Drift while the output is off blocks bring-up but latches nothing
     // — and a return to the commanded setpoints releases it.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     let p = PollResult {
         setpoints: Some(Setpoints {
             v_set: 12.0,
@@ -199,7 +199,7 @@ fn pending_no_battery_inhibits_indefinitely() {
     // already off there is nothing to disable, so a dead sensor at boot
     // no longer strands the unit behind a reboot. The inhibit reason
     // sharpens from "none yet" to "stale" once the debounce fires.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
         let a = ok_tick(&mut s, None, TICK);
         assert!(matches!(a, Action::None));
@@ -242,7 +242,7 @@ fn pending_does_not_enable_without_setpoint_readback() {
     // for output-on with no closed-loop confirmation the buck is even
     // reachable. Modbus-down ticks emit None until the modbus_err
     // debounce eventually latches ModbusUnhealthy.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     let p = PollResult {
         setpoints: None,
         output: None,
@@ -262,7 +262,7 @@ fn buck_output_off_in_pending_does_not_fault() {
     // At boot the buck IS supposed to be off — output_on=Some(false) is
     // normal, must not latch. expected_poll returns Off for a bring-up
     // state.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     let a = s.tick(expected_poll(&s, b(OK_V, -0.1)), TICK);
     assert!(matches!(a, Action::EnableOutput { .. }));
     assert_eq!(s.fault(), None);
@@ -287,7 +287,7 @@ fn pending_does_not_enter_absorb_even_at_high_charge_current() {
     // phase machine MUST NOT advance on it — only `EnableOutput` may be
     // emitted, and after the caller acks we land in Float.
     let profile = lfp_4s();
-    let mut s = ChargeSupervisor::new(profile);
+    let mut s = supervisor(profile);
     // Sample reports current well above enter_absorb_a (3 A). If the phase
     // machine ran during bring-up it would emit UpdateVoltage(absorb_v).
     let high_current = -10.0;

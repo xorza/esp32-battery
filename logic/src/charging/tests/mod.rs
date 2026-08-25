@@ -11,7 +11,7 @@ use crate::charging::fault_reason::FaultReason;
 use crate::charging::inhibit_reason::InhibitReason;
 use crate::charging::phase::Phase;
 use crate::charging::poll_result::{BatterySample, BuckOutput, PollResult};
-use crate::charging::profile::Profile;
+use crate::charging::profile::{Profile, SupplyBudget};
 use crate::charging::voltage_writer::{VoltageWriteOutcome, VoltageWriter, apply_update_voltage};
 use crate::error_log::{ChargeTransition, XyError};
 use xy_modbus::{ProtectionStatus, RtuError, Setpoints, XyError as BusError};
@@ -31,6 +31,21 @@ mod voltage_sequencing;
 /// exercise threshold edges expect those numbers.
 fn lfp_4s() -> Profile {
     Profile::for_pack(Chemistry::LiFePo4, 4, 50.0)
+}
+
+/// The board budget these tests assume: a 24 V rail and no load, so
+/// `i_set_a` is the pack's own charge rate and every threshold figure the
+/// tests quote still reads as written. `ChargeOvercurrent` is measured
+/// against `regulation_a` either way, so it is unaffected by the choice.
+const TEST_SUPPLY: SupplyBudget = SupplyBudget {
+    input_nominal_v: 24.0,
+    load_a: 0.0,
+};
+
+/// A fresh supervisor for `profile`, programmed the way the firmware
+/// programs one.
+fn supervisor(profile: Profile) -> ChargeSupervisor {
+    ChargeSupervisor::new(profile, profile.buck_setup(TEST_SUPPLY).i_set_a)
 }
 
 fn approx(a: f32, b: f32) -> bool {
@@ -166,9 +181,15 @@ fn active(profile: Profile) -> ChargeSupervisor {
     // the pack reads as full and the supervisor lands in Float — the
     // precondition these tests assume. A resting voltage below the plateau
     // would (correctly) resume Absorb; that path has its own tests.
-    let bring_up_v = profile.absorb_v;
-    let mut s = ChargeSupervisor::new(profile);
-    let a = ok_tick(&mut s, b(bring_up_v, -0.1), TICK);
+    bring_up(supervisor(profile), profile.absorb_v)
+}
+
+/// Drive `s` from `Boot` into `Float`, energising at a resting `rest_v` that
+/// must read as full — anything else resumes Absorb instead. Split out from
+/// `active` so a supervisor built with a non-default `i_set_a` can reach the
+/// same starting point.
+fn bring_up(mut s: ChargeSupervisor, rest_v: f32) -> ChargeSupervisor {
+    let a = ok_tick(&mut s, b(rest_v, -0.1), TICK);
     assert!(!accept_enable(&mut s, a), "full pack must not resume Absorb");
     assert_eq!(s.state(), ChargeState::Float);
     s

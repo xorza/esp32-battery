@@ -34,6 +34,11 @@ pub enum FaultReason {
     /// cell, a wiring fault, a load eating the whole charge current — would
     /// otherwise have no cap on it at all.
     ChargeTimeout,
+    /// Pack drew more than `OVERCURRENT_TOL ×` the profile's charge rate for
+    /// `OVERCURRENT_DURATION`. The buck's own CC loop and OCP bound *total*
+    /// output current, which includes the UPS load; this is the only check
+    /// that sees what the pack itself is taking.
+    ChargeOvercurrent,
     /// XY7025 setpoint readback (V_SET or I_SET) disagreed with what we
     /// commanded. The buck is sourcing under unknown setpoints — disable
     /// before it can do damage. Triggers immediately, no debounce: the
@@ -63,6 +68,7 @@ impl std::fmt::Display for FaultReason {
             Self::Overvoltage => f.write_str("pack overvoltage"),
             Self::AbsorbTimeout => f.write_str("absorb time cap reached"),
             Self::ChargeTimeout => f.write_str("total charge time cap reached"),
+            Self::ChargeOvercurrent => f.write_str("pack charge overcurrent"),
             Self::SettingsDrift => f.write_str("setpoint readback drift"),
             Self::OutputUnexpectedlyOff(s) => write!(f, "buck self-disabled ({s})"),
             Self::OutputOnInPending => f.write_str("buck output on while supervisor pending"),

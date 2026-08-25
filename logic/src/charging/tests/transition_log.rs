@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn transitions_record_the_route_not_just_the_destination() {
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     assert_eq!(s.pop_transition(), None, "nothing before the first tick");
 
     // Bring-up at the CV plateau: full pack, parks in Float.

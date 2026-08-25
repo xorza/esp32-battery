@@ -28,7 +28,7 @@ use crate::board::XyPins;
 use crate::clock::{EventRecorder, LoopTimer};
 use crate::reboot;
 use crate::task_wdt;
-use crate::{PACK_PROFILE, SAFETY};
+use crate::{BUCK, PACK_PROFILE};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -335,8 +335,8 @@ fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<u16, BootError> {
     }
     // Scales decode correctly but the ceilings `set_voltage` and friends
     // enforce were written for the XY7025. Worth saying out loud; not
-    // worth refusing over, since SAFETY is programmed into the device's
-    // own protection registers either way.
+    // worth refusing over, since our own trip thresholds are programmed
+    // into the device's protection registers either way.
     if !check.limits_match {
         warn!(
             "XY MODEL 0x{:04X}: scales match but limit ceilings differ from XY7025",
@@ -350,17 +350,17 @@ fn boot_sequence<D: XyDevice>(xy: &mut D) -> Result<u16, BootError> {
     // that stale value contaminating the per-tick read in `poll`.
     xy.clear_protection_status()?;
     xy.set_power_on_default(false)?;
-    xy.set_safety_limits(SAFETY)?;
+    xy.set_safety_limits(BUCK.limits)?;
     xy.set_voltage(PACK_PROFILE.float_v)?;
-    xy.set_current_limit(PACK_PROFILE.regulation_a)?;
+    xy.set_current_limit(BUCK.i_set_a)?;
 
     let s = xy.read_status()?;
     verify("V_SET", PACK_PROFILE.float_v, s.setpoints.v_set)?;
-    verify("I_SET", PACK_PROFILE.regulation_a, s.setpoints.i_set)?;
+    verify("I_SET", BUCK.i_set_a, s.setpoints.i_set)?;
     let p = xy.read_safety_limits()?;
-    verify("OVP", SAFETY.ovp_v, p.ovp_v)?;
-    verify("OCP", SAFETY.ocp_a, p.ocp_a)?;
-    verify("LVP", SAFETY.lvp_v, p.lvp_v)?;
+    verify("OVP", BUCK.limits.ovp_v, p.ovp_v)?;
+    verify("OCP", BUCK.limits.ocp_a, p.ocp_a)?;
+    verify("LVP", BUCK.limits.lvp_v, p.lvp_v)?;
     // Confirm the disable actually took. set_output(false) and S_INI=0
     // both happened above; if OUTPUT_EN still reads 1, we don't trust
     // the device enough to hand off to the supervisor.
@@ -450,7 +450,7 @@ fn run<D: XyDevice>(
 
     let model_code = boot_with_retries(&mut xy, &recorder);
     charge_status.lock().unwrap().model_code = model_code;
-    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
+    let mut supervisor = ChargeSupervisor::new(PACK_PROFILE, BUCK.i_set_a);
 
     let mut protection = ProtectionLog::new();
     // Lapped after `poll`, so a tick is charged its own Modbus traffic as

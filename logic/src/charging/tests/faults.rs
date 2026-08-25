@@ -28,6 +28,11 @@ fn latch_self_disable(s: &mut ChargeSupervisor, cause: ProtectionStatus) {
 /// and what it latches as. The three share one shape, so they share their
 /// tests. Nothing says how to *clear* one, because a single healthy tick
 /// satisfies all three conditions at once.
+///
+/// `ChargeOvercurrent` is deliberately not here: feeding it means feeding a
+/// charge current far above `enter_absorb_a`, so its every tick also drives
+/// the phase machine and cannot answer `Action::None` the way this table
+/// requires. It carries its own window and reset coverage instead.
 #[derive(Debug)]
 struct DebouncedFault {
     name: &'static str,
@@ -335,6 +340,61 @@ fn drift_outranks_overvoltage_while_regulating() {
 }
 
 #[test]
+fn overcurrent_is_measured_on_the_pack_not_the_setpoint() {
+    // I_SET bounds the buck's *total* output current, load included, so it
+    // cannot hold the pack to its own rate: with an idle load the CC loop
+    // puts the whole setpoint into the battery. Only the INA228 sees what
+    // the pack takes, and `regulation_a` — not `i_set_a` — is the line.
+    let profile = lfp_4s();
+    let trip = profile.regulation_a * OVERCURRENT_TOL;
+
+    // Just under holds indefinitely, well past the window.
+    let mut s = active(profile);
+    for _ in 0..(OVERCURRENT_DURATION.as_secs() * 4) {
+        ok_tick(&mut s, b(OK_V, -(trip - 0.1)), TICK);
+    }
+    assert_eq!(s.fault(), None, "{trip} A is the line, not below it");
+
+    // A brief burst is not a fault: the window resets on one healthy tick,
+    // so the burst cannot accumulate across a quiet stretch.
+    let mut s = active(profile);
+    for _ in 0..(OVERCURRENT_DURATION.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, -(trip + 0.1)), TICK);
+    }
+    ok_tick(&mut s, b(OK_V, -1.0), TICK);
+    for _ in 0..(OVERCURRENT_DURATION.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, -(trip + 0.1)), TICK);
+    }
+    assert_eq!(s.fault(), None, "the window did not reset");
+
+    // A board budgeting a load programs a wider I_SET — here twice the
+    // charge rate — and the pack's own limit must not move with it. That is
+    // the whole point of measuring on the battery instead of the setpoint.
+    let wide = ChargeSupervisor::new(profile, profile.regulation_a * 2.0);
+    let mut s = bring_up(wide, profile.absorb_v);
+    for _ in 0..(OVERCURRENT_DURATION.as_secs() - 1) {
+        ok_tick(&mut s, b(OK_V, -(trip + 0.1)), TICK);
+    }
+    assert_eq!(s.fault(), None);
+    assert!(matches_disable(
+        &ok_tick(&mut s, b(OK_V, -(trip + 0.1)), TICK),
+        FaultReason::ChargeOvercurrent
+    ));
+}
+
+#[test]
+fn discharge_is_never_an_overcurrent() {
+    // Sign convention: the check reads charging current, so a pack pushing
+    // current *out* under a heavy load must never look like one taking too
+    // much in.
+    let mut s = active(lfp_4s());
+    for _ in 0..(OVERCURRENT_DURATION.as_secs() * 4) {
+        ok_tick(&mut s, b(OK_V, 40.0), TICK);
+    }
+    assert_eq!(s.fault(), None);
+}
+
+#[test]
 fn output_disagreement_outranks_setpoint_drift() {
     // Both wrong on the same tick. What OUTPUT_EN is doing is the more
     // urgent fact of the two: a buck that is off is not regulating to
@@ -360,7 +420,7 @@ fn output_disagreement_outranks_setpoint_drift() {
         FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ocp)
     ));
 
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     let p = PollResult {
         output: Some(BuckOutput::On),
         setpoints: drifted,
@@ -450,7 +510,7 @@ fn buck_output_on_in_pending_latches() {
     // Boot expects the buck OFF — boot_sequence wrote set_output(false)
     // and S_INI=0. If OUTPUT_EN reads ON anyway, regulation is happening
     // under unknown conditions; latch immediately, no debounce.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     let p = poll_with_output(&s, BuckOutput::On);
     assert!(matches_disable(
         &s.tick(p, TICK),
@@ -464,7 +524,7 @@ fn boot_pending_with_buck_on_still_latches() {
     // verified OUTPUT_EN=0 — so a poll showing buck=On is a genuine
     // anomaly (firmware bug / panel toggle / EMI). Stays the immediate
     // latch it always was; only ProtectRecovery gets the soft transition.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     let p_on = poll_with_output(&s, BuckOutput::On);
     assert!(matches_disable(
         &s.tick(p_on, TICK),
@@ -477,12 +537,13 @@ fn labels_are_the_snake_case_wire_identifiers() {
     // `/api` publishes these verbatim and dashboards match on them, so the
     // strings are a wire format: pinned here against the literals rather
     // than re-derived from the same `IntoStaticStr` that produces them.
-    let faults: [(FaultReason, &str); 8] = [
+    let faults: [(FaultReason, &str); 9] = [
         (FaultReason::BatterySensorStale, "battery_sensor_stale"),
         (FaultReason::ModbusUnhealthy, "modbus_unhealthy"),
         (FaultReason::Overvoltage, "overvoltage"),
         (FaultReason::AbsorbTimeout, "absorb_timeout"),
         (FaultReason::ChargeTimeout, "charge_timeout"),
+        (FaultReason::ChargeOvercurrent, "charge_overcurrent"),
         (FaultReason::SettingsDrift, "settings_drift"),
         (
             FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ovp),

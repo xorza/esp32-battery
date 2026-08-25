@@ -139,6 +139,25 @@ const _: () = assert!(
     "sensor-loss budget changed — re-derive the total documented on \
      BATTERY_MISSING_TIMEOUT"
 );
+/// How far over the profile's charge rate the pack may actually draw before
+/// the supervisor calls it an overcurrent.
+///
+/// The buck's CC loop bounds *total* output current, which on a UPS is the
+/// charge current plus the load — so I_SET is sized for both and cannot by
+/// itself hold the pack to `REGULATION_C`. With an idle load the buck will
+/// happily put the whole setpoint into the pack. Only the INA228 sees what
+/// the pack is actually taking, which makes this the one thing that
+/// enforces the pack's own rate.
+///
+/// 1.25 sits clear of INA noise and CC-loop overshoot, and well under the
+/// 0.5C manufacturer maximum that `REGULATION_C` is already conservative
+/// against.
+const OVERCURRENT_TOL: f32 = 1.25;
+/// How long charging current must hold over the tolerance before tripping.
+/// Debounced because the buck pulses near a full pack and a load stepping
+/// off is a genuine transient, not a fault.
+const OVERCURRENT_DURATION: Duration = Duration::from_secs(5);
+
 /// How long Modbus reads to the XY can keep failing before we fail closed.
 const MODBUS_UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(5);
 

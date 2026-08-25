@@ -171,7 +171,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
 fn pending_at_boot_with_lvp_waits() {
     // Fresh supervisor + buck reports Off(Lvp) at boot (DC supply not
     // yet present). Must not emit EnableOutput; must not latch.
-    let mut s = ChargeSupervisor::new(lfp_4s());
+    let mut s = supervisor(lfp_4s());
     let p_lvp = PollResult {
         output: Some(BuckOutput::Off {
             cause: ProtectionStatus::Lvp,

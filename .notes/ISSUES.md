@@ -5,11 +5,6 @@
   sags under charge current gives a repeating LVP hold/resume loop with no
   flap limit and no back-off on `regulation_a`.
 
-- `ocp_a` is derived as `regulation_a * 1.5`, but the buck's output current is
-  charge current plus the UPS load, and the load does not appear in the
-  derivation. A load surge trips device OCP, which latches
-  `OutputUnexpectedlyOff` and drops the load onto the pack until a reboot.
-
 - No pack temperature reaches the supervisor. Charging below 0 °C is not
   inhibited for any chemistry. The buck's OTP covers its own die only.
 

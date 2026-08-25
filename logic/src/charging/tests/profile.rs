@@ -3,10 +3,6 @@
 
 use super::*;
 
-/// Nominal DC input rail the board feeds the buck — mirrors firmware's
-/// `INPUT_NOMINAL_V`. Drives the input-UVLO (LVP) derivation.
-const INPUT_NOMINAL_V: f32 = 24.0;
-
 #[test]
 fn lfp_4s_50ah_matches_hand_calculation() {
     // Exhaustive check of the production profile's derived fields against
@@ -25,6 +21,7 @@ fn lfp_4s_50ah_matches_hand_calculation() {
     //   enter_absorb_a = 0.06   × 50  =  3.00 A
     //   exit_absorb_a  = 0.05   × 50  =  2.50 A
     //   ovp_v          = 14.40  + 0.6 = 15.00 V
+    //   i_set_a        = 10.00  + 0   = 10.00 A   (no budgeted load)
     //   ocp_a          = 10.00  × 1.5 = 15.00 A
     //   lvp_v          = 24     − 2   = 22.00 V
     let p = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
@@ -33,7 +30,7 @@ fn lfp_4s_50ah_matches_hand_calculation() {
     assert_approx(p.regulation_a, 10.00);
     assert_approx(p.enter_absorb_a, 3.00);
     assert_approx(p.exit_absorb_a, 2.50);
-    let s = p.safety_limits(INPUT_NOMINAL_V);
+    let s = p.buck_setup(TEST_SUPPLY).limits;
     assert_approx(s.ovp_v, 15.00);
     assert_approx(s.ocp_a, 15.00);
     assert_approx(s.lvp_v, 22.00);
@@ -125,7 +122,7 @@ fn largest_pack_the_buck_can_charge() {
     // one step past the real edge rather than somewhere short of it.
     let p = Profile::for_pack(Chemistry::LiFePo4, 4, 90.0);
     assert_approx(p.regulation_a, 18.0);
-    let s = p.safety_limits(INPUT_NOMINAL_V);
+    let s = p.buck_setup(TEST_SUPPLY).limits;
     assert_approx(s.ocp_a, 27.0);
 }
 
@@ -134,15 +131,40 @@ fn largest_pack_the_buck_can_charge() {
 fn oversized_pack_rejected_by_derived_ocp() {
     // 100 Ah → 20 A CC → 30 A OCP. The buck rejects the register write, and
     // an unguarded profile turns that into a boot loop with the buck dark.
-    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 100.0).safety_limits(INPUT_NOMINAL_V);
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 100.0).buck_setup(TEST_SUPPLY).limits;
 }
 
 #[test]
-#[should_panic(expected = "I_SET ceiling")]
-fn oversized_pack_rejected_by_charge_current() {
-    // 0.2 × 130 = 26 A, past the 25 A I_SET ceiling — caught in `for_pack`
-    // itself, before any safety limit is derived.
-    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 130.0);
+fn load_budget_widens_i_set_and_ocp() {
+    // The buck limits *total* output current and the load sits on that
+    // output, so a load that is not in the setpoint is charge current the
+    // pack never receives. Both current figures move with it; the voltage
+    // ones are pack- and rail-side and must not.
+    let p = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
+    let unloaded = p.buck_setup(TEST_SUPPLY);
+    let loaded = p.buck_setup(SupplyBudget {
+        load_a: 5.0,
+        ..TEST_SUPPLY
+    });
+    assert_approx(unloaded.i_set_a, 10.0);
+    assert_approx(loaded.i_set_a, 15.0);
+    assert_approx(unloaded.limits.ocp_a, 15.0);
+    assert_approx(loaded.limits.ocp_a, 22.5);
+    assert_approx(unloaded.limits.ovp_v, loaded.limits.ovp_v);
+    assert_approx(unloaded.limits.lvp_v, loaded.limits.lvp_v);
+}
+
+#[test]
+#[should_panic(expected = "derived OCP exceeds")]
+fn load_budget_counts_against_the_ceiling_too() {
+    // 50 Ah is 10 A of charge, comfortably inside every ceiling on its own.
+    // Budget a 9 A load and I_SET becomes 19 A ⇒ OCP 28.5 A, past 27 — the
+    // pack is fine, the pack *on this board* is not.
+    let supply = SupplyBudget {
+        load_a: 9.0,
+        ..TEST_SUPPLY
+    };
+    let _ = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).buck_setup(supply);
 }
 
 #[test]
@@ -169,22 +191,22 @@ fn new_rejects_absorb_not_above_float() {
         enter_absorb_a: 3.0,
         exit_absorb_a: 2.5,
     };
-    let _ = ChargeSupervisor::new(bogus);
+    let _ = supervisor(bogus);
 }
 
 #[test]
 fn safety_limits_track_chemistry_change() {
     // Top-balance pushes absorb to 14.6 V — OVP must move up too, not stay
     // at the 4S-daily 15.0 V. Without derived limits this is the footgun.
-    let s = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 50.0).safety_limits(INPUT_NOMINAL_V);
+    let s = Profile::for_pack(Chemistry::LiFePo4TopBalance, 4, 50.0).buck_setup(TEST_SUPPLY).limits;
     assert_approx(s.ovp_v, 15.2);
     assert!(s.ovp_v > 14.6, "OVP must clear absorb_v");
 }
 
 #[test]
 fn safety_limits_track_cell_count_change() {
-    let s4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).safety_limits(INPUT_NOMINAL_V);
-    let s8 = Profile::for_pack(Chemistry::LiFePo4, 8, 50.0).safety_limits(INPUT_NOMINAL_V);
+    let s4 = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0).buck_setup(TEST_SUPPLY).limits;
+    let s8 = Profile::for_pack(Chemistry::LiFePo4, 8, 50.0).buck_setup(TEST_SUPPLY).limits;
     assert!(s8.ovp_v > s4.ovp_v, "OVP scales with cell count");
     // OCP is current-only (and capacity-derived) and LVP is input-side —
     // both independent of S.
@@ -203,7 +225,7 @@ fn safety_limits_ovp_clears_supervisor_threshold() {
         (Chemistry::LiIon, 3),
     ] {
         let p = Profile::for_pack(chem, cells, 50.0);
-        let s = p.safety_limits(INPUT_NOMINAL_V);
+        let s = p.buck_setup(TEST_SUPPLY).limits;
         let supervisor_trip = p.absorb_v + OV_MARGIN_V;
         assert!(
             s.ovp_v > supervisor_trip,

@@ -16,7 +16,8 @@ use crate::charging::profile::Profile;
 use crate::charging::protection_policy::ProtectionPolicy;
 use crate::charging::{
     ABSORB_CV_BAND_V, BATTERY_MISSING_TIMEOUT, EXIT_DEBOUNCE, MAX_ABSORB, MAX_CHARGE,
-    MODBUS_UNHEALTHY_TIMEOUT, OV_DURATION, OV_MARGIN_V, SETPOINT_DRIFT_TOL, TRANSITION_BUFFER,
+    MODBUS_UNHEALTHY_TIMEOUT, OVERCURRENT_DURATION, OVERCURRENT_TOL, OV_DURATION, OV_MARGIN_V,
+    SETPOINT_DRIFT_TOL, TRANSITION_BUFFER,
 };
 use crate::error_log::ChargeTransition;
 use xy_modbus::Setpoints;
@@ -37,8 +38,14 @@ enum Verdict {
 
 pub struct ChargeSupervisor {
     profile: Profile,
+    /// CC setpoint the buck is programmed with — the pack's charge rate
+    /// plus the board's load budget, so not `profile.regulation_a`. Held
+    /// here because the drift check compares readback against it.
+    i_set_a: f32,
     state: ChargeState,
     ov: Debounce,
+    /// Charge current over the pack's own rate, against `OVERCURRENT_TOL`.
+    overcurrent: Debounce,
     /// Time at the CV plateau, against `MAX_ABSORB`.
     absorb: Debounce,
     /// Time since entering Absorb, against `MAX_CHARGE`. Counts whatever the
@@ -56,8 +63,12 @@ pub struct ChargeSupervisor {
 }
 
 impl ChargeSupervisor {
-    pub fn new(profile: Profile) -> Self {
+    /// `i_set_a` is [`BuckSetup::i_set_a`] — what the caller actually
+    /// programmed, which the drift check has to match and which is *not*
+    /// `profile.regulation_a` once the board budgets a load.
+    pub fn new(profile: Profile, i_set_a: f32) -> Self {
         assert!(profile.absorb_v > profile.float_v);
+        assert!(i_set_a >= profile.regulation_a);
         // Boot conservative: output stays OFF until the first healthy tick,
         // because bringing up the buck is the supervisor's job and a cold
         // boot must not bypass safety. We never trust a *stored* phase
@@ -66,8 +77,10 @@ impl ChargeSupervisor {
         // resting voltage whether a step up to absorb is owed.
         Self {
             profile,
+            i_set_a,
             state: ChargeState::Boot,
             ov: Debounce::default(),
+            overcurrent: Debounce::default(),
             absorb: Debounce::default(),
             charge_total: Debounce::default(),
             exit: Debounce::default(),
@@ -145,16 +158,16 @@ impl ChargeSupervisor {
 
     /// The pair a buck holding `phase` would be regulating to.
     ///
-    /// `i_set` is the constant `regulation_a` from the profile — the drift
-    /// check relies on this never changing at runtime. If a future feature
-    /// ever varies the current setpoint (CC tapering, dynamic limits), it
-    /// must use the same arm-then-commit pattern the `To*` states give
-    /// V_SET, otherwise a successful write to a new I_SET trips
-    /// `SettingsDrift` on the very next tick.
+    /// `i_set` is the constant handed to [`Self::new`] — the drift check
+    /// relies on it never changing at runtime. If a future feature ever
+    /// varies the current setpoint (CC tapering, dynamic limits, backing
+    /// off on a flapping supply), it must use the same arm-then-commit
+    /// pattern the `To*` states give V_SET, otherwise a successful write to
+    /// a new I_SET trips `SettingsDrift` on the very next tick.
     fn setpoints_for(&self, phase: Phase) -> Setpoints {
         Setpoints {
             v_set: self.voltage_for_phase(phase),
-            i_set: self.profile.regulation_a,
+            i_set: self.i_set_a,
         }
     }
 
@@ -511,7 +524,22 @@ impl ChargeSupervisor {
             return Verdict::Inhibit(InhibitReason::Overvoltage);
         }
 
-        // 5. Bring-up-only gates. Not faults — they say "not yet", and only
+        // 5. Charge overcurrent. I_SET bounds the buck's *total* output
+        //    current, load included, so with an idle load it does not hold
+        //    the pack to its own rate — only this does. Stepped in both
+        //    states so the window stays coherent across a move, but it can
+        //    only fire while sourcing: with the output off no charge
+        //    current flows to be over anything.
+        let over = b.charging_a() > self.profile.regulation_a * OVERCURRENT_TOL;
+        if self
+            .overcurrent
+            .step(over, elapsed, OVERCURRENT_DURATION)
+            && self.state.sourcing()
+        {
+            return Verdict::Latch(FaultReason::ChargeOvercurrent);
+        }
+
+        // 6. Bring-up-only gates. Not faults — they say "not yet", and only
         //    mean anything while the output is off.
         if self.state.bringing_up() {
             // Demand a fresh setpoint readback before energising.
@@ -548,8 +576,7 @@ impl ChargeSupervisor {
             return self.update_voltage_for(next);
         }
 
-        // Charging current as a positive number.
-        let charging_a = -b.current;
+        let charging_a = b.charging_a();
         let below_exit =
             self.state == ChargeState::Absorb && charging_a < self.profile.exit_absorb_a;
         // Leaky, not hard-reset: a full pack makes the buck pulse current in

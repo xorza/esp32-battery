@@ -105,7 +105,7 @@ fn invariants_hold_under_randomized_input() {
 
     for seed in 1..=SEEDS {
         let mut rng = Rng::new(seed);
-        let mut s = ChargeSupervisor::new(profile);
+        let mut s = supervisor(profile);
         // Boot writes float_v, so that is the committed setpoint until an
         // UpdateVoltage is committed.
         let mut committed_v = profile.float_v;

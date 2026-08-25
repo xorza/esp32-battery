@@ -30,9 +30,8 @@ use log::warn;
 
 use esp32_battery_logic::Chemistry;
 use esp32_battery_logic::EventLog;
+use esp32_battery_logic::{BuckSetup, Profile, SupplyBudget};
 use esp32_battery_logic::{ChargeStatus, SensorData};
-use esp32_battery_logic::{INPUT_LVP_MARGIN_V, Profile};
-use xy_modbus::SafetyLimits;
 
 use esp32_battery_logic::{NetAction, NetPhase, NetPoll, NetSupervisor, WifiCredentials};
 
@@ -51,17 +50,24 @@ const TICK_PERIOD: Duration = Duration::from_secs(1);
 pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiFePo4, 4, 50.0);
 // pub(crate) const PACK_PROFILE: Profile = Profile::for_pack(Chemistry::LiIon, 3, 17.0);
 
-/// Hard trip thresholds programmed into the XY's protection registers (OVP/OCP/LVP).
-/// Derived from the profile so a chemistry/cell-count change moves them
-/// in lockstep — no chance the OVP ceiling drifts below the absorb target.
-/// Nominal DC input feeding the XY7025 buck. Drives the buck's input UVLO
-/// (LVP register) — a board/supply property, not part of the pack profile.
-// pub(crate) const INPUT_NOMINAL_V: f32 = 19.0;
-pub(crate) const INPUT_NOMINAL_V: f32 = 24.0;
+/// This board's supply side: the DC rail feeding the buck, and the
+/// continuous load hanging off its output.
+///
+/// `load_a` is **0.0 until measured** — that reproduces the pre-budget
+/// behaviour exactly (I_SET = the pack's charge rate) and is the safe
+/// direction, but it means a real UPS load silently derates charging by
+/// whatever it draws. Set it to the worst-case continuous load and the
+/// buck's CC setpoint and OCP move with it; the compile-time ceilings in
+/// `buck_setup` will refuse a combination this hardware cannot deliver.
+pub(crate) const SUPPLY: SupplyBudget = SupplyBudget {
+    input_nominal_v: 24.0,
+    load_a: 0.0,
+};
 
-const _: () = assert!(INPUT_NOMINAL_V - INPUT_LVP_MARGIN_V > 12.0);
-
-pub(crate) const SAFETY: SafetyLimits = PACK_PROFILE.safety_limits(INPUT_NOMINAL_V);
+/// CC setpoint and hard trip thresholds programmed into the XY at boot.
+/// Derived from the pack profile and the board budget together, so a
+/// chemistry, cell-count or load change moves them all in lockstep.
+pub(crate) const BUCK: BuckSetup = PACK_PROFILE.buck_setup(SUPPLY);
 
 /// Quiet down the ESP-IDF C-side logger before any subsystem starts emitting.
 /// Rust `log::` calls go through a separate path and aren't filtered here.
