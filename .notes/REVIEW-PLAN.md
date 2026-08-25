@@ -129,34 +129,41 @@ key still boots into the portal.
 
 ---
 
-## Phase 3 — Collapse the duplicated encodings — **DONE except step 18**
+## Phase 3 — Collapse the duplicated encodings — **DONE**
 
-**Step 18 (supervisor state) was examined and not done — the item was wrong on
-both of its main claims.** Checked against the code rather than the review:
+Step 18 landed last, after a first pass had set it aside. Re-reading it against
+the code, the objection did not hold: the two predicates the gauntlet needs —
+"is the buck sourcing?" and "are we still deciding whether to bring it up?" —
+are *total* over `LatchState`, and `Tripped` answers both correctly (the output
+is off, or on its way off). `Mode` was buying an unrepresentable-state guarantee
+for a case that needed no guarantee, at the cost of a second encoding of the
+same state and a mapping written out in `tick`. It is gone; `safety_verdict`
+reads `self.latch`, and `tick` dispatches Pending-vs-regulating off the same
+field.
 
-- `Mode` is not merely "a lossy copy because `safety_verdict` takes `&mut
-  self`". `tick` returns early for both `Tripped` variants, so by the time the
-  gauntlet runs only two states remain, and `Mode` makes the third
-  *unrepresentable*. Folding it back into `LatchState` reads would force
-  `safety_verdict` to carry a `Tripped` arm that cannot occur — trading a type
-  guarantee for an `unreachable!()`.
-- `transition_between` is not re-derivation. `commit_enable` calls `set_latch`
-  from `Pending { Boot }` (→ `Energised`) *and* from `Pending { ProtectRecovery }`
-  (→ `ProtectCleared`), so that caller genuinely does not know which transition
-  it is making. The from×to table is doing real work.
-- The `set_latch` `debug_assert!`s and the `commit_*` `assert!`s are invariant
-  guards, which is what the project reserves each kind for: `debug_assert` for
-  internal invariants off the hot path, release `assert` for public-API misuse.
-  Removing them deletes the machine's written-down rules.
+`transition_between`'s from×to table is gone too. `commit_enable` was the one
+caller that genuinely did not know which transition it was making — so it now
+reads the `PendingReason` it is leaving (via the `let-else` that already had to
+check the state) and names `Energised` or `ProtectCleared` itself. Every other
+caller knew all along.
 
-Two further judgement calls, recorded in `REVIEW.md` rather than acted on: the
-`NetStatusHandle` / `SubmissionStatusHandle` generic costs more than it saves,
-and the `NetPhase → NetStatus → LowerKey` hops each earn their place.
+What was kept, deliberately: the `commit_*` asserts. Step 18 scoped the removal
+to asserts "that the call sites make unreachable", and these are public API —
+their call sites are in the firmware, outside this crate, so nothing in here can
+make a stashed ticket unreachable. `commit_voltage` was reshaped to match
+`commit_disable`'s `let-else` + `assert_eq!` shape, which also names *which*
+half of the check failed. The three `set_latch` `debug_assert!`s did go: all
+six call sites are in this file, each now names its own transition, and the
+invariants they restated are visible at those sites.
 
 For step 20 the mechanism kept is the one that works in the shipped build.
 `debug_assert_matches_phase` compiled to nothing in release — the firmware
 flashes `--release` — so it was deleted in favour of a single
 `warn_out_of_step` that every mismatched arm now reports through.
+
+Two further judgement calls, recorded in `REVIEW.md` rather than acted on: the
+`NetStatusHandle` / `SubmissionStatusHandle` generic costs more than it saves,
+and the `NetPhase → NetStatus → LowerKey` hops each earn their place.
 
 The bulk of the code reduction. Each item is independent of the others, so they
 can land in any order within the phase.

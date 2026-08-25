@@ -26,6 +26,17 @@ fn transitions_record_the_route_not_just_the_destination() {
     assert!(matches!(s.tick(p_on, TICK), Action::None));
     assert_eq!(s.pop_transition(), Some(ChargeTransition::ProtectCleared));
 
+    // Second hold, recovered the other way round: the cause clears but the
+    // buck stays off, so the supervisor energises it itself. That commit is
+    // the same code path as a cold-boot bring-up and must still log
+    // ProtectCleared — a hold ended, not a fresh boot.
+    assert!(matches!(s.tick(p_lvp, TICK), Action::None));
+    assert_eq!(s.pop_transition(), Some(ChargeTransition::ProtectHold));
+    let a = ok_tick(&mut s, b(CV_V, -0.1), TICK);
+    assert!(!accept_enable(&mut s, a), "pack at the plateau stays in Float");
+    assert_eq!(s.pop_transition(), Some(ChargeTransition::ProtectCleared));
+    assert_eq!(s.pop_transition(), None, "the enable itself is not a transition");
+
     // A non-recoverable self-disable latches.
     let p_ovp = poll_with_output(&s, BuckOutput::Off {
         cause: ProtectionStatus::Ovp,

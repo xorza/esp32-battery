@@ -41,6 +41,30 @@ enum LatchState {
     Tripped { reason: FaultReason, acked: bool },
 }
 
+impl LatchState {
+    /// Output is off and the supervisor is deciding whether to bring it up.
+    fn pending(&self) -> bool {
+        matches!(self, LatchState::Pending { .. })
+    }
+
+    /// The buck is sourcing. This is what every safety decision keys off,
+    /// and it is total: `Tripped` answers `false` for the same reason
+    /// `Pending` does — the output is off or on its way off.
+    fn regulating(&self) -> bool {
+        matches!(self, LatchState::Active { .. })
+    }
+
+    /// The latch/inhibit rule in one place: the same condition disables a
+    /// sourcing buck and merely blocks bring-up of an idle one.
+    fn fault(&self, latched: FaultReason, inhibited: InhibitReason) -> Verdict {
+        if self.regulating() {
+            Verdict::Latch(latched)
+        } else {
+            Verdict::Inhibit(inhibited)
+        }
+    }
+}
+
 /// Why the supervisor is in `Pending`. Determines how an unexpected
 /// `buck output ON in Pending` is handled.
 ///
@@ -55,43 +79,13 @@ enum LatchState {
 ///   *expected* recovery — transition straight back to Active rather
 ///   than latching. Setpoints are still what we programmed before the
 ///   self-disable, so drift check covers regulation safety.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug)]
 enum PendingReason {
     Boot,
     ProtectRecovery,
 }
-/// Which half of the machine a tick is running in. Replaces the
-/// `Option<PendingReason>` that used to be read as a bare "am I
-/// Pending?" flag — the distinction that actually matters is whether
-/// the buck is sourcing, and every safety decision keys off exactly
-/// that.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Mode {
-    /// Output is off, waiting to decide it is safe to enable.
-    Pending(PendingReason),
-    /// Output is on and the buck is regulating.
-    Regulating,
-}
-
-impl Mode {
-    /// Whether a fault found in this mode has anything to disable.
-    fn latches(self) -> bool {
-        matches!(self, Mode::Regulating)
-    }
-
-    /// The latch/inhibit rule in one place: the same condition disables
-    /// a sourcing buck and merely blocks bring-up of an idle one.
-    fn fault(self, latched: FaultReason, inhibited: InhibitReason) -> Verdict {
-        if self.latches() {
-            Verdict::Latch(latched)
-        } else {
-            Verdict::Inhibit(inhibited)
-        }
-    }
-}
-
 /// Outcome of the ordered safety gauntlet, in descending authority:
-/// a `Latch` beats a mode change, which beats an `Inhibit`, which beats
+/// a `Latch` beats a latch-state change, which beats an `Inhibit`, which beats
 /// `Clear`. `safety_verdict` returns the first one it reaches, so the
 /// order of the checks inside it *is* the precedence.
 enum Verdict {
@@ -104,8 +98,8 @@ enum Verdict {
     ResumeRegulating,
     /// Hold the buck off without latching; re-checked next tick.
     Inhibit(InhibitReason),
-    /// Every check passed; carries the validated battery sample so the
-    /// mode arms don't re-filter it.
+    /// Every check passed; carries the validated battery sample so
+    /// `tick` doesn't re-filter it.
     Clear(BatterySample),
 }
 pub struct ChargeSupervisor {
@@ -119,27 +113,6 @@ pub struct ChargeSupervisor {
     latch: LatchState,
     inhibit: Option<InhibitReason>,
     transitions: Deque<ChargeTransition, TRANSITION_BUFFER>,
-}
-/// Classify a latch move for the event log. `None` for a move that isn't
-/// a state change — `Active → Active` is `pending_voltage` being armed or
-/// cleared, which the phase log already covers.
-fn transition_between(from: &LatchState, to: &LatchState) -> Option<ChargeTransition> {
-    match (from, to) {
-        (_, LatchState::Tripped { .. }) => Some(ChargeTransition::Latched),
-        (
-            LatchState::Pending {
-                reason: PendingReason::ProtectRecovery,
-            },
-            LatchState::Active { .. },
-        ) => Some(ChargeTransition::ProtectCleared),
-        (LatchState::Pending { .. }, LatchState::Active { .. }) => {
-            Some(ChargeTransition::Energised)
-        }
-        (LatchState::Active { .. }, LatchState::Pending { .. }) => {
-            Some(ChargeTransition::ProtectHold)
-        }
-        _ => None,
-    }
 }
 impl ChargeSupervisor {
     pub fn new(profile: Profile) -> Self {
@@ -185,7 +158,7 @@ impl ChargeSupervisor {
     /// (latched fault). Surfaced to the dashboard so "Float" / "Absorb"
     /// labels appear only when they describe a live charging state.
     pub fn active_phase(&self) -> Option<Phase> {
-        matches!(self.latch, LatchState::Active { .. }).then_some(self.phase)
+        self.latch.regulating().then_some(self.phase)
     }
 
     fn target_voltage(&self) -> f32 {
@@ -288,10 +261,9 @@ impl ChargeSupervisor {
     /// `float_v` to ever draw `enter_absorb_a`, so without this it would
     /// stall in Float and never finish charging.
     pub fn commit_enable(&mut self, ticket: EnableTicket) {
-        assert!(
-            matches!(self.latch, LatchState::Pending { .. }),
-            "enable ticket committed outside Pending"
-        );
+        let LatchState::Pending { reason } = self.latch else {
+            panic!("enable ticket committed outside Pending");
+        };
         // Arming the phase we are already in would emit an UpdateVoltage
         // whose target equals the live V_SET — a wasted Modbus write, and
         // a tick where the phase machine is skipped for nothing. Reachable
@@ -301,9 +273,18 @@ impl ChargeSupervisor {
             .resume_absorb
             .then_some(Phase::Absorb)
             .filter(|&p| p != self.phase);
-        self.set_latch(LatchState::Active {
-            pending_voltage: resume,
-        });
+        // A protect-hold ends where it began — the buck came back on once
+        // its cause cleared — so that route reads as a resume, not a boot.
+        let transition = match reason {
+            PendingReason::Boot => ChargeTransition::Energised,
+            PendingReason::ProtectRecovery => ChargeTransition::ProtectCleared,
+        };
+        self.set_latch(
+            LatchState::Active {
+                pending_voltage: resume,
+            },
+            Some(transition),
+        );
     }
 
     /// Commit the phase transition named by `ticket`, after
@@ -315,19 +296,23 @@ impl ChargeSupervisor {
     /// supervisor stays on the old phase, the drift check keeps matching
     /// the old V_SET, and the next tick re-emits `UpdateVoltage`.
     pub fn commit_voltage(&mut self, ticket: VoltageTicket) {
-        assert!(
-            matches!(
-                self.latch,
-                LatchState::Active {
-                    pending_voltage: Some(p),
-                } if p == ticket.phase
-            ),
-            "voltage ticket committed without a matching pending phase"
+        let LatchState::Active {
+            pending_voltage: Some(pending),
+        } = self.latch
+        else {
+            panic!("voltage ticket committed without a pending phase");
+        };
+        assert_eq!(
+            pending, ticket.phase,
+            "voltage ticket does not match the pending phase"
         );
         self.phase = ticket.phase;
-        self.set_latch(LatchState::Active {
-            pending_voltage: None,
-        });
+        self.set_latch(
+            LatchState::Active {
+                pending_voltage: None,
+            },
+            None,
+        );
         // A Float→Absorb transition can immediately follow an
         // Absorb→Float, with no intervening Float dwell to clear stale counts.
         self.reset_phase_timers();
@@ -348,23 +333,27 @@ impl ChargeSupervisor {
     /// stuck sensor mask overvoltage. Routes through the same
     /// `BatterySensorStale` debounce as a truly absent sample.
     pub fn tick(&mut self, p: PollResult, elapsed: Duration) -> Action {
-        let mode = match self.latch {
+        match self.latch {
             LatchState::Tripped {
                 reason,
                 acked: false,
             } => return Action::DisableOutput(DisableTicket { reason }),
             // Tripped+acked: reboot-only recovery, supervisor parks here.
             LatchState::Tripped { acked: true, .. } => return Action::None,
-            LatchState::Pending { reason } => Mode::Pending(reason),
-            LatchState::Active { .. } => Mode::Regulating,
-        };
+            _ => {}
+        }
 
-        let battery = match self.safety_verdict(&p, elapsed, mode) {
+        // The gauntlet steps debouncers but never writes `self.latch`, so the
+        // dispatch below still reads the state its verdict was formed against.
+        let battery = match self.safety_verdict(&p, elapsed) {
             Verdict::Latch(reason) => return self.latch(reason),
             Verdict::EnterProtectRecovery(cause) => {
-                self.set_latch(LatchState::Pending {
-                    reason: PendingReason::ProtectRecovery,
-                });
+                self.set_latch(
+                    LatchState::Pending {
+                        reason: PendingReason::ProtectRecovery,
+                    },
+                    Some(ChargeTransition::ProtectHold),
+                );
                 self.reset_phase_timers();
                 // Output is off for the duration of the hold, so the pack
                 // voltage decays. A partly-accumulated OV window from before
@@ -375,9 +364,12 @@ impl ChargeSupervisor {
                 return Action::None;
             }
             Verdict::ResumeRegulating => {
-                self.set_latch(LatchState::Active {
-                    pending_voltage: None,
-                });
+                self.set_latch(
+                    LatchState::Active {
+                        pending_voltage: None,
+                    },
+                    Some(ChargeTransition::ProtectCleared),
+                );
                 self.inhibit = None;
                 return Action::None;
             }
@@ -391,16 +383,16 @@ impl ChargeSupervisor {
             }
         };
 
-        match mode {
-            // Output has been OFF throughout Pending, so `b.voltage` is the
-            // pack's resting voltage — the true SoC signal. Below the CV
-            // plateau means not full, so the caller acks with
-            // resume_absorb = true. The supervisor stays Pending until it does.
-            Mode::Pending(_) => Action::EnableOutput(EnableTicket {
+        // Output has been OFF throughout Pending, so `battery.voltage` is the
+        // pack's resting voltage — the true SoC signal. Below the CV plateau
+        // means not full, so the caller acks with resume_absorb = true. The
+        // supervisor stays Pending until it does.
+        if self.latch.pending() {
+            return Action::EnableOutput(EnableTicket {
                 resume_absorb: !self.at_cv_plateau(battery.voltage),
-            }),
-            Mode::Regulating => self.regulate(battery, elapsed),
+            });
         }
+        self.regulate(battery, elapsed)
     }
 
     /// The ordered safety gauntlet. **The order of the checks below is the
@@ -408,15 +400,16 @@ impl ChargeSupervisor {
     /// with, and `tests.rs` pins the precedence where two can fire on the
     /// same tick.
     ///
-    /// Whether a failure latches or merely inhibits is decided by `mode` and
-    /// nothing else. A fault latches only while the buck is sourcing; in
-    /// `Pending` the output is already off, so a latch would disable nothing
-    /// and cost a reboot to clear. `OutputOnInPending` is the one exception,
-    /// because there the output really is on.
+    /// Whether a failure latches or merely inhibits is decided by the latch
+    /// state and nothing else. A fault latches only while the buck is
+    /// sourcing; in `Pending` the output is already off, so a latch would
+    /// disable nothing and cost a reboot to clear. `OutputOnInPending` is the
+    /// one exception, because there the output really is on.
     ///
-    /// Debouncers are stepped in both modes so their windows stay coherent
-    /// across a mode change.
-    fn safety_verdict(&mut self, p: &PollResult, elapsed: Duration, mode: Mode) -> Verdict {
+    /// Debouncers are stepped in both states so their windows stay coherent
+    /// across a move between them. `self.latch` is only read here, never
+    /// written — `tick` relies on that to dispatch on it afterwards.
+    fn safety_verdict(&mut self, p: &PollResult, elapsed: Duration) -> Verdict {
         // 1. Commanded vs. reported setpoints. No debounce: the read itself
         //    succeeded, so a mismatch is the device disagreeing with us
         //    rather than transport noise.
@@ -425,7 +418,9 @@ impl ChargeSupervisor {
             if (sp.v_set - want.v_set).abs() >= SETPOINT_DRIFT_TOL
                 || (sp.i_set - want.i_set).abs() >= SETPOINT_DRIFT_TOL
             {
-                return mode.fault(FaultReason::SettingsDrift, InhibitReason::SettingsDrift);
+                return self
+                    .latch
+                    .fault(FaultReason::SettingsDrift, InhibitReason::SettingsDrift);
             }
         }
 
@@ -440,19 +435,24 @@ impl ChargeSupervisor {
         //    So we step back to Pending and treat a later ON as the expected
         //    recovery. Setpoints are untouched through the wait — check 1
         //    just verified them — so regulation resumes at known targets.
-        match (mode, p.output) {
+        match (&self.latch, p.output) {
             (
-                Mode::Regulating,
+                LatchState::Active { .. },
                 Some(BuckOutput::Off {
                     cause: cause @ (Lvp | Otp),
                 }),
             ) => {
                 return Verdict::EnterProtectRecovery(cause);
             }
-            (Mode::Regulating, Some(BuckOutput::Off { cause })) => {
+            (LatchState::Active { .. }, Some(BuckOutput::Off { cause })) => {
                 return Verdict::Latch(FaultReason::OutputUnexpectedlyOff(cause));
             }
-            (Mode::Pending(PendingReason::ProtectRecovery), Some(BuckOutput::On)) => {
+            (
+                LatchState::Pending {
+                    reason: PendingReason::ProtectRecovery,
+                },
+                Some(BuckOutput::On),
+            ) => {
                 return Verdict::ResumeRegulating;
             }
             // Boot + ON: `boot_sequence` wrote set_output(false) and verified
@@ -460,7 +460,12 @@ impl ChargeSupervisor {
             // panel toggle, EMI on the button GPIO). Unlike every other
             // Pending check there IS something sourcing to disable, so this
             // one latches.
-            (Mode::Pending(PendingReason::Boot), Some(BuckOutput::On)) => {
+            (
+                LatchState::Pending {
+                    reason: PendingReason::Boot,
+                },
+                Some(BuckOutput::On),
+            ) => {
                 return Verdict::Latch(FaultReason::OutputOnInPending);
             }
             _ => {}
@@ -472,7 +477,9 @@ impl ChargeSupervisor {
             .modbus_err
             .step(p.setpoints.is_none(), elapsed, MODBUS_UNHEALTHY_TIMEOUT)
         {
-            return mode.fault(FaultReason::ModbusUnhealthy, InhibitReason::ModbusUnhealthy);
+            return self
+                .latch
+                .fault(FaultReason::ModbusUnhealthy, InhibitReason::ModbusUnhealthy);
         }
 
         // 4. Battery sample freshness. NaN/Inf counts as missing: a sensor
@@ -485,7 +492,7 @@ impl ChargeSupervisor {
             .battery_missing
             .step(battery.is_none(), elapsed, BATTERY_MISSING_TIMEOUT)
         {
-            return mode.fault(
+            return self.latch.fault(
                 FaultReason::BatterySensorStale,
                 InhibitReason::BatterySensorStale,
             );
@@ -501,7 +508,7 @@ impl ChargeSupervisor {
         //    longer strand the unit off until a reboot.
         let ov = b.voltage > self.profile.absorb_v + OV_MARGIN_V;
         let ov_debounced = self.ov.step(ov, elapsed, OV_DURATION);
-        if mode.latches() {
+        if self.latch.regulating() {
             if ov_debounced {
                 return Verdict::Latch(FaultReason::Overvoltage);
             }
@@ -511,7 +518,7 @@ impl ChargeSupervisor {
 
         // 6. Bring-up-only gates. Not faults — they say "not yet", and only
         //    mean anything while the output is off.
-        if matches!(mode, Mode::Pending(_)) {
+        if self.latch.pending() {
             // Demand a fresh setpoint readback before energising.
             // `boot_sequence` already verified the writes, but requiring
             // closed-loop confirmation here means we never ask for output-on
@@ -567,9 +574,12 @@ impl ChargeSupervisor {
             // ticket — keeps `target_voltage` matching the buck's actual
             // V_SET so a failed write doesn't trigger SettingsDrift on the
             // next tick.
-            self.set_latch(LatchState::Active {
-                pending_voltage: Some(next),
-            });
+            self.set_latch(
+                LatchState::Active {
+                    pending_voltage: Some(next),
+                },
+                None,
+            );
             return self.update_voltage_for(next);
         }
 
@@ -583,36 +593,15 @@ impl ChargeSupervisor {
         Action::None
     }
 
-    /// Single write point for `self.latch`. Every transition routes through
-    /// here so there is one place to assert on, and one place a transition
-    /// log would hook into.
-    fn set_latch(&mut self, next: LatchState) {
-        // Tripped is absorbing — recovery is reboot-only. `commit_disable`
-        // mutates its `acked` flag in place rather than coming through here,
-        // so reaching this from Tripped means something tried to leave it.
-        debug_assert!(
-            !matches!(self.latch, LatchState::Tripped { .. }),
-            "attempted to leave Tripped"
-        );
-        // A freshly latched fault is never pre-acked — the caller has not
-        // written `set_output(false)` yet, and `DisableOutput` must be
-        // emitted at least once.
-        debug_assert!(
-            !matches!(next, LatchState::Tripped { acked: true, .. }),
-            "latched into Tripped already acked"
-        );
-        // Pending is only entered from Active (the LVP/OTP step-back).
-        // Pending → Pending would silently rewrite the reason and lose
-        // why we were waiting.
-        debug_assert!(
-            !matches!(
-                (&self.latch, &next),
-                (LatchState::Pending { .. }, LatchState::Pending { .. })
-            ),
-            "Pending re-entered from Pending"
-        );
-
-        if let Some(t) = transition_between(&self.latch, &next) {
+    /// Single write point for `self.latch`. `transition` is what the move
+    /// means to the event log, named by the caller rather than recovered
+    /// from `from × to`: `Pending → Active` is `Energised` or
+    /// `ProtectCleared` depending on why we were Pending, and only the
+    /// caller is holding that. `None` records nothing, which is what an
+    /// `Active → Active` move wants — that is `pending_voltage` being armed
+    /// or cleared, already covered by the phase log.
+    fn set_latch(&mut self, next: LatchState, transition: Option<ChargeTransition>) {
+        if let Some(t) = transition {
             // Oldest-out when full: a caller that stopped draining is
             // better served by the recent history than the stale head.
             if self.transitions.is_full() {
@@ -628,10 +617,13 @@ impl ChargeSupervisor {
 
     fn latch(&mut self, reason: FaultReason) -> Action {
         self.inhibit = None;
-        self.set_latch(LatchState::Tripped {
-            reason,
-            acked: false,
-        });
+        self.set_latch(
+            LatchState::Tripped {
+                reason,
+                acked: false,
+            },
+            Some(ChargeTransition::Latched),
+        );
         Action::DisableOutput(DisableTicket { reason })
     }
 }
@@ -643,7 +635,7 @@ impl ChargeSupervisor {
 pub(crate) mod internals {
     use xy_modbus::Setpoints;
 
-    use crate::charging::charge_supervisor::{ChargeSupervisor, LatchState};
+    use crate::charging::charge_supervisor::ChargeSupervisor;
 
     /// A trait, not an inherent `impl`, because two of these names are
     /// already private inherent methods and a second inherent definition
@@ -661,11 +653,11 @@ pub(crate) mod internals {
 
     impl SupervisorInternals for ChargeSupervisor {
         fn is_pending(&self) -> bool {
-            matches!(self.latch, LatchState::Pending { .. })
+            self.latch.pending()
         }
 
         fn is_active(&self) -> bool {
-            matches!(self.latch, LatchState::Active { .. })
+            self.latch.regulating()
         }
 
         fn target_voltage(&self) -> f32 {
