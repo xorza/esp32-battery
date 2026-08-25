@@ -1,6 +1,6 @@
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
-use esp32_battery_logic::net::wifi_credentials::{PASSWORD_MAX, SSID_MAX, WifiCredentials};
+use esp32_battery_logic::{PASSWORD_MAX, SSID_MAX, WifiCredentials};
 use log::info;
 
 const NAMESPACE: &str = "wifi";

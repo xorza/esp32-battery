@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp32_battery_logic::data::{Ina228Reading, PsReading, SensorData};
-use esp32_battery_logic::error_log::EventLog;
+use esp32_battery_logic::EventLog;
+use esp32_battery_logic::{Ina228Reading, PsReading, SensorData};
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Point, Size};
@@ -26,7 +26,7 @@ use mipidsi::models::ST7789;
 use mipidsi::options::{Orientation, Rotation};
 
 use crate::board::LcdPins;
-use esp32_battery_logic::net::NetStatus;
+use esp32_battery_logic::NetStatus;
 
 use crate::net::NetStatusHandle;
 

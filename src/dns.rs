@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use esp32_battery_logic::dns_packet::build_response;
+use esp32_battery_logic::build_response;
 
 pub struct DnsHandle {
     stop: Arc<AtomicBool>,

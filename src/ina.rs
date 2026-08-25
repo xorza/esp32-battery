@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use esp32_battery_logic::data::{Ina228Reading, SensorData};
-use esp32_battery_logic::error_log::{Event, InaError};
+use esp32_battery_logic::{Event, InaError};
+use esp32_battery_logic::{Ina228Reading, SensorData};
 
 use crate::board::I2cPins;
 use crate::clock::EventRecorder;
@@ -58,8 +58,8 @@ mod real {
     use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
     use esp_idf_hal::units::Hertz;
 
-    use esp32_battery_logic::data::Ina228Reading;
-    use esp32_battery_logic::error_log::InaError;
+    use esp32_battery_logic::Ina228Reading;
+    use esp32_battery_logic::InaError;
 
     use super::InaDevice;
     use crate::board::I2cPins;
@@ -121,8 +121,8 @@ mod fake {
     use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
     use esp_idf_hal::units::Hertz;
 
-    use esp32_battery_logic::data::Ina228Reading;
-    use esp32_battery_logic::error_log::InaError;
+    use esp32_battery_logic::Ina228Reading;
+    use esp32_battery_logic::InaError;
 
     use super::InaDevice;
     use crate::board::I2cPins;

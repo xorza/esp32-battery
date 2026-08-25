@@ -13,7 +13,7 @@ use esp_idf_svc::wifi::{
 };
 use log::{info, warn};
 
-use esp32_battery_logic::net::wifi_credentials::WifiCredentials;
+use esp32_battery_logic::WifiCredentials;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};

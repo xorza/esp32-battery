@@ -1,4 +1,18 @@
+//! `use super::*` only reaches this module's constants now that the
+//! supervisor is split across files, so the types come in explicitly.
 use super::*;
+
+use crate::battery::Chemistry;
+use crate::charging::action::{Action, DisableTicket, EnableTicket, VoltageTicket};
+use crate::charging::charge_supervisor::{ChargeSupervisor, LatchState};
+use crate::charging::fault_reason::FaultReason;
+use crate::charging::inhibit_reason::InhibitReason;
+use crate::charging::phase::Phase;
+use crate::charging::poll_result::{BatterySample, BuckOutput, PollResult};
+use crate::charging::profile::Profile;
+use crate::charging::voltage_writer::{VoltageWriteOutcome, VoltageWriter, apply_update_voltage};
+use crate::error_log::{ChargeTransition, XyError};
+use xy_modbus::{ProtectionStatus, RtuError, Setpoints, XyError as BusError};
 
 /// 4S 50 Ah LFP — the board's actual pack. With the module's C-rate
 /// constants this gives reg = 10 A, enter = 3 A, exit = 2.5 A. Tests that
@@ -151,10 +165,7 @@ fn enter_absorb(s: &mut ChargeSupervisor) {
 /// Cause must be non-recoverable (i.e. not Lvp/Otp, which are handled
 /// in-place and never latch).
 fn latch_self_disable(s: &mut ChargeSupervisor, cause: ProtectionStatus) {
-    let p = PollResult {
-        output: Some(BuckOutput::Off { cause }),
-        ..expected_poll(s, b(OK_V, -0.1))
-    };
+    let p = poll_with_output(s, BuckOutput::Off { cause });
     let a = s.tick(p, TICK);
     assert!(matches_disable(
         &a,
@@ -297,6 +308,44 @@ fn random_poll(rng: &mut Rng, s: &ChargeSupervisor) -> PollResult {
         battery,
     }
 }
+
+/// A debounced fault: how to feed it, the window it needs before latching,
+/// and what it latches as. The three share one shape, so they share their
+/// tests. Nothing says how to *clear* one, because a single healthy tick
+/// satisfies all three conditions at once.
+#[derive(Debug)]
+struct DebouncedFault {
+    name: &'static str,
+    window: Duration,
+    fault: FaultReason,
+    feed: fn(&mut ChargeSupervisor, Duration) -> Action,
+}
+
+const DEBOUNCED_FAULTS: [DebouncedFault; 3] = [
+    DebouncedFault {
+        name: "battery sensor stale",
+        window: BATTERY_MISSING_TIMEOUT,
+        fault: FaultReason::BatterySensorStale,
+        feed: |s, dt| ok_tick(s, None, dt),
+    },
+    DebouncedFault {
+        name: "modbus unhealthy",
+        window: MODBUS_UNHEALTHY_TIMEOUT,
+        fault: FaultReason::ModbusUnhealthy,
+        feed: |s, dt| fail_tick(s, b(OK_V, -0.1), dt),
+    },
+    DebouncedFault {
+        // absorb_v for lfp_4s is 14.4 and the margin 0.2, so 14.7 trips.
+        name: "overvoltage",
+        window: OV_DURATION,
+        fault: FaultReason::Overvoltage,
+        feed: |s, dt| ok_tick(s, b(14.7, -0.1), dt),
+    },
+];
+
+/// LVP and OTP are both sensor-side conditions the buck clears on its own,
+/// so the supervisor treats them identically.
+const SELF_CLEARING: [ProtectionStatus; 2] = [ProtectionStatus::Lvp, ProtectionStatus::Otp];
 
 #[test]
 fn lfp_4s_50ah_matches_hand_calculation() {
@@ -814,9 +863,8 @@ fn ov_trip_accumulates_elapsed_time_not_tick_count() {
     // Same budget reached three ways. A regression that counts calls
     // instead of `+= elapsed` passes the first row and fails the others.
     let ms = Duration::from_millis;
-    let cases: [(&str, &[Duration]); 3] = [
+    let cases: [(&str, &[Duration]); 2] = [
         ("6 x 500 ms = 3.0 s", &[ms(500); 6]),
-        ("one tick covering the whole budget", &[OV_DURATION]),
         ("1500 + 1000 + 600 = 3100 ms", &[ms(1500), ms(1000), ms(600)]),
     ];
     for (label, steps) in cases {
@@ -843,22 +891,6 @@ fn absorb_timeout_in_a_single_large_elapsed_tick() {
         &ok_tick(&mut s, b(CV_V, -3.0), MAX_ABSORB),
         FaultReason::AbsorbTimeout,
     ));
-}
-
-#[test]
-fn battery_stale_honors_elapsed() {
-    // One tick with elapsed = BATTERY_MISSING_TIMEOUT must latch.
-    let mut s = active(lfp_4s());
-    let a = ok_tick(&mut s, None, BATTERY_MISSING_TIMEOUT);
-    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
-}
-
-#[test]
-fn modbus_unhealthy_honors_elapsed() {
-    // Same: one big-elapsed tick saturates the modbus error counter.
-    let mut s = active(lfp_4s());
-    let a = fail_tick(&mut s, b(13.5, -0.1), MODBUS_UNHEALTHY_TIMEOUT);
-    assert!(matches_disable(&a, FaultReason::ModbusUnhealthy));
 }
 
 #[test]
@@ -972,85 +1004,6 @@ fn supervisor_returns_none_on_steady_state() {
 }
 
 #[test]
-fn battery_stale_for_budget_latches() {
-    let mut s = active(lfp_4s());
-    // BUDGET-1 ticks of missing battery: still healthy.
-    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
-        assert!(matches!(ok_tick(&mut s, None, TICK), Action::None));
-    }
-    assert_eq!(s.fault(), None);
-
-    let a = ok_tick(&mut s, None, TICK);
-    assert!(matches_disable(&a, FaultReason::BatterySensorStale));
-    assert_eq!(s.fault(), Some(FaultReason::BatterySensorStale));
-}
-
-#[test]
-fn battery_recovers_within_budget_no_latch() {
-    let mut s = active(lfp_4s());
-    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
-        ok_tick(&mut s, None, TICK);
-    }
-    // One fresh reading clears the counter.
-    ok_tick(&mut s, b(13.5, -0.1), TICK);
-    // Now we should be able to miss BUDGET-1 again without latching.
-    for _ in 0..(BATTERY_MISSING_TIMEOUT.as_secs() - 1) {
-        assert!(matches!(ok_tick(&mut s, None, TICK), Action::None));
-    }
-    assert_eq!(s.fault(), None);
-}
-
-#[test]
-fn modbus_errors_for_budget_latches() {
-    let mut s = active(lfp_4s());
-    for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {
-        assert!(matches!(
-            fail_tick(&mut s, b(13.5, -0.1), TICK),
-            Action::None
-        ));
-    }
-    let a = fail_tick(&mut s, b(13.5, -0.1), TICK);
-    assert!(matches_disable(&a, FaultReason::ModbusUnhealthy));
-}
-
-#[test]
-fn modbus_recovers_within_budget_no_latch() {
-    let mut s = active(lfp_4s());
-    for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {
-        fail_tick(&mut s, b(13.5, -0.1), TICK);
-    }
-    ok_tick(&mut s, b(13.5, -0.1), TICK); // good read clears counter
-    for _ in 0..(MODBUS_UNHEALTHY_TIMEOUT.as_secs() - 1) {
-        fail_tick(&mut s, b(13.5, -0.1), TICK);
-    }
-    assert_eq!(s.fault(), None);
-}
-
-#[test]
-fn overvoltage_sustained_latches() {
-    // absorb_v for lfp_4s = 14.4; margin = 0.2; so > 14.6 trips.
-    let mut s = active(lfp_4s());
-    for _ in 0..(OV_DURATION.as_secs() - 1) {
-        assert!(matches!(ok_tick(&mut s, b(14.7, -0.1), TICK), Action::None));
-    }
-    let a = ok_tick(&mut s, b(14.7, -0.1), TICK);
-    assert!(matches_disable(&a, FaultReason::Overvoltage));
-}
-
-#[test]
-fn overvoltage_brief_recovers_no_latch() {
-    let mut s = active(lfp_4s());
-    // Two ticks above OV; one tick back below. Counter resets.
-    ok_tick(&mut s, b(14.7, -0.1), TICK);
-    ok_tick(&mut s, b(14.7, -0.1), TICK);
-    ok_tick(&mut s, b(13.5, -0.1), TICK);
-    // Two more above must NOT latch (< budget after reset).
-    ok_tick(&mut s, b(14.7, -0.1), TICK);
-    ok_tick(&mut s, b(14.7, -0.1), TICK);
-    assert_eq!(s.fault(), None);
-}
-
-#[test]
 fn ov_below_threshold_does_not_trip() {
     // absorb_v + OV_MARGIN_V ≈ 14.6. 14.55 is unambiguously below in f32.
     let mut s = active(lfp_4s());
@@ -1058,6 +1011,107 @@ fn ov_below_threshold_does_not_trip() {
         ok_tick(&mut s, b(14.55, -0.1), TICK);
     }
     assert_eq!(s.fault(), None);
+}
+
+#[test]
+fn debounced_faults_latch_only_after_their_full_window() {
+    for c in DEBOUNCED_FAULTS {
+        let mut s = active(lfp_4s());
+        for _ in 0..(c.window.as_secs() - 1) {
+            let a = (c.feed)(&mut s, TICK);
+            assert!(matches!(a, Action::None), "{}: latched early", c.name);
+        }
+        assert_eq!(s.fault(), None, "{}", c.name);
+        let a = (c.feed)(&mut s, TICK);
+        assert!(matches_disable(&a, c.fault), "{}: no latch at the window", c.name);
+        assert_eq!(s.fault(), Some(c.fault), "{}", c.name);
+
+        // The window is elapsed time, not a tick count: one tick spanning
+        // the whole of it latches just the same.
+        let mut s = active(lfp_4s());
+        let a = (c.feed)(&mut s, c.window);
+        assert!(
+            matches_disable(&a, c.fault),
+            "{}: single big-elapsed tick did not latch",
+            c.name
+        );
+    }
+}
+
+#[test]
+fn debounced_faults_reset_on_a_single_healthy_tick() {
+    // One healthy tick is a fresh sample, a successful read, and a voltage
+    // under the line all at once, so the same tick clears whichever window
+    // happens to be accumulating.
+    for c in DEBOUNCED_FAULTS {
+        let mut s = active(lfp_4s());
+        for _ in 0..(c.window.as_secs() - 1) {
+            (c.feed)(&mut s, TICK);
+        }
+        ok_tick(&mut s, b(OK_V, -0.1), TICK);
+        // Counter is back to zero, so a whole window-minus-one fits again.
+        for _ in 0..(c.window.as_secs() - 1) {
+            let a = (c.feed)(&mut s, TICK);
+            assert!(matches!(a, Action::None), "{}: window was not reset", c.name);
+        }
+        assert_eq!(s.fault(), None, "{}", c.name);
+    }
+}
+
+#[test]
+fn self_clearing_protection_drops_to_pending_without_latching() {
+    // The buck self-disabled on a benign sensor-side condition, not a
+    // pack fault. The supervisor steps back to bring-up and waits, so no
+    // DisableOutput is emitted and no restart budget is burned however
+    // long the condition lasts.
+    for cause in SELF_CLEARING {
+        let mut s = active(lfp_4s());
+        let a = s.tick(poll_with_output(&s, BuckOutput::Off { cause }), TICK);
+        assert!(matches!(a, Action::None), "{cause}");
+        assert_eq!(s.fault(), None, "{cause}");
+        assert!(matches!(s.latch, LatchState::Pending { .. }), "{cause}");
+    }
+}
+
+#[test]
+fn self_clearing_protection_accepts_buck_auto_re_enable() {
+    // The XY7025 typically re-enables OUTPUT_EN itself once the cause
+    // clears — input voltage returns, or the case cools. The supervisor
+    // must read that as recovery rather than latching OutputOnInPending:
+    // setpoints are still the ones it programmed before the self-disable,
+    // so regulation resumes at known targets.
+    for cause in SELF_CLEARING {
+        let mut s = active(lfp_4s());
+        s.tick(poll_with_output(&s, BuckOutput::Off { cause }), TICK);
+        assert!(matches!(s.latch, LatchState::Pending { .. }), "{cause}");
+
+        let a = s.tick(poll_with_output(&s, BuckOutput::On), TICK);
+        assert!(matches!(a, Action::None), "{cause}");
+        assert_eq!(s.fault(), None, "{cause}");
+        assert!(matches!(s.latch, LatchState::Active { .. }), "{cause}");
+    }
+}
+
+#[test]
+fn setpoint_drift_in_either_field_latches_immediately() {
+    // Float targets for lfp_4s are 13.5 V and 10 A; the tolerance is
+    // 0.02, so either of these is well past it. No debounce — the read
+    // itself succeeded, so a mismatch is the device disagreeing with us.
+    let drifted = [
+        Setpoints { v_set: 12.0, i_set: 10.0 },
+        Setpoints { v_set: 13.5, i_set: 5.0 },
+    ];
+    for sp in drifted {
+        let mut s = active(lfp_4s());
+        let p = PollResult {
+            setpoints: Some(sp),
+            ..expected_poll(&s, b(OK_V, -0.1))
+        };
+        assert!(
+            matches_disable(&s.tick(p, TICK), FaultReason::SettingsDrift),
+            "{sp:?}"
+        );
+    }
 }
 
 #[test]
@@ -1131,41 +1185,6 @@ fn supervisor_latches_on_absorb_timeout() {
 
     let a = ok_tick(&mut s, b(CV_V, -3.0), TICK);
     assert!(matches_disable(&a, FaultReason::AbsorbTimeout));
-}
-
-#[test]
-fn setpoint_drift_v_set_latches_immediately() {
-    // Float target is 13.5 V; pretend the buck reports 12.0 V — well past
-    // the 0.02 V tolerance.
-    let mut s = active(lfp_4s());
-    let p = PollResult {
-        setpoints: Some(Setpoints {
-            v_set: 12.0,
-            i_set: 10.0,
-        }),
-        ..expected_poll(&s, b(13.5, -0.1))
-    };
-    assert!(matches_disable(
-        &s.tick(p, TICK),
-        FaultReason::SettingsDrift
-    ));
-}
-
-#[test]
-fn setpoint_drift_i_set_latches_immediately() {
-    // Float target is 13.5 V (matches), but I_SET disagrees with the 10 A regulation.
-    let mut s = active(lfp_4s());
-    let p = PollResult {
-        setpoints: Some(Setpoints {
-            v_set: 13.5,
-            i_set: 5.0,
-        }),
-        ..expected_poll(&s, b(13.5, -0.1))
-    };
-    assert!(matches_disable(
-        &s.tick(p, TICK),
-        FaultReason::SettingsDrift
-    ));
 }
 
 #[test]
@@ -1386,10 +1405,7 @@ fn buck_self_disable_in_active_latches() {
     // Active supervisor + buck reports output OFF (own OVP/OCP/LVP/over-temp
     // tripped, or panel toggled) → latch OutputUnexpectedlyOff.
     let mut s = active(lfp_4s());
-    let p = PollResult {
-        output: Some(BuckOutput::Off { cause: ProtectionStatus::Normal }),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
+    let p = poll_with_output(&s, BuckOutput::Off { cause: ProtectionStatus::Normal });
     assert!(matches_disable(
         &s.tick(p, TICK),
         FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Normal)
@@ -1536,10 +1552,7 @@ fn buck_output_on_in_pending_latches() {
     // and S_INI=0. If OUTPUT_EN reads ON anyway, regulation is happening
     // under unknown conditions; latch immediately, no debounce.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let p = PollResult {
-        output: Some(BuckOutput::On),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
+    let p = poll_with_output(&s, BuckOutput::On);
     assert!(matches_disable(
         &s.tick(p, TICK),
         FaultReason::OutputOnInPending
@@ -1595,38 +1608,13 @@ fn pending_does_not_enter_absorb_even_at_high_charge_current() {
 }
 
 #[test]
-fn active_lvp_drops_to_pending_without_latch() {
-    // Input UVLO is benign: the buck self-disabled because the DC supply
-    // dropped, not because of a pack-side fault. The supervisor must
-    // transition back to Pending without latching, so no DisableOutput
-    // is emitted and the caller's restart budget is preserved across
-    // arbitrarily long outages.
-    let mut s = active(lfp_4s());
-    let p_lvp = PollResult {
-        output: Some(BuckOutput::Off {
-            cause: ProtectionStatus::Lvp,
-        }),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
-    let a = s.tick(p_lvp, TICK);
-    assert!(matches!(a, Action::None));
-    assert_eq!(s.fault(), None);
-    assert!(matches!(s.latch, LatchState::Pending { .. }));
-}
-
-#[test]
 fn pending_waits_for_lvp_to_clear_before_enable() {
     // While LVP persists, the Pending bring-up must NOT emit EnableOutput
     // — writing set_output(true) into a buck in input UVLO would just
     // flap. Once LVP clears (buck reports Off with no cause), the
     // normal Pending → Active path emits EnableOutput.
     let mut s = active(lfp_4s());
-    let p_lvp = PollResult {
-        output: Some(BuckOutput::Off {
-            cause: ProtectionStatus::Lvp,
-        }),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
+    let p_lvp = poll_with_output(&s, BuckOutput::Off { cause: ProtectionStatus::Lvp });
     // Drop Active → Pending via LVP.
     assert!(matches!(s.tick(p_lvp, TICK), Action::None));
     // Many ticks of sustained LVP: stays Pending, no actions, no fault.
@@ -1649,12 +1637,7 @@ fn lvp_recovery_resumes_absorb_when_pack_below_plateau() {
     // Absorb (not stall in Float).
     let profile = lfp_4s();
     let mut s = active(profile);
-    let p_lvp = PollResult {
-        output: Some(BuckOutput::Off {
-            cause: ProtectionStatus::Lvp,
-        }),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
+    let p_lvp = poll_with_output(&s, BuckOutput::Off { cause: ProtectionStatus::Lvp });
     s.tick(p_lvp, TICK);
     // Pack rests well below absorb_v - ABSORB_CV_BAND_V (= 14.3).
     let drained = b(13.0, 0.0);
@@ -1697,99 +1680,16 @@ fn pending_at_boot_with_lvp_waits() {
 }
 
 #[test]
-fn lvp_recovery_accepts_buck_auto_re_enable() {
-    // After LVP intercept drops the supervisor to Pending, the XY7025
-    // typically auto-re-enables OUTPUT_EN once input voltage returns
-    // (LVP is a transient input-side protection, not a permanent latch).
-    // The supervisor must accept that as recovery — transition back to
-    // Active without latching OutputOnInPending — because setpoints are
-    // still the values it programmed before LVP, so regulation is at
-    // known targets.
-    let mut s = active(lfp_4s());
-    let p_lvp = PollResult {
-        output: Some(BuckOutput::Off {
-            cause: ProtectionStatus::Lvp,
-        }),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
-    s.tick(p_lvp, TICK);
-    assert!(matches!(s.latch, LatchState::Pending { .. }));
-    // Input returns and the buck brings its own output back on.
-    let p_recovered = PollResult {
-        output: Some(BuckOutput::On),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
-    let a = s.tick(p_recovered, TICK);
-    assert!(matches!(a, Action::None));
-    assert_eq!(s.fault(), None);
-    assert!(matches!(
-        s.latch,
-        LatchState::Active {
-            pending_voltage: None
-        }
-    ));
-}
-
-#[test]
 fn boot_pending_with_buck_on_still_latches() {
     // At cold boot, boot_sequence already wrote set_output(false) and
     // verified OUTPUT_EN=0 — so a poll showing buck=On is a genuine
     // anomaly (firmware bug / panel toggle / EMI). Stays the immediate
     // latch it always was; only ProtectRecovery gets the soft transition.
     let mut s = ChargeSupervisor::new(lfp_4s());
-    let p_on = PollResult {
-        output: Some(BuckOutput::On),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
+    let p_on = poll_with_output(&s, BuckOutput::On);
     assert!(matches_disable(
         &s.tick(p_on, TICK),
         FaultReason::OutputOnInPending
-    ));
-}
-
-#[test]
-fn active_otp_drops_to_pending_without_latch() {
-    // Over-temp self-disable is handled the same way as input UVLO:
-    // benign sensor-side condition, supervisor drops to Pending and
-    // waits without latching or burning any restart budget.
-    let mut s = active(lfp_4s());
-    let p_otp = PollResult {
-        output: Some(BuckOutput::Off {
-            cause: ProtectionStatus::Otp,
-        }),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
-    let a = s.tick(p_otp, TICK);
-    assert!(matches!(a, Action::None));
-    assert_eq!(s.fault(), None);
-    assert!(matches!(s.latch, LatchState::Pending { .. }));
-}
-
-#[test]
-fn otp_recovery_accepts_buck_auto_re_enable() {
-    // OTP, like LVP, may auto-clear and the buck may auto-re-enable
-    // OUTPUT_EN when the case cools. Supervisor follows it back to
-    // Active without latching.
-    let mut s = active(lfp_4s());
-    let p_otp = PollResult {
-        output: Some(BuckOutput::Off {
-            cause: ProtectionStatus::Otp,
-        }),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
-    s.tick(p_otp, TICK);
-    let p_recovered = PollResult {
-        output: Some(BuckOutput::On),
-        ..expected_poll(&s, b(OK_V, -0.1))
-    };
-    let a = s.tick(p_recovered, TICK);
-    assert!(matches!(a, Action::None));
-    assert_eq!(s.fault(), None);
-    assert!(matches!(
-        s.latch,
-        LatchState::Active {
-            pending_voltage: None
-        }
     ));
 }
 

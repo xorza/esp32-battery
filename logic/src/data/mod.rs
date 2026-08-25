@@ -4,11 +4,12 @@
 //! staleness tracking (`LiveReadings`) and the adaptive-resolution history
 //! ring (`history`).
 
-mod history;
+pub(crate) mod history;
 
-pub use history::HISTORY_CAPACITY;
 
-use crate::charging::{FaultReason, InhibitReason, Phase};
+use crate::charging::fault_reason::FaultReason;
+use crate::charging::inhibit_reason::InhibitReason;
+use crate::charging::phase::Phase;
 use history::History;
 
 #[derive(Clone, Copy, Default)]

@@ -14,12 +14,12 @@ use std::time::Duration;
 
 use log::{error, info, warn};
 
-use esp32_battery_logic::charging::{
-    self, Action, BatterySample, BuckOutput, BusError, ChargeSupervisor, PollResult,
-    VoltageWriteOutcome, VoltageWriter,
+use esp32_battery_logic::{
+    Action, BatterySample, BuckOutput, BusError, ChargeSupervisor, PollResult, VoltageWriteOutcome,
+    VoltageWriter, apply_update_voltage,
 };
-use esp32_battery_logic::data::{PsReading, SensorData};
-use esp32_battery_logic::error_log::{Event, XyError};
+use esp32_battery_logic::{Event, XyError};
+use esp32_battery_logic::{PsReading, SensorData};
 
 use xy_modbus::{ModelCheck, ProtectionStatus, SafetyLimits, Status};
 
@@ -133,7 +133,7 @@ mod real {
     use xy_modbus::esp_idf::EspIdfTransport;
     use xy_modbus::{ModelCheck, SafetyLimits, Status};
 
-    use esp32_battery_logic::charging::{BusError, VoltageWriter};
+    use esp32_battery_logic::{BusError, VoltageWriter};
 
     use super::XyDevice;
     use crate::board::XyPins;
@@ -205,7 +205,7 @@ mod fake {
     use esp_idf_hal::uart::{UartDriver, config::Config};
     use esp_idf_hal::units::Hertz;
 
-    use esp32_battery_logic::charging::{BusError, VoltageWriter};
+    use esp32_battery_logic::{BusError, VoltageWriter};
     use xy_modbus::{ModelCheck, ProtectionStatus, RegMode, SafetyLimits, Setpoints, Status};
 
     use super::{EXPECTED_MODEL_CODE, XyDevice};
@@ -581,7 +581,7 @@ fn apply_action<D: XyDevice>(
             }
         }
         Action::UpdateVoltage(ticket) => {
-            let outcome = charging::apply_update_voltage(
+            let outcome = apply_update_voltage(
                 xy,
                 &ticket,
                 || thread::sleep(STEP_DOWN_SETTLE),

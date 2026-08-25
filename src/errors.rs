@@ -16,7 +16,7 @@ use esp_idf_svc::http::server::EspHttpServer;
 use serde::Serialize;
 use serde::ser::SerializeSeq;
 
-use esp32_battery_logic::error_log::{Event, EventLog};
+use esp32_battery_logic::{Event, EventLog};
 
 use crate::http::mount_json_get;
 

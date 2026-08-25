@@ -18,7 +18,7 @@ use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::sys;
 use esp_idf_svc::sys::EspError;
 
-use esp32_battery_logic::log_ring::Ring;
+use esp32_battery_logic::Ring;
 
 unsafe extern "C" {
     fn vsnprintf(s: *mut c_char, n: usize, fmt: *const c_char, args: sys::va_list) -> i32;

@@ -28,14 +28,13 @@ use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use log::warn;
 
-use esp32_battery_logic::battery::Chemistry;
-use esp32_battery_logic::charging::{INPUT_LVP_MARGIN_V, Profile};
-use esp32_battery_logic::data::SensorData;
-use esp32_battery_logic::error_log::EventLog;
+use esp32_battery_logic::Chemistry;
+use esp32_battery_logic::EventLog;
+use esp32_battery_logic::SensorData;
+use esp32_battery_logic::{INPUT_LVP_MARGIN_V, Profile};
 use xy_modbus::SafetyLimits;
 
-use esp32_battery_logic::net::wifi_credentials::WifiCredentials;
-use esp32_battery_logic::net::{NetAction, NetPhase, NetPoll, NetSupervisor};
+use esp32_battery_logic::{NetAction, NetPhase, NetPoll, NetSupervisor, WifiCredentials};
 
 use crate::clock::{EventRecorder, uptime};
 use crate::net::{NetResources, NetStatusHandle, ResetSignal, SubmissionStatus};
@@ -124,9 +123,9 @@ fn main() {
     let wifi = wifi::WifiDriver::new(board.modem, sysloop, nvs_partition);
 
     let sensor_data: Arc<Mutex<SensorData>> =
-        Arc::new(Mutex::new(esp32_battery_logic::data::SensorData::new()));
+        Arc::new(Mutex::new(esp32_battery_logic::SensorData::new()));
     let event_log: Arc<Mutex<EventLog>> =
-        Arc::new(Mutex::new(esp32_battery_logic::error_log::EventLog::new()));
+        Arc::new(Mutex::new(esp32_battery_logic::EventLog::new()));
     let net_status = NetStatusHandle::new();
 
     let _sntp = clock::start_sntp(clock.clone());

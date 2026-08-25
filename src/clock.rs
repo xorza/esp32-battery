@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use log::{info, warn};
 
-use esp32_battery_logic::error_log::{Event, EventLog};
+use esp32_battery_logic::{Event, EventLog};
 
 /// Plausibility bounds on the system clock. The SNTP callback fires even when
 /// the system time hasn't actually been set to something sensible (e.g. a

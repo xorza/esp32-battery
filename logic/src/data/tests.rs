@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::data::history::HISTORY_CAPACITY;
+
 fn bat_reading(voltage: f32, current: f32) -> Ina228Reading {
     Ina228Reading {
         voltage,

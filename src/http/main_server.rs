@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
-use esp32_battery_logic::data::SensorData;
-use esp32_battery_logic::error_log::EventLog;
+use esp32_battery_logic::EventLog;
+use esp32_battery_logic::SensorData;
 
 use crate::log_ring;
 use crate::net::ResetSignal;

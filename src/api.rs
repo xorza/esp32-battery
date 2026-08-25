@@ -12,7 +12,7 @@ use serde::ser::SerializeSeq;
 
 use std::sync::{Arc, Mutex};
 
-use esp32_battery_logic::data::{Sample, SensorData};
+use esp32_battery_logic::{Sample, SensorData};
 
 const REASON_DISPLAY_CAP: usize = 64;
 
