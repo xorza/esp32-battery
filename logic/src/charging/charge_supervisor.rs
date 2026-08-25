@@ -486,11 +486,15 @@ impl ChargeSupervisor {
 
     /// The latch/inhibit rule in one place: the same condition disables a
     /// sourcing buck and merely blocks bring-up of an idle one.
-    fn fault_or_inhibit(&self, latched: FaultReason, inhibited: InhibitReason) -> Verdict {
+    fn fault_or_inhibit(&self, reason: FaultReason) -> Verdict {
         if self.state.sourcing() {
-            Verdict::Latch(latched)
+            Verdict::Latch(reason)
         } else {
-            Verdict::Inhibit(inhibited)
+            Verdict::Inhibit(
+                reason
+                    .inhibited()
+                    .expect("a fault reachable with the output off has a waiting form"),
+            )
         }
     }
 
@@ -535,8 +539,7 @@ impl ChargeSupervisor {
             if (sp.v_set - want.v_set).abs() >= SETPOINT_DRIFT_TOL
                 || (sp.i_set - want.i_set).abs() >= SETPOINT_DRIFT_TOL
             {
-                return self
-                    .fault_or_inhibit(FaultReason::SettingsDrift, InhibitReason::SettingsDrift);
+                return self.fault_or_inhibit(FaultReason::SettingsDrift);
             }
         }
 
@@ -546,8 +549,7 @@ impl ChargeSupervisor {
             .modbus_err
             .step(p.setpoints.is_none(), elapsed, MODBUS_UNHEALTHY_TIMEOUT)
         {
-            return self
-                .fault_or_inhibit(FaultReason::ModbusUnhealthy, InhibitReason::ModbusUnhealthy);
+            return self.fault_or_inhibit(FaultReason::ModbusUnhealthy);
         }
 
         // 4. Battery sample freshness. NaN/Inf counts as missing: a sensor
@@ -560,10 +562,7 @@ impl ChargeSupervisor {
             .battery_missing
             .step(battery.is_none(), elapsed, BATTERY_MISSING_TIMEOUT)
         {
-            return self.fault_or_inhibit(
-                FaultReason::BatterySensorStale,
-                InhibitReason::BatterySensorStale,
-            );
+            return self.fault_or_inhibit(FaultReason::BatterySensorStale);
         }
         let Some(b) = battery else {
             return Verdict::Inhibit(InhibitReason::NoBatterySample);
@@ -610,17 +609,14 @@ impl ChargeSupervisor {
                 elapsed,
                 PACK_TEMP_STALE_TIMEOUT,
             ) {
-                return self
-                    .fault_or_inhibit(FaultReason::PackTempStale, InhibitReason::PackTempStale);
+                return self.fault_or_inhibit(FaultReason::PackTempStale);
             }
             if let Some(t) = p.pack_temp_c {
                 if t < CHARGE_TEMP_MIN_C {
-                    return self
-                        .fault_or_inhibit(FaultReason::PackTooCold, InhibitReason::PackTooCold);
+                    return self.fault_or_inhibit(FaultReason::PackTooCold);
                 }
                 if t > CHARGE_TEMP_MAX_C {
-                    return self
-                        .fault_or_inhibit(FaultReason::PackTooHot, InhibitReason::PackTooHot);
+                    return self.fault_or_inhibit(FaultReason::PackTooHot);
                 }
             }
         }

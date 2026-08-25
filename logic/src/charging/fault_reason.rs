@@ -1,6 +1,8 @@
 //! Why the supervisor stopped charging, and what it did about it.
 
 use strum::IntoStaticStr;
+
+use crate::charging::inhibit_reason::InhibitReason;
 use xy_modbus::ProtectionStatus;
 
 /// Why the supervisor stopped charging. Recovery is a reboot either way —
@@ -143,6 +145,33 @@ impl FaultReason {
                 FaultResponse::Park
             }
         }
+    }
+
+    /// The waiting form of this fault: the same condition seen from a state
+    /// where the output is already off, so latching would disable nothing
+    /// while still costing a reboot to clear.
+    ///
+    /// `None` for the faults that can only arise while the buck is
+    /// sourcing, which therefore never need one. Kept here rather than
+    /// named at each check, so the pairing lives in one place and cannot
+    /// drift per call site — a mismatched pair would compile and report the
+    /// wrong reason.
+    pub(super) fn inhibited(self) -> Option<InhibitReason> {
+        Some(match self {
+            Self::SettingsDrift => InhibitReason::SettingsDrift,
+            Self::ModbusUnhealthy => InhibitReason::ModbusUnhealthy,
+            Self::BatterySensorStale => InhibitReason::BatterySensorStale,
+            Self::Overvoltage => InhibitReason::Overvoltage,
+            Self::PackTooCold => InhibitReason::PackTooCold,
+            Self::PackTooHot => InhibitReason::PackTooHot,
+            Self::PackTempStale => InhibitReason::PackTempStale,
+            Self::AbsorbTimeout
+            | Self::ChargeTimeout
+            | Self::ChargeOvercurrent
+            | Self::ProtectionFlapping
+            | Self::OutputUnexpectedlyOff(_)
+            | Self::OutputOnInPending => return None,
+        })
     }
 
     /// Stable snake_case identifier — what API consumers and dashboards

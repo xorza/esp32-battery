@@ -577,6 +577,16 @@ fn labels_are_the_snake_case_wire_identifiers() {
         assert_eq!(reason.label(), want, "{reason:?}");
     }
 
+    // A fault and its waiting form are the same condition seen from either
+    // side of the output being on, so they publish the same identifier.
+    // Pinned here because `inhibited()` is a hand-written pairing, and a
+    // crossed pair would compile and quietly report the wrong reason.
+    for (reason, want) in faults {
+        if let Some(waiting) = reason.inhibited() {
+            assert_eq!(waiting.label(), want, "{reason:?}");
+        }
+    }
+
     // A payload must not leak into the identifier — only the Display form
     // names the cause.
     assert_eq!(
