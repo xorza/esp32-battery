@@ -10,35 +10,31 @@
 //! }
 //! ```
 
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use esp_idf_svc::http::server::EspHttpServer;
 use serde::Serialize;
 use serde::ser::SerializeSeq;
 
-use esp32_battery_logic::{Event, EventLog};
+use esp32_battery_logic::{ChargeTransition, EventKind, EventLog, InaError, XyError};
 
 use crate::http::mount_json_get;
 
-/// Which per-kind counter map to render. The three groups differ only in
-/// which iterator they pull from, so they share one view rather than three
-/// identical `Serialize` impls.
-#[derive(Copy, Clone)]
-enum CountKind {
-    Ina,
-    Xy,
-    Charge,
+/// The `{ kind: count }` map for one event source. Generic over the source so
+/// the three groups share one `Serialize` impl.
+/// `PhantomData<fn() -> K>`: the view names a source, it does not own one.
+struct CountsView<'a, K>(&'a EventLog, PhantomData<fn() -> K>);
+
+impl<'a, K> CountsView<'a, K> {
+    fn new(log: &'a EventLog) -> Self {
+        Self(log, PhantomData)
+    }
 }
 
-struct CountsView<'a>(&'a EventLog, CountKind);
-
-impl Serialize for CountsView<'_> {
+impl<K: EventKind> Serialize for CountsView<'_, K> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self.1 {
-            CountKind::Ina => s.collect_map(self.0.ina_counts_iter()),
-            CountKind::Xy => s.collect_map(self.0.xy_counts_iter()),
-            CountKind::Charge => s.collect_map(self.0.charge_counts_iter()),
-        }
+        s.collect_map(self.0.counts_iter::<K>())
     }
 }
 
@@ -48,12 +44,8 @@ impl Serialize for RecentView<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(self.0.len()))?;
         for e in self.0.recent() {
-            let (source, kind) = match e.event {
-                Event::Ina(k) => ("ina", k.name()),
-                Event::Xy(k) => ("xy", k.name()),
-                Event::Charge(k) => ("charge", k.name()),
-            };
-            seq.serialize_element(&(e.ts, source, kind))?;
+            let name = e.event.name();
+            seq.serialize_element(&(e.ts, name.source, name.kind))?;
         }
         seq.end()
     }
@@ -61,9 +53,9 @@ impl Serialize for RecentView<'_> {
 
 #[derive(Serialize)]
 struct ErrorsResponse<'a> {
-    ina_counts: CountsView<'a>,
-    xy_counts: CountsView<'a>,
-    charge_counts: CountsView<'a>,
+    ina_counts: CountsView<'a, InaError>,
+    xy_counts: CountsView<'a, XyError>,
+    charge_counts: CountsView<'a, ChargeTransition>,
     recent: RecentView<'a>,
 }
 
@@ -71,9 +63,9 @@ pub fn mount(server: &mut EspHttpServer<'static>, event_log: Arc<Mutex<EventLog>
     mount_json_get(server, "/api/errors", move |buf| {
         let log = event_log.lock().unwrap();
         let response = ErrorsResponse {
-            ina_counts: CountsView(&log, CountKind::Ina),
-            xy_counts: CountsView(&log, CountKind::Xy),
-            charge_counts: CountsView(&log, CountKind::Charge),
+            ina_counts: CountsView::new(&log),
+            xy_counts: CountsView::new(&log),
+            charge_counts: CountsView::new(&log),
             recent: RecentView(&log),
         };
         serde_json_core::to_slice(&response, buf)

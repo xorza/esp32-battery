@@ -391,3 +391,47 @@ fn boot_pending_with_buck_on_still_latches() {
         FaultReason::OutputOnInPending
     ));
 }
+
+#[test]
+fn labels_are_the_snake_case_wire_identifiers() {
+    // `/api` publishes these verbatim and dashboards match on them, so the
+    // strings are a wire format: pinned here against the literals rather
+    // than re-derived from the same `IntoStaticStr` that produces them.
+    let faults: [(FaultReason, &str); 7] = [
+        (FaultReason::BatterySensorStale, "battery_sensor_stale"),
+        (FaultReason::ModbusUnhealthy, "modbus_unhealthy"),
+        (FaultReason::Overvoltage, "overvoltage"),
+        (FaultReason::AbsorbTimeout, "absorb_timeout"),
+        (FaultReason::SettingsDrift, "settings_drift"),
+        (
+            FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ovp),
+            "output_unexpectedly_off",
+        ),
+        (FaultReason::OutputOnInPending, "output_on_in_pending"),
+    ];
+    for (reason, want) in faults {
+        assert_eq!(reason.label(), want, "{reason:?}");
+    }
+
+    let inhibits: [(InhibitReason, &str); 6] = [
+        (InhibitReason::SettingsDrift, "settings_drift"),
+        (InhibitReason::ModbusUnhealthy, "modbus_unhealthy"),
+        (InhibitReason::BatterySensorStale, "battery_sensor_stale"),
+        (InhibitReason::NoBatterySample, "no_battery_sample"),
+        (InhibitReason::Overvoltage, "overvoltage"),
+        (
+            InhibitReason::BuckProtection(ProtectionStatus::Lvp),
+            "buck_protection",
+        ),
+    ];
+    for (reason, want) in inhibits {
+        assert_eq!(reason.label(), want, "{reason:?}");
+    }
+
+    // A payload must not leak into the identifier — only the Display form
+    // names the cause.
+    assert_eq!(
+        FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Ovp).label(),
+        FaultReason::OutputUnexpectedlyOff(ProtectionStatus::Otp).label()
+    );
+}

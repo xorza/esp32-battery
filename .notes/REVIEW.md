@@ -4,66 +4,25 @@ Findings only — no fixes, no designs. **Delete an item once it is addressed**;
 this file lists open findings and nothing else. Groups are ordered by severity
 and benefit; items within a group share one root cause.
 
-## The network state is re-encoded five times along one path
+## The network state is re-encoded three times along one path
 
-- [ ] `NetPhase` (5 variants, `logic/src/net/net_phase.rs:20`) →
-      `NetStatus` (4 variants, `#[repr(u8)]`, `:52`) → `LowerKey`
-      (3 variants, `src/lcd.rs:197`). Each hop is a lossy hand-written match,
-      and the middle hop round-trips through an `AtomicU8` and
-      `from_repr(...).expect("invalid NetStatus discriminant")`
-      (`src/net.rs:40`).
-- [ ] `NetResources` (`src/net.rs:134`) is a fourth encoding — two variants the
-      phase already determines — kept honest by three separate mechanisms:
-      `debug_assert_matches_phase` once per tick (`:182`), `if let
-      NetResources::Mixed {..}` arms in `apply_net_action` that silently no-op
-      on mismatch (`src/main.rs:207`, `:216`, `:226`), and
-      `warn!("… out of step")` else-branches in `promote_to_sta` /
-      `sta_to_captive` (`src/main.rs:246`, `:267`). Its own doc comment says it
-      is recovering a property "the old fused enum enforced by construction".
-- [ ] `MixedWifi::sta_configured` (`src/wifi.rs:241`) is a fifth: it tracks
-      "are credentials on the radio", which `NetPhase::polls_association()`
-      already answers and `NetResources::try_connect` already gates on
-      (`src/net.rs:152`). The only phase in which it can be `false` is
-      `CaptiveIdle`, which is exactly the phase `polls_association()` rejects —
-      so the short-circuit at `src/wifi.rs:290` is unreachable.
-- [ ] `NetStatusHandle` (`src/net.rs:26`) and `SubmissionStatusHandle` (`:60`)
-      are the same `Arc<AtomicU8>` newtype with identical `new`/`store`/`load`
-      bodies, written out twice; `ResetSignal` (`:83`) is the `AtomicBool`
-      sibling of the same shape.
+- [ ] `NetPhase` (5 variants, `logic/src/net/net_phase.rs`) → `NetStatus`
+      (4 variants, `#[repr(u8)]`) → `LowerKey` (3 variants, `src/lcd.rs`).
+      Each hop is a lossy hand-written match, and the middle one round-trips
+      through an `AtomicU8` and `from_repr(...).expect(...)`. The atomic hop
+      earns its place — it is how the LCD thread reads the phase without
+      locking the supervisor — but nothing checks that the two matches stay
+      consistent with each other.
+- [ ] `NetStatusHandle` and `SubmissionStatusHandle` (`src/net.rs`) are the
+      same `Arc<AtomicU8>` newtype with identical `new`/`store`/`load`, written
+      twice. *(Left alone in Phase 3: strum's `FromRepr` is an inherent method
+      rather than a trait, so the generic that removes the duplication needs a
+      local trait, two impls, `PhantomData`, and manual `Clone`/`Debug` to
+      avoid spurious `T:` bounds — more code and more indirection than the ~15
+      lines it deletes. Worth revisiting only if a third one appears.)*
 - [ ] `NetStatusHandle::load` carries `#[allow(dead_code)] // consumed by the
-      lcd thread` (`src/net.rs:37`) — it is dead only when the `lcd` feature is
-      off, expressed as an unconditional allow rather than a cfg.
-
-## The event-kind trio is written out three times at every layer
-
-- [ ] `InaError`, `XyError` and `ChargeTransition` each carry a hand-written
-      `index()` + `name()` pair with identical bodies
-      (`logic/src/error_log/mod.rs:22-33`, `:77-88`, `:90-98`).
-- [ ] `EventLog` holds three parallel count arrays, three `*_count` accessors,
-      three `*_counts_iter` accessors, and a three-arm `record` match whose arms
-      differ only in which array they index (`logic/src/error_log/mod.rs:143-222`).
-- [ ] `src/errors.rs` adds a `CountKind` enum (`:27`) whose only job is to
-      re-dispatch to one of those three iterators, plus a third three-arm match
-      in `RecentView` (`:51-55`).
-- [ ] `ina_count` / `xy_count` / `charge_count` are `pub` but have no caller
-      outside the `*_counts_iter` methods on the same type and the tests.
-
-## The charge supervisor's own state lives in five overlapping types
-
-- [ ] `LatchState` (`logic/src/charging/charge_supervisor.rs:38`) is re-derived
-      every tick into `Mode` (`:69`), a lossy copy that exists only because
-      `safety_verdict` takes `&mut self` and cannot hold a borrow of
-      `self.latch`. `PendingReason` is then carried in both.
-- [ ] `Verdict` (`:97`) is a fifth enum encoding the transitions between the
-      other two.
-- [ ] `transition_between(&from, &to)` (`:126`) re-derives which transition just
-      happened by comparing two states, though each of the four `set_latch`
-      call sites already knows which one it is making.
-- [ ] `set_latch` carries three `debug_assert!`s (`:593-613`) re-checking
-      legality that those same four callers establish by construction.
-- [ ] Each `commit_*` method asserts that the ticket matches the current state
-      (`:269-276`, `:291-295`, `:318-327`); `commit_disable`'s own doc says the
-      assert "cannot fire through the public API".
+      lcd thread` — it is dead only when the `lcd` feature is off, expressed as
+      an unconditional allow rather than a cfg.
 
 ## `SensorData` is a pass-through wrapper carrying an unrelated mailbox
 
@@ -147,49 +106,6 @@ and benefit; items within a group share one root cause.
       `EnterProtectRecovery`), and `InhibitReason::BuckProtection`
       (`logic/src/charging/inhibit_reason.rs:33`). Firmware and logic each
       decide it for themselves.
-
-## The net supervisor's transition table repeats itself
-
-- [ ] The `p.associated → StaServing + PromoteToSta` block is byte-identical in
-      the `CaptiveTrying` and `CaptiveFallbackRetrying` arms
-      (`logic/src/net/net_supervisor.rs:88-96`, `:121-129`).
-- [ ] The `p.submitted → CaptiveTrying + ApplyCreds` block appears three times
-      (`:70-76`, `:97-106`, `:130-138`).
-- [ ] Every arm that stays put reconstructs its own phase by hand
-      (`:113-116`, `:139-142`, `:166-172`, `:193-196`), and `tick` runs a
-      `mem::replace` against a `CaptiveIdle` placeholder (`:46`) purely to move
-      the credentials out by value.
-- [ ] `WifiCredentials` (a 32- + 64-byte heapless pair) is cloned on each of
-      those transitions because `Step` needs the same creds in both the phase
-      and the action.
-
-## The two `wifi.rs` mode wrappers duplicate each other
-
-- [ ] `StaWifi::try_connect` (`src/wifi.rs:218`) and `MixedWifi::try_connect`
-      (`:289`) share the same four-line body, `MixedWifi` prefixing the
-      unreachable `sta_configured` check; `NetResources::try_connect` then
-      matches on both variants to call the same-named method (`src/net.rs:155`).
-- [ ] `WifiDriver::into_mixed` (`src/wifi.rs:190`) and
-      `MixedWifi::apply_sta_config` (`:276`) both build
-      `Configuration::Mixed(sta_config-or-default, ap_config())` — one via
-      stop/start, one live.
-- [ ] `StaWifi::into_mixed` (`:228`) and `MixedWifi::into_sta` (`:320`) are
-      one-line forwards to the identically named `WifiDriver` methods.
-
-## Three mechanisms produce one kind of label
-
-- [ ] `Phase` derives its label from `strum::IntoStaticStr`
-      (`logic/src/charging/phase.rs:5`), as do `InaError`, `XyError` and
-      `ChargeTransition`. `FaultReason` and `InhibitReason` each hand-write both
-      a `label()` match *and* a `Display` match — four variant lists maintained
-      by hand next to enums that already derive the same string
-      (`logic/src/charging/fault_reason.rs:47-74`,
-      `logic/src/charging/inhibit_reason.rs:36-60`).
-- [ ] `api::reason_message` (`src/api.rs:116`) builds a 64-byte
-      `heapless::String` even when the reason is `None`, then tests
-      `is_empty()` to decide whether the field serializes as null
-      (`:161`, `:163`) — "no fault" and "a fault whose `Display` is empty" are
-      the same value.
 
 ## The HTTP helper stack is deeper and more parameterised than its callers
 

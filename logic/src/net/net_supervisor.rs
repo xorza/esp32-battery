@@ -16,6 +16,50 @@ struct Step {
     action: NetAction,
 }
 
+/// The transitions more than one phase can make. Each carries the same
+/// credentials into both halves of the `Step`, which is why they clone: the
+/// phase has to remember them and the action has to apply them.
+impl Step {
+    /// Association succeeded from a captive phase. Reachable from
+    /// `CaptiveTrying` (the creds the user just submitted) and from
+    /// `CaptiveFallbackRetrying` (the last known-good pair, retried in the
+    /// background) — identical either way, since what matters is that the
+    /// pair on the radio works.
+    fn promote(creds: WifiCredentials) -> Self {
+        Self {
+            phase: NetPhase::StaServing {
+                creds: creds.clone(),
+                link: LinkState::Up,
+            },
+            action: NetAction::PromoteToSta(creds),
+        }
+    }
+
+    /// A `/save` landed: put the new pair on the radio and restart the
+    /// association budget. Latest submission always wins, from any captive
+    /// phase.
+    fn try_creds(creds: WifiCredentials, now: Duration) -> Self {
+        Self {
+            phase: NetPhase::CaptiveTrying {
+                creds: creds.clone(),
+                since: now,
+            },
+            action: NetAction::ApplyCreds(creds),
+        }
+    }
+
+    /// The STA half ran out of grace: bring the captive AP up but keep the
+    /// credentials on the radio so the STA half keeps retrying behind it.
+    fn fall_back(creds: WifiCredentials) -> Self {
+        Self {
+            phase: NetPhase::CaptiveFallbackRetrying {
+                creds: creds.clone(),
+            },
+            action: NetAction::FallbackToCaptive(creds),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NetSupervisor {
     phase: NetPhase,
@@ -67,13 +111,7 @@ impl NetSupervisor {
 
         match phase {
             NetPhase::CaptiveIdle => match p.submitted {
-                Some(creds) => Step {
-                    phase: NetPhase::CaptiveTrying {
-                        creds: creds.clone(),
-                        since: p.now,
-                    },
-                    action: NetAction::ApplyCreds(creds),
-                },
+                Some(creds) => Step::try_creds(creds, p.now),
                 None => Step {
                     phase: NetPhase::CaptiveIdle,
                     action: NetAction::RefreshScan,
@@ -86,23 +124,10 @@ impl NetSupervisor {
                 // same tick. The other way round we would disconnect from
                 // the network we just joined.
                 if p.associated {
-                    return Step {
-                        phase: NetPhase::StaServing {
-                            creds: creds.clone(),
-                            link: LinkState::Up,
-                        },
-                        action: NetAction::PromoteToSta(creds),
-                    };
+                    return Step::promote(creds);
                 }
                 if let Some(new_creds) = p.submitted {
-                    // Latest submission wins, and restarts the budget.
-                    return Step {
-                        phase: NetPhase::CaptiveTrying {
-                            creds: new_creds.clone(),
-                            since: p.now,
-                        },
-                        action: NetAction::ApplyCreds(new_creds),
-                    };
+                    return Step::try_creds(new_creds, p.now);
                 }
                 if p.now.saturating_sub(since) >= CAPTIVE_TRYING_TIMEOUT {
                     return Step {
@@ -119,22 +144,10 @@ impl NetSupervisor {
             NetPhase::CaptiveFallbackRetrying { creds } => {
                 // Same ordering rule as CaptiveTrying.
                 if p.associated {
-                    return Step {
-                        phase: NetPhase::StaServing {
-                            creds: creds.clone(),
-                            link: LinkState::Up,
-                        },
-                        action: NetAction::PromoteToSta(creds),
-                    };
+                    return Step::promote(creds);
                 }
                 if let Some(new_creds) = p.submitted {
-                    return Step {
-                        phase: NetPhase::CaptiveTrying {
-                            creds: new_creds.clone(),
-                            since: p.now,
-                        },
-                        action: NetAction::ApplyCreds(new_creds),
-                    };
+                    return Step::try_creds(new_creds, p.now);
                 }
                 Step {
                     phase: NetPhase::CaptiveFallbackRetrying { creds },
@@ -156,12 +169,7 @@ impl NetSupervisor {
                     };
                 }
                 if p.now.saturating_sub(session_start) >= CAPTIVE_AFTER_DISCONNECT {
-                    return Step {
-                        phase: NetPhase::CaptiveFallbackRetrying {
-                            creds: creds.clone(),
-                        },
-                        action: NetAction::FallbackToCaptive(creds),
-                    };
+                    return Step::fall_back(creds);
                 }
                 Step {
                     phase: NetPhase::StaConnecting {
@@ -183,12 +191,7 @@ impl NetSupervisor {
                 if let LinkState::Down { since } = link
                     && p.now.saturating_sub(since) >= CAPTIVE_AFTER_DISCONNECT
                 {
-                    return Step {
-                        phase: NetPhase::CaptiveFallbackRetrying {
-                            creds: creds.clone(),
-                        },
-                        action: NetAction::FallbackToCaptive(creds),
-                    };
+                    return Step::fall_back(creds);
                 }
                 Step {
                     phase: NetPhase::StaServing { creds, link },

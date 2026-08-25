@@ -1,5 +1,6 @@
 //! Why the supervisor latched the buck off.
 
+use strum::IntoStaticStr;
 use xy_modbus::ProtectionStatus;
 
 /// Why the supervisor latched the buck off. Once latched, only a reboot
@@ -7,7 +8,8 @@ use xy_modbus::ProtectionStatus;
 /// under the same conditions. `OutputUnexpectedlyOff` carries the
 /// device-reported PROTECT cause that was active when the buck
 /// self-disabled (or `Normal` if no cause was set).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum FaultReason {
     /// No fresh battery reading for `BATTERY_MISSING_TIMEOUT.as_secs()` consecutive ticks.
     /// Without current/voltage we cannot supervise charging — fail closed.
@@ -62,14 +64,6 @@ impl FaultReason {
     /// Stable snake_case identifier — what API consumers and dashboards
     /// match on. The `Display` impl is the human-readable form for logs.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::BatterySensorStale => "battery_sensor_stale",
-            Self::ModbusUnhealthy => "modbus_unhealthy",
-            Self::Overvoltage => "overvoltage",
-            Self::AbsorbTimeout => "absorb_timeout",
-            Self::SettingsDrift => "settings_drift",
-            Self::OutputUnexpectedlyOff(_) => "output_unexpectedly_off",
-            Self::OutputOnInPending => "output_on_in_pending",
-        }
+        self.into()
     }
 }

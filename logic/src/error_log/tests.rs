@@ -7,13 +7,13 @@ fn new_is_empty() {
     assert!(log.is_empty());
     assert_eq!(log.len(), 0);
     for k in InaError::iter() {
-        assert_eq!(log.ina_count(k), 0);
+        assert_eq!(log.count(k), 0);
     }
     for k in XyError::iter() {
-        assert_eq!(log.xy_count(k), 0);
+        assert_eq!(log.count(k), 0);
     }
     for k in ChargeTransition::iter() {
-        assert_eq!(log.charge_count(k), 0);
+        assert_eq!(log.count(k), 0);
     }
 }
 
@@ -22,8 +22,8 @@ fn record_bumps_counter_and_appends() {
     let mut log = EventLog::new();
     log.record(100, Event::Ina(InaError::CurrentRead));
     assert_eq!(log.len(), 1);
-    assert_eq!(log.ina_count(InaError::CurrentRead), 1);
-    assert_eq!(log.ina_count(InaError::Init), 0);
+    assert_eq!(log.count(InaError::CurrentRead), 1);
+    assert_eq!(log.count(InaError::Init), 0);
     let e = log.recent().next().unwrap();
     assert_eq!(e.ts, 100);
     assert!(matches!(e.event, Event::Ina(InaError::CurrentRead)));
@@ -35,9 +35,9 @@ fn distinct_kinds_within_source_counted_separately() {
     log.record(1, Event::Ina(InaError::CurrentRead));
     log.record(2, Event::Ina(InaError::CurrentRead));
     log.record(3, Event::Ina(InaError::PowerRead));
-    assert_eq!(log.ina_count(InaError::CurrentRead), 2);
-    assert_eq!(log.ina_count(InaError::PowerRead), 1);
-    assert_eq!(log.ina_count(InaError::BusVoltageRead), 0);
+    assert_eq!(log.count(InaError::CurrentRead), 2);
+    assert_eq!(log.count(InaError::PowerRead), 1);
+    assert_eq!(log.count(InaError::BusVoltageRead), 0);
 }
 
 #[test]
@@ -49,12 +49,12 @@ fn counters_are_independent_per_source() {
     log.record(4, Event::Charge(ChargeTransition::Energised));
     log.record(5, Event::Charge(ChargeTransition::Energised));
     log.record(6, Event::Charge(ChargeTransition::Latched));
-    assert_eq!(log.ina_count(InaError::CurrentRead), 1);
-    assert_eq!(log.xy_count(XyError::ReadStatus), 2);
-    assert_eq!(log.charge_count(ChargeTransition::Energised), 2);
-    assert_eq!(log.charge_count(ChargeTransition::Latched), 1);
+    assert_eq!(log.count(InaError::CurrentRead), 1);
+    assert_eq!(log.count(XyError::ReadStatus), 2);
+    assert_eq!(log.count(ChargeTransition::Energised), 2);
+    assert_eq!(log.count(ChargeTransition::Latched), 1);
     // A kind that was never recorded stays at zero across sources.
-    assert_eq!(log.charge_count(ChargeTransition::ProtectHold), 0);
+    assert_eq!(log.count(ChargeTransition::ProtectHold), 0);
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn counters_survive_ring_eviction() {
         log.record(1, Event::Xy(XyError::ReadStatus));
     }
     assert_eq!(log.len(), CAPACITY);
-    assert_eq!(log.xy_count(XyError::ReadStatus), pushes);
+    assert_eq!(log.count(XyError::ReadStatus), pushes);
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn pre_ntp_zero_timestamp_is_valid() {
     log.record(0, Event::Ina(InaError::Init));
     let e = log.recent().next().unwrap();
     assert_eq!(e.ts, 0);
-    assert_eq!(log.ina_count(InaError::Init), 1);
+    assert_eq!(log.count(InaError::Init), 1);
 }
 
 #[test]
@@ -129,27 +129,29 @@ fn names_are_unique_across_sources() {
 }
 
 #[test]
-fn indices_are_dense_and_match_count() {
-    let mut ina_seen = [false; <InaError as EnumCount>::COUNT];
+fn every_kind_owns_one_counter_slot() {
+    // One flat counter array means a wrong `OFFSET` silently aliases two
+    // kinds onto the same counter instead of failing to compile. Every kind
+    // must own a distinct slot, and between them they must fill the array —
+    // a gap would mean a block is offset past where the width says it ends.
+    let mut seen = [false; TOTAL_KINDS];
+    let mut mark = |slot: usize, what: &str| {
+        assert!(!seen[slot], "{what} collides at slot {slot}");
+        seen[slot] = true;
+    };
     for k in InaError::iter() {
-        assert!(!ina_seen[k.index()], "duplicate index {}", k.index());
-        ina_seen[k.index()] = true;
+        mark(k.slot(), k.name());
     }
-    assert!(ina_seen.iter().all(|&b| b));
-
-    let mut xy_seen = [false; <XyError as EnumCount>::COUNT];
     for k in XyError::iter() {
-        assert!(!xy_seen[k.index()], "duplicate index {}", k.index());
-        xy_seen[k.index()] = true;
+        mark(k.slot(), k.name());
     }
-    assert!(xy_seen.iter().all(|&b| b));
-
-    let mut charge_seen = [false; <ChargeTransition as EnumCount>::COUNT];
     for k in ChargeTransition::iter() {
-        assert!(!charge_seen[k.index()], "duplicate index {}", k.index());
-        charge_seen[k.index()] = true;
+        mark(k.slot(), k.name());
     }
-    assert!(charge_seen.iter().all(|&b| b));
+    assert!(
+        seen.iter().all(|&filled| filled),
+        "flat counter array has an unused slot"
+    );
 }
 
 #[test]
@@ -186,8 +188,8 @@ fn mixed_workload_keeps_each_source_consistent() {
         }
     }
     // 0,3,…,48 → 17 INA. 1,4,…,49 → 17 XY. 2,5,…,47 → 16 charge. 50 total.
-    assert_eq!(log.ina_count(InaError::CurrentRead), 17);
-    assert_eq!(log.xy_count(XyError::ReadStatus), 17);
-    assert_eq!(log.charge_count(ChargeTransition::ProtectHold), 16);
+    assert_eq!(log.count(InaError::CurrentRead), 17);
+    assert_eq!(log.count(XyError::ReadStatus), 17);
+    assert_eq!(log.count(ChargeTransition::ProtectHold), 16);
     assert_eq!(log.len(), CAPACITY);
 }

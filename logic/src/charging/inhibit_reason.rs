@@ -1,5 +1,6 @@
 //! Why the supervisor is holding the buck off without latching.
 
+use strum::IntoStaticStr;
 use xy_modbus::ProtectionStatus;
 
 /// Why the supervisor is declining to energise the buck this tick,
@@ -8,7 +9,8 @@ use xy_modbus::ProtectionStatus;
 /// lifts. Reported alongside `FaultReason` so a dashboard can tell
 /// "waiting for the input rail" from "the INA228 has been dead for
 /// eight seconds" — both of which look like a dark output otherwise.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum InhibitReason {
     /// Setpoint readback disagrees with what we commanded. Regulating
     /// on unknown setpoints would latch; refusing to *start* on them
@@ -36,14 +38,7 @@ pub enum InhibitReason {
 impl InhibitReason {
     /// Stable snake_case identifier, matching `FaultReason::label`.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::SettingsDrift => "settings_drift",
-            Self::ModbusUnhealthy => "modbus_unhealthy",
-            Self::BatterySensorStale => "battery_sensor_stale",
-            Self::NoBatterySample => "no_battery_sample",
-            Self::Overvoltage => "overvoltage",
-            Self::BuckProtection(_) => "buck_protection",
-        }
+        self.into()
     }
 }
 

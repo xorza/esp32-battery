@@ -14,12 +14,13 @@ use std::sync::{Arc, Mutex};
 
 use esp32_battery_logic::{Sample, SensorData};
 
-const REASON_DISPLAY_CAP: usize = 64;
-
 use crate::PACK_PROFILE;
 use crate::clock::uptime;
 use crate::http::mount_json_get;
 use crate::wifi::sta_rssi;
+
+/// Longest supervisor reason `Display` the response will carry.
+const REASON_DISPLAY_CAP: usize = 64;
 
 #[derive(Serialize)]
 pub struct BatteryReading {
@@ -109,18 +110,16 @@ pub struct ApiResponse<'a> {
     pub history: HistoryView<'a>,
 }
 
-/// Render a supervisor reason for display. `fault` and `inhibit` are both
-/// `Option<impl Display>` and differ only in which response field they land
-/// in, so they share this. An empty result means "nothing to report" and
-/// serializes as `null`.
+/// Render a supervisor reason for display, or `None` when there is none.
+/// `fault` and `inhibit` are both `Option<impl Display>` and differ only in
+/// which response field they land in, so they share this.
 fn reason_message<T: core::fmt::Display>(
     reason: Option<T>,
-) -> heapless::String<REASON_DISPLAY_CAP> {
+) -> Option<heapless::String<REASON_DISPLAY_CAP>> {
+    let reason = reason?;
     let mut out = heapless::String::new();
-    if let Some(reason) = reason {
-        let _ = write!(out, "{reason}");
-    }
-    out
+    let _ = write!(out, "{reason}");
+    Some(out)
 }
 
 pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorData>>) {
@@ -158,9 +157,9 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
             ps_offline: store.ps_offline,
             phase: store.charge_phase.map(|p| p.label()),
             fault: store.charge_fault.map(|f| f.label()),
-            fault_message: (!fault_message.is_empty()).then_some(fault_message.as_str()),
+            fault_message: fault_message.as_deref(),
             inhibit: store.charge_inhibit.map(|i| i.label()),
-            inhibit_message: (!inhibit_message.is_empty()).then_some(inhibit_message.as_str()),
+            inhibit_message: inhibit_message.as_deref(),
             history: HistoryView(store.history()),
         };
         let history_len = response.history.0.len();

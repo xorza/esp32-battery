@@ -181,6 +181,29 @@ impl<'d> WifiDriver<'d> {
         self.wifi.start().unwrap();
     }
 
+    /// Mixed AP+STA, optionally carrying STA credentials. Built here so the
+    /// cold start (`into_mixed`) and the live swap (`apply_sta_config`) can
+    /// never disagree about the AP half.
+    fn mixed_config(creds: Option<&WifiCredentials>) -> Configuration {
+        let sta = creds.map_or_else(ClientConfiguration::default, sta_config);
+        Configuration::Mixed(sta, ap_config())
+    }
+
+    /// One association attempt, returning the state afterwards. Waits for the
+    /// netif so a `true` return means downstream binds (mDNS, HTTP) can run
+    /// immediately. Callers gate on `NetPhase::polls_association` — a phase
+    /// with no credentials must not reach here, or the radio logs a failed
+    /// connect to an empty SSID every tick.
+    fn try_connect(&mut self) -> bool {
+        if self.wifi.is_connected().unwrap_or(false) {
+            return true;
+        }
+        if self.wifi.connect().is_ok() && self.wifi.wait_netif_up().is_ok() {
+            log_got_ip();
+        }
+        self.wifi.is_connected().unwrap_or(false)
+    }
+
     pub fn into_sta(mut self, creds: &WifiCredentials) -> StaWifi<'d> {
         info!("Starting WiFi STA for '{}'", creds.ssid);
         self.start_with(Configuration::Client(sta_config(creds)));
@@ -190,8 +213,7 @@ impl<'d> WifiDriver<'d> {
     pub fn into_mixed(mut self, creds: Option<&WifiCredentials>) -> MixedWifi<'d> {
         info!("Starting AP: {}", AP_SSID);
         // Always Mixed mode so the STA interface is available for scanning.
-        let sta = creds.map_or_else(ClientConfiguration::default, sta_config);
-        self.start_with(Configuration::Mixed(sta, ap_config()));
+        self.start_with(Self::mixed_config(creds));
         info!("AP started");
         MixedWifi {
             driver: self,
@@ -199,7 +221,6 @@ impl<'d> WifiDriver<'d> {
                 at: None,
                 entries: ScanResult::new(),
             })),
-            sta_configured: creds.is_some(),
         }
     }
 }
@@ -212,17 +233,8 @@ pub struct StaWifi<'d> {
 }
 
 impl<'d> StaWifi<'d> {
-    /// Single connect attempt. Returns post-attempt connection state.
-    /// Waits for the netif so a `true` return means downstream binds
-    /// (mDNS, HTTP) can run immediately.
     pub fn try_connect(&mut self) -> bool {
-        if self.driver.wifi.is_connected().unwrap_or(false) {
-            return true;
-        }
-        if self.driver.wifi.connect().is_ok() && self.driver.wifi.wait_netif_up().is_ok() {
-            log_got_ip();
-        }
-        self.driver.wifi.is_connected().unwrap_or(false)
+        self.driver.try_connect()
     }
 
     pub fn into_mixed(self, creds: Option<&WifiCredentials>) -> MixedWifi<'d> {
@@ -230,15 +242,12 @@ impl<'d> StaWifi<'d> {
     }
 }
 
-/// Mixed AP+STA mode: captive portal + STA half retrying. Carries the
-/// scan cache (only sane in mixed mode — STA-only scan would disrupt the
-/// dashboard) and a `sta_configured` flag so `try_connect` can short-
-/// circuit before any creds were ever supplied (avoids per-tick
-/// "connecting to ''" log spam at cold boot).
+/// Mixed AP+STA mode: captive portal up, STA half retrying behind it.
+/// Carries the scan cache, which is only sane in mixed mode — an STA-only
+/// scan would disrupt the dashboard.
 pub struct MixedWifi<'d> {
     driver: WifiDriver<'d>,
     scan_cache: ScanCache,
-    sta_configured: bool,
 }
 
 impl<'d> MixedWifi<'d> {
@@ -274,29 +283,15 @@ impl<'d> MixedWifi<'d> {
     /// the captive AP stays associated with the user's phone throughout.
     /// Drops any association in flight; `None` leaves the STA half bare.
     fn apply_sta_config(&mut self, creds: Option<&WifiCredentials>) {
-        let sta = creds.map_or_else(ClientConfiguration::default, sta_config);
         self.driver
             .wifi
-            .set_configuration(&Configuration::Mixed(sta, ap_config()))
+            .set_configuration(&WifiDriver::mixed_config(creds))
             .unwrap();
         let _ = self.driver.wifi.disconnect();
-        self.sta_configured = creds.is_some();
     }
 
-    /// Returns post-attempt connection state. Until creds are configured,
-    /// this is just a read of `is_connected()` — connecting to an empty
-    /// SSID logs an error per second otherwise.
     pub fn try_connect(&mut self) -> bool {
-        if !self.sta_configured {
-            return self.driver.wifi.is_connected().unwrap_or(false);
-        }
-        if self.driver.wifi.is_connected().unwrap_or(false) {
-            return true;
-        }
-        if self.driver.wifi.connect().is_ok() && self.driver.wifi.wait_netif_up().is_ok() {
-            log_got_ip();
-        }
-        self.driver.wifi.is_connected().unwrap_or(false)
+        self.driver.try_connect()
     }
 
     /// Re-run `scan_n` if the cached result is older than `SCAN_CACHE_TTL`.

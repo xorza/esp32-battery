@@ -129,7 +129,34 @@ key still boots into the portal.
 
 ---
 
-## Phase 3 — Collapse the duplicated encodings
+## Phase 3 — Collapse the duplicated encodings — **DONE except step 18**
+
+**Step 18 (supervisor state) was examined and not done — the item was wrong on
+both of its main claims.** Checked against the code rather than the review:
+
+- `Mode` is not merely "a lossy copy because `safety_verdict` takes `&mut
+  self`". `tick` returns early for both `Tripped` variants, so by the time the
+  gauntlet runs only two states remain, and `Mode` makes the third
+  *unrepresentable*. Folding it back into `LatchState` reads would force
+  `safety_verdict` to carry a `Tripped` arm that cannot occur — trading a type
+  guarantee for an `unreachable!()`.
+- `transition_between` is not re-derivation. `commit_enable` calls `set_latch`
+  from `Pending { Boot }` (→ `Energised`) *and* from `Pending { ProtectRecovery }`
+  (→ `ProtectCleared`), so that caller genuinely does not know which transition
+  it is making. The from×to table is doing real work.
+- The `set_latch` `debug_assert!`s and the `commit_*` `assert!`s are invariant
+  guards, which is what the project reserves each kind for: `debug_assert` for
+  internal invariants off the hot path, release `assert` for public-API misuse.
+  Removing them deletes the machine's written-down rules.
+
+Two further judgement calls, recorded in `REVIEW.md` rather than acted on: the
+`NetStatusHandle` / `SubmissionStatusHandle` generic costs more than it saves,
+and the `NetPhase → NetStatus → LowerKey` hops each earn their place.
+
+For step 20 the mechanism kept is the one that works in the shipped build.
+`debug_assert_matches_phase` compiled to nothing in release — the firmware
+flashes `--release` — so it was deleted in favour of a single
+`warn_out_of_step` that every mismatched arm now reports through.
 
 The bulk of the code reduction. Each item is independent of the others, so they
 can land in any order within the phase.

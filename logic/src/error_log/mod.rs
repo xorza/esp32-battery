@@ -19,16 +19,40 @@ pub enum InaError {
     PowerRead,
 }
 
-impl InaError {
-    /// Stable index 0..COUNT — relies on declaration order being the
-    /// numeric discriminant order (true for unit-only enums in Rust).
-    #[inline]
-    pub fn index(self) -> usize {
-        self as usize
+/// One source's event kinds, as `EventLog` counts them.
+///
+/// The three sources are otherwise unrelated types — `InaError` and `XyError`
+/// are real error types their producers return — so this exists only to let
+/// the log keep one flat counter array and one set of accessors instead of a
+/// parallel set per source. `OFFSET` chains off the previous source's, so a
+/// fourth one only has to continue the chain.
+pub trait EventKind:
+    // `Iterator: 'static` is strum's own shape — a plain owned struct over the
+    // variants. Stating it here rather than at each use keeps the bound off
+    // every caller's signature.
+    Copy + Into<&'static str> + IntoEnumIterator<Iterator: 'static> + EnumCount
+{
+    /// Where this source's block starts in the flat counter array.
+    const OFFSET: usize;
+
+    /// Position within this source's block. Relies on declaration order being
+    /// the numeric discriminant order (true for unit-only enums in Rust).
+    fn index(self) -> usize;
+
+    /// Slot in the flat counter array.
+    fn slot(self) -> usize {
+        Self::OFFSET + self.index()
     }
-    #[inline]
-    pub fn name(self) -> &'static str {
+
+    fn name(self) -> &'static str {
         self.into()
+    }
+}
+
+impl EventKind for InaError {
+    const OFFSET: usize = 0;
+    fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -74,29 +98,21 @@ pub enum ChargeTransition {
     Latched,
 }
 
-impl ChargeTransition {
-    /// Stable index 0..COUNT — relies on declaration order being the
-    /// numeric discriminant order (true for unit-only enums in Rust).
-    #[inline]
-    pub fn index(self) -> usize {
+impl EventKind for XyError {
+    const OFFSET: usize = <InaError as EnumCount>::COUNT;
+    fn index(self) -> usize {
         self as usize
     }
-    #[inline]
-    pub fn name(self) -> &'static str {
-        self.into()
+}
+
+impl EventKind for ChargeTransition {
+    const OFFSET: usize = <XyError as EventKind>::OFFSET + <XyError as EnumCount>::COUNT;
+    fn index(self) -> usize {
+        self as usize
     }
 }
 
 impl XyError {
-    #[inline]
-    pub fn index(self) -> usize {
-        self as usize
-    }
-    #[inline]
-    pub fn name(self) -> &'static str {
-        self.into()
-    }
-
     /// Event kind for a latched protection cause. `Normal` is not a fault,
     /// so it maps to `None`.
     pub fn from_protection(p: ProtectionStatus) -> Option<Self> {
@@ -116,14 +132,51 @@ impl XyError {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Event {
     Ina(InaError),
     Xy(XyError),
     Charge(ChargeTransition),
 }
 
-#[derive(Copy, Clone)]
+/// How an event names itself on the wire: which producer it came from, and
+/// which kind within that producer. One struct rather than two accessors so
+/// the source tags live beside the kinds they label and `/api/errors` needs
+/// no match of its own.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EventName {
+    pub source: &'static str,
+    pub kind: &'static str,
+}
+
+impl Event {
+    pub fn name(self) -> EventName {
+        match self {
+            Self::Ina(k) => EventName {
+                source: "ina",
+                kind: k.name(),
+            },
+            Self::Xy(k) => EventName {
+                source: "xy",
+                kind: k.name(),
+            },
+            Self::Charge(k) => EventName {
+                source: "charge",
+                kind: k.name(),
+            },
+        }
+    }
+
+    fn slot(self) -> usize {
+        match self {
+            Self::Ina(k) => k.slot(),
+            Self::Xy(k) => k.slot(),
+            Self::Charge(k) => k.slot(),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
 pub struct TimedEvent {
     /// Epoch seconds. `0` means the entry was recorded before NTP sync —
     /// readers can't distinguish ordering of pre-sync entries beyond
@@ -141,10 +194,15 @@ const CAPACITY: usize = 32;
 /// unreachable.
 pub struct EventLog {
     recent: Deque<TimedEvent, CAPACITY>,
-    ina_counts: [u32; <InaError as EnumCount>::COUNT],
-    xy_counts: [u32; <XyError as EnumCount>::COUNT],
-    charge_counts: [u32; <ChargeTransition as EnumCount>::COUNT],
+    /// Lifetime totals, one slot per kind across all sources — see
+    /// [`EventKind::slot`]. Flat rather than one array per source so the
+    /// record/read paths are written once.
+    counts: [u32; TOTAL_KINDS],
 }
+
+/// Width of the flat counter array: every source's block, end to end.
+const TOTAL_KINDS: usize =
+    <ChargeTransition as EventKind>::OFFSET + <ChargeTransition as EnumCount>::COUNT;
 
 impl Default for EventLog {
     fn default() -> Self {
@@ -156,9 +214,7 @@ impl EventLog {
     pub fn new() -> Self {
         Self {
             recent: Deque::new(),
-            ina_counts: [0; <InaError as EnumCount>::COUNT],
-            xy_counts: [0; <XyError as EnumCount>::COUNT],
-            charge_counts: [0; <ChargeTransition as EnumCount>::COUNT],
+            counts: [0; TOTAL_KINDS],
         }
     }
 
@@ -172,20 +228,8 @@ impl EventLog {
             .push_back(TimedEvent { ts, event })
             .ok()
             .expect("ring has a free slot after pop_front");
-        match event {
-            Event::Ina(k) => {
-                let i = k.index();
-                self.ina_counts[i] = self.ina_counts[i].saturating_add(1);
-            }
-            Event::Xy(k) => {
-                let i = k.index();
-                self.xy_counts[i] = self.xy_counts[i].saturating_add(1);
-            }
-            Event::Charge(k) => {
-                let i = k.index();
-                self.charge_counts[i] = self.charge_counts[i].saturating_add(1);
-            }
-        }
+        let slot = event.slot();
+        self.counts[slot] = self.counts[slot].saturating_add(1);
     }
 
     /// Iterate ring entries oldest-first.
@@ -193,30 +237,16 @@ impl EventLog {
         self.recent.iter()
     }
 
-    pub fn ina_count(&self, k: InaError) -> u32 {
-        self.ina_counts[k.index()]
+    /// Lifetime total for one kind, saturating at `u32::MAX`. Survives ring
+    /// eviction.
+    pub fn count<K: EventKind>(&self, kind: K) -> u32 {
+        self.counts[kind.slot()]
     }
 
-    pub fn xy_count(&self, k: XyError) -> u32 {
-        self.xy_counts[k.index()]
-    }
-
-    pub fn charge_count(&self, k: ChargeTransition) -> u32 {
-        self.charge_counts[k.index()]
-    }
-
-    /// Iterate `(name, count)` pairs for every INA error kind. Lets API
+    /// Iterate `(name, count)` pairs for every kind of one source. Lets API
     /// callers serialize without depending on `strum` themselves.
-    pub fn ina_counts_iter(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
-        InaError::iter().map(|k| (k.name(), self.ina_count(k)))
-    }
-
-    pub fn xy_counts_iter(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
-        XyError::iter().map(|k| (k.name(), self.xy_count(k)))
-    }
-
-    pub fn charge_counts_iter(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
-        ChargeTransition::iter().map(|k| (k.name(), self.charge_count(k)))
+    pub fn counts_iter<K: EventKind>(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
+        K::iter().map(|k| (k.name(), self.count(k)))
     }
 
     pub fn len(&self) -> usize {

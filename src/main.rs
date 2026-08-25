@@ -180,7 +180,6 @@ fn main() {
         let now = timer.now();
         sensor_data.lock().unwrap().tick(clock.epoch_s(), elapsed);
 
-        resources.debug_assert_matches_phase(supervisor.phase());
         let poll = NetPoll {
             now,
             associated: resources.try_connect(supervisor.phase()),
@@ -209,26 +208,33 @@ fn apply_net_action(
             resources
         }
         NetAction::ApplyCreds(creds) => {
-            if let NetResources::Mixed { wifi, bundle } = &mut resources {
-                wifi.set_sta_creds(&creds);
-                bundle.set_status(SubmissionStatus::Trying);
+            match &mut resources {
+                NetResources::Mixed { wifi, bundle } => {
+                    wifi.set_sta_creds(&creds);
+                    bundle.set_status(SubmissionStatus::Trying);
+                }
+                other => other.warn_out_of_step("ApplyCreds"),
             }
             resources
         }
         NetAction::MarkSubmissionFailed => {
             warn!("Captive: STA association timed out; flipping to Failed");
-            if let NetResources::Mixed { wifi, bundle } = &mut resources {
-                // The phase drops the credentials on this transition; the
-                // radio has to as well, or the STA half keeps retrying a
-                // pair the supervisor no longer knows about.
-                wifi.clear_sta_creds();
-                bundle.set_status(SubmissionStatus::Failed);
+            match &mut resources {
+                NetResources::Mixed { wifi, bundle } => {
+                    // The phase drops the credentials on this transition; the
+                    // radio has to as well, or the STA half keeps retrying a
+                    // pair the supervisor no longer knows about.
+                    wifi.clear_sta_creds();
+                    bundle.set_status(SubmissionStatus::Failed);
+                }
+                other => other.warn_out_of_step("MarkSubmissionFailed"),
             }
             resources
         }
         NetAction::StartMdns => {
-            if let NetResources::Sta { mdns, .. } = &mut resources {
-                *mdns = Some(wifi::setup_mdns());
+            match &mut resources {
+                NetResources::Sta { mdns, .. } => *mdns = Some(wifi::setup_mdns()),
+                other => other.warn_out_of_step("StartMdns"),
             }
             resources
         }
@@ -244,10 +250,7 @@ fn apply_net_action(
 /// STA-only, and bring the dashboard and mDNS up.
 fn promote_to_sta(resources: NetResources, ctx: &StaCtx, creds: &WifiCredentials) -> NetResources {
     let NetResources::Mixed { wifi, bundle } = resources else {
-        // Only a captive phase can emit PromoteToSta, so this means the
-        // supervisor and the resources have gone out of step. Say so —
-        // silence would leave the radio stuck with no way to tell.
-        warn!("net: PromoteToSta while already STA-only; resources out of step");
+        resources.warn_out_of_step("PromoteToSta");
         return resources;
     };
     nvs_creds::save(&ctx.nvs, creds);
@@ -269,7 +272,7 @@ fn promote_to_sta(resources: NetResources, ctx: &StaCtx, creds: &WifiCredentials
 /// it bare, which is what `/wifi-reset` wants.
 fn sta_to_captive(resources: NetResources, creds: Option<&WifiCredentials>) -> NetResources {
     let NetResources::Sta { wifi, server, mdns } = resources else {
-        warn!("net: captive fallback while already captive; resources out of step");
+        resources.warn_out_of_step("captive fallback");
         return resources;
     };
     drop(server);

@@ -175,25 +175,18 @@ impl NetResources {
         }
     }
 
-    /// The phase-to-resource mapping is total: three captive phases share
-    /// the Mixed shape and two STA phases share the Sta shape. Asserting
-    /// it each tick recovers the "illegal combinations are not
-    /// representable" property the pure/impure split gave up.
-    pub fn debug_assert_matches_phase(&self, phase: &NetPhase) {
-        debug_assert!(
-            matches!(
-                (phase, self),
-                (
-                    NetPhase::CaptiveIdle
-                        | NetPhase::CaptiveTrying { .. }
-                        | NetPhase::CaptiveFallbackRetrying { .. },
-                    NetResources::Mixed { .. }
-                ) | (
-                    NetPhase::StaConnecting { .. } | NetPhase::StaServing { .. },
-                    NetResources::Sta { .. }
-                )
-            ),
-            "resources do not match phase {phase:?}"
+    /// The phase-to-resource mapping is total: the three captive phases share
+    /// the Mixed shape, the two STA phases share the Sta shape. The
+    /// pure/impure split gave up enforcing that by construction, so a site
+    /// handed an action its resources cannot carry out reports here. The radio
+    /// is stale either way; silence would leave nothing to explain why.
+    pub fn warn_out_of_step(&self, action: &str) {
+        let live = match self {
+            Self::Mixed { .. } => "Mixed",
+            Self::Sta { .. } => "Sta",
+        };
+        log::warn!(
+            "net: {action} does not match the live {live} resources; the two are out of step"
         );
     }
 }

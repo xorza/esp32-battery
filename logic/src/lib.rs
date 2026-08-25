@@ -28,7 +28,9 @@ pub use charging::INPUT_LVP_MARGIN_V;
 
 pub use data::{Ina228Reading, PsReading, Sample, SensorData};
 pub use error::CredentialsError;
-pub use error_log::{ChargeTransition, Event, EventLog, InaError, TimedEvent, XyError};
+pub use error_log::{
+    ChargeTransition, Event, EventKind, EventLog, EventName, InaError, TimedEvent, XyError,
+};
 
 pub use dns_packet::build_response;
 pub use form::{parse_form, url_decode};
