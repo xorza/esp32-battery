@@ -94,7 +94,7 @@ The supervisor latches the buck off on any of these conditions:
 | `Overvoltage` | `v_batt > absorb_v + OV_MARGIN_V` | `OV_DURATION` = 3 s |
 | `AbsorbTimeout` | Held at CV plateau without tapering (CC ramp excluded) | `MAX_ABSORB` = 2 h |
 
-After latching, the supervisor emits `Action::DisableOutput` on every `tick()` until the caller successfully writes `set_output(false)` to the buck and calls `ack_disable()`. Once acked, the supervisor goes silent — only a reboot clears the latch.
+After latching, the supervisor emits `Action::DisableOutput` on every `tick()` until the caller successfully writes `set_output(false)` to the buck and commits the action's `DisableTicket`. Once committed, the supervisor goes silent — only a reboot clears the latch.
 
 After a reboot, the supervisor always boots in **Float**, regardless of the previous phase. Conservative by design: re-derive phase from observed current rather than persist it across resets.
 

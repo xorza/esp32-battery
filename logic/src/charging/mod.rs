@@ -26,7 +26,6 @@
 //! the safe-step-down sequencing is testable against a `VoltageWriter`
 //! mock without an esp-idf target.
 
-use std::thread;
 use std::time::Duration;
 
 use log::{error, info, warn};
@@ -156,7 +155,7 @@ pub enum BuckOutput {
     Off { cause: ProtectionStatus },
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, IntoStaticStr)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
 pub enum Phase {
     Float,
@@ -299,51 +298,100 @@ impl std::fmt::Display for InhibitReason {
     }
 }
 
+/// Proof that this tick asked for output-on, and the only key that opens
+/// [`ChargeSupervisor::commit_enable`]. Neither `Copy` nor `Clone`, and
+/// its fields are private to this module, so a caller cannot commit an
+/// enable it was never handed, commit the same one twice, or supply a
+/// `resume_absorb` of its own invention — the supervisor's answer rides
+/// along inside.
+#[derive(Debug)]
+pub struct EnableTicket {
+    resume_absorb: bool,
+}
+
+impl EnableTicket {
+    /// Whether the first regulating tick steps V_SET straight to absorb
+    /// (the pack rested below the CV plateau, so it isn't full) or parks
+    /// in Float. Exposed for logging; committing uses it either way.
+    pub fn resume_absorb(&self) -> bool {
+        self.resume_absorb
+    }
+}
+
+/// Proof that this tick asked for a V_SET change, and the key to
+/// [`ChargeSupervisor::commit_voltage`]. Carries the phase being moved
+/// to, so [`apply_update_voltage`] can name it in logs without reaching
+/// back into the supervisor.
+#[derive(Debug)]
+pub struct VoltageTicket {
+    phase: Phase,
+    target_v: f32,
+    cycle_output: bool,
+}
+
+impl VoltageTicket {
+    fn target_v(&self) -> f32 {
+        self.target_v
+    }
+
+    /// The phase this write transitions into once committed.
+    fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// `true` when `target_v` is *below* the live V_SET. The caller MUST
+    /// disable output before writing V_SET and re-enable after, in that
+    /// order. Stepping V_SET down with output enabled drives reverse
+    /// current through the buck's synchronous low-side FET (the battery
+    /// sources back into the buck as the control loop pulls V_OUT down to
+    /// the new setpoint), which can destroy the FET and propagate
+    /// upstream through the input rail — the XY7025 has no anti-backup
+    /// protection on either port. `false` means a step-up, safe to do live.
+    fn cycle_output(&self) -> bool {
+        self.cycle_output
+    }
+}
+
+/// Proof that this tick latched a fault, and the key to
+/// [`ChargeSupervisor::commit_disable`].
+#[derive(Debug)]
+pub struct DisableTicket {
+    reason: FaultReason,
+}
+
+impl DisableTicket {
+    pub fn reason(&self) -> FaultReason {
+        self.reason
+    }
+}
+
 /// What the poll loop should do this tick.
 ///
 /// The supervisor boots in a `Pending` latch state — output is OFF and we
 /// haven't decided it's safe to enable yet. Each tick re-runs the same
 /// safety checks as the active path; once all clear, the supervisor emits
-/// `EnableOutput` and stays Pending until the caller `ack_enable`s. After
-/// that it transitions to active operation: phase machine + drift +
+/// `EnableOutput` and stays Pending until the caller commits the ticket.
+/// After that it transitions to active operation: phase machine + drift +
 /// fault paths. After a fault latches, only `DisableOutput` is ever
-/// emitted until the disable is ACKed; the supervisor then sits in
+/// emitted until the disable is committed; the supervisor then sits in
 /// `Action::None` indefinitely (reboot-only recovery — transient
 /// protection causes LVP/OTP are handled in-place without latching).
+///
+/// Every non-`None` variant carries a ticket. Perform the write, then
+/// commit the ticket only if the write succeeded: dropping it instead is
+/// how a failed Modbus write becomes a retry on the next tick.
 #[derive(Debug)]
 pub enum Action {
     None,
-    /// Caller should write `set_output(true)` then call
-    /// `ack_enable(resume_absorb)`. `resume_absorb` reports whether the
-    /// supervisor will jump straight to Absorb on the first Active tick
-    /// (pack rests below the CV plateau, so it isn't full) or park in
-    /// Float. Surfacing it here keeps the bring-up decision visible at
-    /// the call site instead of buried in supervisor state.
-    EnableOutput {
-        resume_absorb: bool,
-    },
-    /// Caller should write V_SET to `target_v` then call
-    /// `ack_voltage_update`. Emitted while the phase machine wants to
-    /// transition Float ↔ Absorb but the new voltage hasn't been
-    /// successfully written yet — re-emits each tick until acked, so a
-    /// transient Modbus glitch on the write retries instead of latching
-    /// `SettingsDrift`.
-    ///
-    /// `cycle_output: true` means `target_v` is *below* the current
-    /// V_SET. The caller MUST disable output before writing V_SET and
-    /// re-enable after, in that order. Stepping V_SET down with output
-    /// enabled drives reverse current through the buck's synchronous
-    /// low-side FET (the battery sources back into the buck as the
-    /// control loop tries to pull V_OUT down to the new setpoint),
-    /// which can destroy the FET and propagate upstream through the
-    /// input rail — the XY7025 has no anti-backup protection on either
-    /// the output or the input. `false` means a step-up, which is safe
-    /// to do live.
-    UpdateVoltage {
-        target_v: f32,
-        cycle_output: bool,
-    },
-    DisableOutput(FaultReason),
+    /// Write `set_output(true)`, then [`ChargeSupervisor::commit_enable`].
+    EnableOutput(EnableTicket),
+    /// Hand the ticket to [`apply_update_voltage`], then
+    /// [`ChargeSupervisor::commit_voltage`] if it reports `Committed`.
+    /// Re-emitted every tick until committed, so a transient Modbus
+    /// glitch on the write retries instead of latching `SettingsDrift`.
+    UpdateVoltage(VoltageTicket),
+    /// Write `set_output(false)`, then [`ChargeSupervisor::commit_disable`].
+    DisableOutput(DisableTicket),
 }
 
 /// Latest fresh battery reading fed to the supervisor. Voltage is used for
@@ -356,15 +404,15 @@ pub struct BatterySample {
 
 /// Latch state.
 /// - `Pending`: output is OFF and we haven't yet emitted EnableOutput, or
-///   we have but `ack_enable` hasn't been called yet (write may have
-///   failed). Same safety checks as `Active`, but tick emits
+///   we have but its `EnableTicket` hasn't been committed yet (the write
+///   may have failed). Same safety checks as `Active`, but tick emits
 ///   `EnableOutput` instead of running the phase machine.
 /// - `Active { pending_voltage }`: output is on, phase machine + drift +
 ///   fault paths run. `pending_voltage` is `Some(next)` while a
 ///   Float↔Absorb V_SET write is in flight: tick re-emits `UpdateVoltage`
 ///   each cycle (so a transient Modbus glitch retries instead of latching
 ///   `SettingsDrift`), and `target_voltage` keeps reporting the **old**
-///   phase's voltage until `ack_voltage_update` commits the transition.
+///   phase's voltage until the `VoltageTicket` is committed.
 /// - `Tripped { acked: false }`: a fault latched; emit `DisableOutput`.
 /// - `Tripped { acked: true }`: caller successfully disabled. Reboot-only
 ///   recovery — `tick` returns `Action::None` from here on.
@@ -563,7 +611,7 @@ impl ChargeSupervisor {
         // the supervisor's job, so cold-boot can't bypass safety). We never
         // trust a *stored* phase across a reset, but the Pending bring-up
         // re-derives it from the pack's resting voltage: a pack below the CV
-        // plateau isn't full, so `ack_enable` resumes Absorb rather than
+        // plateau isn't full, so the enable ticket resumes Absorb rather than
         // stalling in Float.
         Self {
             profile,
@@ -622,13 +670,14 @@ impl ChargeSupervisor {
     /// Build the `UpdateVoltage` action for a phase transition to `next`.
     /// `cycle_output` is set when the new V_SET is below the current
     /// one — see `Action::UpdateVoltage` for why. Stable across re-emits
-    /// because `self.phase` only changes on `ack_voltage_update`.
+    /// because `self.phase` only changes on `commit_voltage`.
     fn update_voltage_for(&self, next: Phase) -> Action {
         let target_v = self.voltage_for_phase(next);
-        Action::UpdateVoltage {
+        Action::UpdateVoltage(VoltageTicket {
+            phase: next,
             target_v,
             cycle_output: target_v < self.voltage_for_phase(self.phase),
-        }
+        })
     }
 
     /// Why the supervisor is holding the buck off without having latched,
@@ -663,60 +712,69 @@ impl ChargeSupervisor {
         }
     }
 
-    /// Caller invokes this after a successful `set_output(false)` Modbus write.
-    /// Until then, the supervisor will keep emitting `DisableOutput` so a
-    /// failed disable write gets retried on every tick.
-    pub fn ack_disable(&mut self) {
-        match &mut self.latch {
-            LatchState::Tripped { acked, .. } => *acked = true,
-            _ => panic!("ack_disable without latched fault"),
-        }
-    }
-
-    /// Caller invokes this after a successful `set_output(true)` Modbus write.
-    /// Transitions Pending → Active; the supervisor's phase machine starts
-    /// running on the next tick. Until acked, the supervisor keeps emitting
-    /// `EnableOutput` so a failed enable write gets retried.
+    /// Commit the disable named by `ticket`, after a successful
+    /// `set_output(false)`. Until then the supervisor keeps emitting
+    /// `DisableOutput` so a failed write is retried every tick.
     ///
-    /// `resume_absorb` echoes the bool from the `Action::EnableOutput` the
-    /// caller is acking — `true` means the pack rested below the CV plateau
-    /// so it isn't full and the first Active tick should step V_SET
-    /// float_v → absorb_v (otherwise the supervisor parks in Float). A pack
-    /// power-cycled above ~75% rests too near `float_v` to ever draw
-    /// `enter_absorb_a`, so without this it would stall there and never
-    /// finish charging.
-    pub fn ack_enable(&mut self, resume_absorb: bool) {
-        match self.latch {
-            LatchState::Pending { .. } => {
-                let pending_voltage = resume_absorb.then_some(Phase::Absorb);
-                self.set_latch(LatchState::Active { pending_voltage });
-            }
-            _ => panic!("ack_enable from non-Pending state"),
-        }
+    /// The assert cannot fire through the public API — a `DisableTicket`
+    /// is only minted by a tick that latched — but it still guards
+    /// against a ticket stashed across ticks.
+    pub fn commit_disable(&mut self, ticket: DisableTicket) {
+        let LatchState::Tripped { reason, acked } = &mut self.latch else {
+            panic!("disable ticket committed while no fault is latched");
+        };
+        assert_eq!(
+            *reason, ticket.reason,
+            "disable ticket does not match the latched fault"
+        );
+        *acked = true;
     }
 
-    /// Caller invokes this after a successful `set_voltage(target)` Modbus
-    /// write that resulted from `Action::UpdateVoltage`. Commits the
-    /// pending phase transition: the new phase becomes the supervisor's
-    /// `target_voltage()` (drift check switches to the new value on the
-    /// next tick) and the absorb/exit debouncers reset. If the write
-    /// fails, the caller does NOT call this — the supervisor stays at
-    /// the old phase, drift check keeps matching old V_SET, and the next
-    /// tick re-emits `UpdateVoltage` for retry.
-    pub fn ack_voltage_update(&mut self) {
-        let LatchState::Active {
-            pending_voltage: Some(next),
-        } = self.latch
-        else {
-            panic!("ack_voltage_update without pending phase");
-        };
-        self.phase = next;
+    /// Commit the bring-up named by `ticket`, after a successful
+    /// `set_output(true)`. Transitions Pending → Active; the phase
+    /// machine starts on the next tick. Until committed the supervisor
+    /// keeps emitting `EnableOutput` so a failed write is retried.
+    ///
+    /// The ticket carries `resume_absorb`, so the caller can no longer
+    /// disagree with the supervisor about it: `true` means the pack
+    /// rested below the CV plateau and the first Active tick steps V_SET
+    /// float_v → absorb_v. A pack power-cycled above ~75% rests too near
+    /// `float_v` to ever draw `enter_absorb_a`, so without this it would
+    /// stall in Float and never finish charging.
+    pub fn commit_enable(&mut self, ticket: EnableTicket) {
+        assert!(
+            matches!(self.latch, LatchState::Pending { .. }),
+            "enable ticket committed outside Pending"
+        );
+        self.set_latch(LatchState::Active {
+            pending_voltage: ticket.resume_absorb.then_some(Phase::Absorb),
+        });
+    }
+
+    /// Commit the phase transition named by `ticket`, after
+    /// [`apply_update_voltage`] reported `Committed`. The new phase
+    /// becomes `target_voltage()` — so the drift check switches to the
+    /// new value on the next tick — and the absorb/exit debouncers reset.
+    ///
+    /// If the write failed the caller drops the ticket instead: the
+    /// supervisor stays on the old phase, the drift check keeps matching
+    /// the old V_SET, and the next tick re-emits `UpdateVoltage`.
+    pub fn commit_voltage(&mut self, ticket: VoltageTicket) {
+        assert!(
+            matches!(
+                self.latch,
+                LatchState::Active {
+                    pending_voltage: Some(p),
+                } if p == ticket.phase
+            ),
+            "voltage ticket committed without a matching pending phase"
+        );
+        self.phase = ticket.phase;
         self.set_latch(LatchState::Active {
             pending_voltage: None,
         });
         // A Float→Absorb transition can immediately follow an
-        // Absorb→Float, with no intervening Float dwell to clear
-        // stale counts.
+        // Absorb→Float, with no intervening Float dwell to clear stale counts.
         self.reset_phase_timers();
     }
 
@@ -739,7 +797,7 @@ impl ChargeSupervisor {
             LatchState::Tripped {
                 reason,
                 acked: false,
-            } => return Action::DisableOutput(reason),
+            } => return Action::DisableOutput(DisableTicket { reason }),
             // Tripped+acked: reboot-only recovery, supervisor parks here.
             LatchState::Tripped { acked: true, .. } => return Action::None,
             LatchState::Pending { reason } => Mode::Pending(reason),
@@ -778,9 +836,9 @@ impl ChargeSupervisor {
             // pack's resting voltage — the true SoC signal. Below the CV
             // plateau means not full, so the caller acks with
             // resume_absorb = true. The supervisor stays Pending until it does.
-            Mode::Pending(_) => Action::EnableOutput {
+            Mode::Pending(_) => Action::EnableOutput(EnableTicket {
                 resume_absorb: !self.at_cv_plateau(battery.voltage),
-            },
+            }),
             Mode::Regulating => self.regulate(battery, elapsed),
         }
     }
@@ -945,10 +1003,10 @@ impl ChargeSupervisor {
             p => p,
         };
         if next != self.phase {
-            // Defer the phase commit until the caller acks — keeps
-            // `target_voltage` matching the buck's actual V_SET so a failed
-            // write doesn't trigger SettingsDrift on the next tick. Caller
-            // invokes `ack_voltage_update` on success.
+            // Defer the phase commit until the caller commits the
+            // ticket — keeps `target_voltage` matching the buck's actual
+            // V_SET so a failed write doesn't trigger SettingsDrift on the
+            // next tick.
             self.set_latch(LatchState::Active {
                 pending_voltage: Some(next),
             });
@@ -969,7 +1027,7 @@ impl ChargeSupervisor {
     /// here so there is one place to assert on, and one place a transition
     /// log would hook into.
     fn set_latch(&mut self, next: LatchState) {
-        // Tripped is absorbing — recovery is reboot-only. `ack_disable`
+        // Tripped is absorbing — recovery is reboot-only. `commit_disable`
         // mutates its `acked` flag in place rather than coming through here,
         // so reaching this from Tripped means something tried to leave it.
         debug_assert!(
@@ -985,7 +1043,7 @@ impl ChargeSupervisor {
             reason,
             acked: false,
         });
-        Action::DisableOutput(reason)
+        Action::DisableOutput(DisableTicket { reason })
     }
 }
 
@@ -999,84 +1057,97 @@ pub trait VoltageWriter {
     fn set_output(&mut self, on: bool) -> Result<(), BusError>;
 }
 
-/// Execute one `Action::UpdateVoltage`. For `cycle_output: false` (step-up)
-/// writes V_SET live. For `cycle_output: true` (step-down) runs
-/// `set_output(false)` → settle → `set_voltage` → `ack_voltage_update`
-/// → `set_output(true)`. Partial failures attempt best-effort restore so
-/// a single transient Modbus glitch doesn't drop the UPS load:
+/// Whether [`apply_update_voltage`] got V_SET onto the device, and so
+/// whether its ticket should be committed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VoltageWriteOutcome {
+    /// V_SET is on the device — commit the ticket so the supervisor's
+    /// drift check switches to the new target next tick. This includes
+    /// the case where a step-down's re-enable failed: the setpoint
+    /// really did change, and the next tick latches
+    /// `OutputUnexpectedlyOff` for the dark buck.
+    Committed,
+    /// V_SET was not written — drop the ticket. The supervisor stays on
+    /// the old phase, its drift check keeps matching the old V_SET, and
+    /// the next tick re-emits `UpdateVoltage` for another attempt.
+    Retry,
+}
+
+/// Execute one `Action::UpdateVoltage`. For a step-up
+/// (`cycle_output == false`) writes V_SET live. For a step-down runs
+/// `set_output(false)` → settle → `set_voltage` → `set_output(true)`.
+/// Partial failures attempt a best-effort restore so a single transient
+/// Modbus glitch doesn't drop the UPS load:
 ///
-/// - Step-2 failure (`set_voltage` after disable): re-enable output so the
-///   supervisor can retry the whole sequence next tick instead of latching.
-/// - Step-3 failure (`set_output(true)` after V_SET commit): retried once
-///   inline. If still failing, the supervisor latches on the next tick
-///   — V_SET is already committed, so the failure mode is safe.
+/// - Step-2 failure (`set_voltage` after the disable): re-enable output
+///   and report `Retry`, so the supervisor re-runs the whole sequence
+///   next tick instead of latching.
+/// - Step-3 failure (`set_output(true)` after V_SET landed): retried
+///   once inline. If it still fails the outcome is `Committed` anyway —
+///   V_SET did change — and the supervisor latches on the next tick.
 ///
-/// `settle` is the quiet window between disable and the V_SET write
-/// (zero in tests). `on_error` is invoked once per Modbus error so the
-/// firmware can drop it into its event log.
+/// Takes the ticket by reference and returns an outcome rather than
+/// touching the supervisor, so control flows one direction and this
+/// stays a pure sequence of device writes. `settle` is the quiet window
+/// between the disable and the V_SET write (a no-op in tests); it is
+/// passed as a closure so this module needs no clock of its own.
+/// `on_error` is invoked once per Modbus error for the firmware's event log.
 pub fn apply_update_voltage<W: VoltageWriter>(
     xy: &mut W,
-    supervisor: &mut ChargeSupervisor,
-    target_v: f32,
-    cycle_output: bool,
-    settle: Duration,
+    ticket: &VoltageTicket,
+    settle: impl FnOnce(),
     mut on_error: impl FnMut(XyError),
-) {
-    if !cycle_output {
-        match xy.set_voltage(target_v) {
+) -> VoltageWriteOutcome {
+    let target_v = ticket.target_v;
+    let phase = ticket.phase.label();
+
+    if !ticket.cycle_output {
+        return match xy.set_voltage(target_v) {
             Ok(()) => {
-                supervisor.ack_voltage_update();
-                info!(
-                    "charge phase → {}: V_set = {target_v:.2} V",
-                    supervisor.phase().label()
-                );
+                info!("charge phase → {phase}: V_set = {target_v:.2} V");
+                VoltageWriteOutcome::Committed
             }
             Err(e) => {
                 warn!("XY set_voltage({target_v}): {e} — supervisor will retry next tick");
                 on_error(XyError::SetVoltage);
+                VoltageWriteOutcome::Retry
             }
-        }
-        return;
+        };
     }
 
     info!("charge phase step-down → V_set = {target_v:.2} V (cycling output)");
     if let Err(e) = xy.set_output(false) {
         warn!("XY safe-step-down set_output(false): {e} — will retry next tick");
         on_error(XyError::SetOutput);
-        return;
+        return VoltageWriteOutcome::Retry;
     }
-    thread::sleep(settle);
+    settle();
     if let Err(e) = xy.set_voltage(target_v) {
         warn!("XY safe-step-down set_voltage({target_v}): {e} — attempting output restore");
         on_error(XyError::SetVoltage);
-        // Best-effort restore so the UPS load stays powered. Supervisor
-        // is still in Active+pending_voltage=Some(next) and will
-        // re-emit UpdateVoltage on the next tick for another attempt.
+        // Best-effort restore so the UPS load stays powered. The ticket
+        // goes uncommitted, so the supervisor re-emits UpdateVoltage.
         if let Err(e) = xy.set_output(true) {
             error!("XY safe-step-down restore set_output(true): {e} — buck OFF, will latch");
             on_error(XyError::SetOutput);
         }
-        return;
+        return VoltageWriteOutcome::Retry;
     }
-    // V_SET is on the buck; commit the phase so the next tick's drift
-    // check sees matching setpoints.
-    supervisor.ack_voltage_update();
-    // Step 3: re-enable. Retry once inline to ride out a single
-    // transient glitch; persistent failure latches on the next tick.
+    // Step 3: re-enable. Retry once inline to ride out a single transient
+    // glitch; persistent failure is safe because V_SET is already on the
+    // device, so the next tick sees a dark buck and latches.
     let enable = xy.set_output(true).or_else(|e| {
         warn!("XY safe-step-down set_output(true) attempt 1: {e} — retrying");
         xy.set_output(true)
     });
     match enable {
-        Ok(()) => info!(
-            "charge phase → {}: V_set = {target_v:.2} V (step-down complete)",
-            supervisor.phase().label()
-        ),
+        Ok(()) => info!("charge phase → {phase}: V_set = {target_v:.2} V (step-down complete)"),
         Err(e) => {
             error!("XY safe-step-down set_output(true): {e} — buck OFF after voltage commit");
             on_error(XyError::SetOutput);
         }
     }
+    VoltageWriteOutcome::Committed
 }
 
 #[cfg(test)]

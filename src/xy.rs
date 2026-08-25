@@ -15,7 +15,8 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use esp32_battery_logic::charging::{
-    self, Action, BatterySample, BuckOutput, BusError, ChargeSupervisor, PollResult, VoltageWriter,
+    self, Action, BatterySample, BuckOutput, BusError, ChargeSupervisor, PollResult,
+    VoltageWriteOutcome, VoltageWriter,
 };
 use esp32_battery_logic::data::{PsReading, SensorData};
 use esp32_battery_logic::error_log::{Event, XyError};
@@ -564,41 +565,50 @@ fn apply_action<D: XyDevice>(
 ) {
     match action {
         Action::None => {}
-        Action::EnableOutput { resume_absorb } => {
-            info!("supervisor enabling output (resume_absorb={resume_absorb})");
+        Action::EnableOutput(ticket) => {
+            info!(
+                "supervisor enabling output (resume_absorb={})",
+                ticket.resume_absorb()
+            );
             match xy.set_output(true) {
-                Ok(()) => supervisor.ack_enable(resume_absorb),
+                // Dropping the ticket instead is what makes a failed
+                // write a retry: the supervisor stays Pending and
+                // re-emits EnableOutput next tick.
+                Ok(()) => supervisor.commit_enable(ticket),
                 Err(e) => {
                     warn!("XY set_output(true): {e} — supervisor stays Pending, will retry");
                     recorder.record(Event::Xy(XyError::SetOutput));
                 }
             }
         }
-        Action::UpdateVoltage {
-            target_v,
-            cycle_output,
-        } => charging::apply_update_voltage(
-            xy,
-            supervisor,
-            target_v,
-            cycle_output,
-            STEP_DOWN_SETTLE,
-            |err| recorder.record(Event::Xy(err)),
-        ),
-        Action::DisableOutput(reason) => match xy.set_output(false) {
-            Ok(()) => {
-                error!("CHARGE FAULT ({reason}): PS output DISABLED");
-                // Record once per latch episode: ack_disable transitions
-                // out of `Tripped { acked: false }`, so subsequent ticks
-                // stop re-emitting DisableOutput for the same fault.
-                recorder.record(Event::Xy(XyError::ChargeFaultLatched));
-                supervisor.ack_disable();
+        Action::UpdateVoltage(ticket) => {
+            let outcome = charging::apply_update_voltage(
+                xy,
+                &ticket,
+                || thread::sleep(STEP_DOWN_SETTLE),
+                |err| recorder.record(Event::Xy(err)),
+            );
+            if outcome == VoltageWriteOutcome::Committed {
+                supervisor.commit_voltage(ticket);
             }
-            Err(e) => {
-                error!("CHARGE FAULT ({reason}): set_output(false) failed: {e} — will retry");
-                recorder.record(Event::Xy(XyError::SetOutput));
+        }
+        Action::DisableOutput(ticket) => {
+            let reason = ticket.reason();
+            match xy.set_output(false) {
+                Ok(()) => {
+                    error!("CHARGE FAULT ({reason}): PS output DISABLED");
+                    // Record once per latch episode: committing the ticket
+                    // leaves `Tripped { acked: true }`, so subsequent ticks
+                    // stop re-emitting DisableOutput for the same fault.
+                    recorder.record(Event::Xy(XyError::ChargeFaultLatched));
+                    supervisor.commit_disable(ticket);
+                }
+                Err(e) => {
+                    error!("CHARGE FAULT ({reason}): set_output(false) failed: {e} — will retry");
+                    recorder.record(Event::Xy(XyError::SetOutput));
+                }
             }
-        },
+        }
     }
 }
 

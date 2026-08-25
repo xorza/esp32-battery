@@ -24,8 +24,8 @@ are fixable in isolation:
 
 Ranked by value: **P1 > P3 > P4 > P2 > P5 > P6 > P7**.
 
-**P3 and P4 are done** — landed together, 174 host tests green. The
-remaining open items are P1, P2, P5, P6 and P7.
+**P2, P3, P4 and P7 are done** — 174 host tests green. The remaining
+open items are P1, P5 and P6.
 
 ---
 
@@ -154,7 +154,7 @@ the supervisor simply does not emit from captive phases.
 - `drift_outranks_overvoltage_while_regulating` pins the check ordering;
   the three former Pending-latch tests now assert inhibit-and-recover.
 
-## P2 — Replace the panic-enforced ack protocol with linear tickets
+## P2 — Replace the panic-enforced ack protocol with linear tickets — DONE
 
 **Problem.** Three `panic!`s guard the ack protocol
 (`charging/mod.rs:545, 567, 584`). On this board the panic hook reboots.
@@ -304,6 +304,29 @@ is on battery right now, that distinction is the whole story.
 
 ---
 
+### What shipped (P2 + P7a)
+
+- `Action` variants now carry `EnableTicket` / `VoltageTicket` /
+  `DisableTicket` — non-`Copy`, non-`Clone`, private fields. `ack_enable`,
+  `ack_voltage_update` and `ack_disable` are gone, replaced by
+  `commit_enable`, `commit_voltage` and `commit_disable`, which consume
+  the ticket.
+- `resume_absorb` rides inside `EnableTicket`, so a caller can no longer
+  echo back a value the supervisor did not choose.
+- `VoltageTicket` also carries the target `Phase`, which is what let
+  `apply_update_voltage` drop its `&mut ChargeSupervisor` entirely.
+- `apply_update_voltage(xy, &ticket, settle, on_error) ->
+  VoltageWriteOutcome`. `settle` is now `impl FnOnce()`, so the logic
+  crate no longer imports `std::thread` at all; the firmware passes
+  `|| thread::sleep(STEP_DOWN_SETTLE)`. The caller commits the ticket iff
+  the outcome is `Committed`, so control flows one direction.
+- Dropping a ticket *is* the retry path, which is now stated in the type
+  rather than in a comment.
+
+The residual asserts in `commit_*` are unreachable through the public
+API — a ticket only exists because a tick minted one — and remain only to
+catch a ticket deliberately stashed across ticks.
+
 ## P5 — Invariants and a transition log
 
 Two cheap additions that turn field debugging from guesswork into
@@ -359,7 +382,7 @@ having persisted creds first.
 
 ---
 
-## P7 — The step-down sequencer
+## P7 — The step-down sequencer — DONE (option (a))
 
 `apply_update_voltage` is the one impurity left in the logic crate: it
 calls `thread::sleep`. It also encodes a five-step effect sequence with
@@ -392,7 +415,7 @@ is not worth the purity.
 | Step | Work | Why here |
 |---|---|---|
 | ~~P3 + P4~~ | **Done** | Landed as one pass: `Mode`, `Verdict`, `safety_verdict`, `set_latch`, `InhibitReason`, wired to `/api` |
-| P2 + P7(a) | One file, mechanical | Same call sites as P3; do them in the same pass |
+| ~~P2 + P7(a)~~ | **Done** | `EnableTicket` / `VoltageTicket` / `DisableTicket` + `commit_*`; `apply_update_voltage` takes a ticket and returns `VoltageWriteOutcome` |
 | P5 | Small | Needs P3's single setter to exist |
 | P6 | Small, needs dep approval | Needs the above to be worth proving |
 | P1 | Largest | Independent of the rest; schedule on its own |
