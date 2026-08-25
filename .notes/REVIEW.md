@@ -24,29 +24,6 @@ and benefit; items within a group share one root cause.
       lcd thread` — it is dead only when the `lcd` feature is off, expressed as
       an unconditional allow rather than a cfg.
 
-## `SensorData` is a pass-through wrapper carrying an unrelated mailbox
-
-- [ ] `update_battery`, `update_ps`, `battery_reading`, `ps_reading`,
-      `power_online`, `history`, `interval` are each a one-line delegate to a
-      private `LiveReadings` or `History` (`logic/src/data/mod.rs:178-210`).
-      The type adds no behaviour of its own except `tick`.
-- [ ] Its five public fields — `model_code`, `ps_offline`, `charge_phase`,
-      `charge_fault`, `charge_inhibit` (`:131-153`) — are a supervisor →
-      dashboard mailbox with nothing to do with sensor readings, and they share
-      the sensor mutex, so the LCD's 2 Hz read and the `/api` handler contend
-      with the XY poll thread's writes.
-- [ ] `power_online` is a boolean carried as `f32` because history compaction
-      averages it (`logic/src/data/mod.rs:110`). That representation reaches the
-      wire: `/api` ships `1.0`/`0.0` for both the live field and every history
-      row (`src/api.rs:86`, `:55`).
-- [ ] `src/xy.rs` takes the `SensorData` mutex three times per tick — once in
-      `poll` to publish `PsReading` + `ps_offline` (`:505`), once in `poll` to
-      read the battery back out (`:545`), once in `run` to publish
-      phase/fault/inhibit (`:471`).
-- [ ] `SensorData::interval()` and `History::interval()` have no caller outside
-      the logic crate's own tests; the compaction interval is never surfaced to
-      the dashboard that would need it to read the x-axis.
-
 ## One number, two literals
 
 - [ ] `SETPOINT_DRIFT_TOL = 0.02` (`logic/src/charging/mod.rs:111`) and the bare
@@ -62,11 +39,9 @@ and benefit; items within a group share one root cause.
       `esp32_battery_logic::PsReading`, redeclared only to attach `Serialize`;
       `api::BatteryReading` (`:25`) is `Ina228Reading` with `soc` substituted
       for `voltage`.
-- [ ] `Sample` averaging is written twice inside `logic/src/data/history/mod.rs`
-      — once in `SampleAccum::average` (`:39`), once inline in
-      `compact_if_needed`'s pairwise loop (`:122-128`) — and a third
-      structurally identical accumulator exists for `Ina228Reading`
-      (`ina::ReadingAccum`, `src/ina.rs:22`).
+- [ ] `ina::ReadingAccum` (`src/ina.rs:22`) is structurally identical to
+      `data::history::SampleAccum` — the same sum-then-divide over a fixed
+      field list, written a second time for `Ina228Reading`.
 - [ ] `AP_GATEWAY` is a `[u8; 4]` reformatted into a dotted quad for the LCD
       (`src/lcd.rs:415-417`), while `/generate_204` hard-codes the same address
       as the literal string `"http://192.168.71.1/"` (`src/captive_api.rs:111`).
@@ -78,17 +53,10 @@ and benefit; items within a group share one root cause.
       entry") no longer implies a fixed span once the main loop jitters. The
       `time_s` stamps stay honest, but sample *density* along the x-axis does
       not, and nothing records the span an averaged sample covers.
-- [ ] `History` carries a `SampleAccum`, an `acc_count`, a doubling `interval`
-      and `compact_if_needed`, but `MAX_INTERVAL` is `4`
-      (`logic/src/data/history/mod.rs:16`) — two doublings, capping coverage at
-      ~13.6 minutes. `MAX_ABSORB` alone permits a 2 h absorb phase
-      (`logic/src/charging/mod.rs:80`), so the dashboard cannot show a charge
-      cycle, and the machinery that grows coverage exponentially stops almost
-      immediately.
 - [ ] Once the interval is capped, the steady-state drop path is
       `self.samples.remove(0)` on a `heapless::Vec<Sample, 204>`
-      (`logic/src/data/history/mod.rs:113`) — a ~4 KB memmove on every push,
-      forever, where the buffer is otherwise a ring.
+      (`logic/src/data/history/mod.rs`) — a ~4 KB memmove once per
+      `MAX_INTERVAL` seconds, forever, where the buffer is otherwise a ring.
 - [ ] `/api` re-serializes all 204 history rows into the shared 16 KB buffer on
       every request (`src/api.rs:164`), at the dashboard's poll rate.
 

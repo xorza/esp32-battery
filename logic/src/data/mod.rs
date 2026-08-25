@@ -1,16 +1,14 @@
-//! Sensor data store: live readings + history pipeline.
+//! What the device knows about itself: the sensor reading store with its
+//! history pipeline, and the supervisor's published status.
 //!
-//! `SensorData` is a thin orchestrator over two concerns: per-producer
-//! staleness tracking (`LiveReadings`) and the adaptive-resolution history
-//! ring (`history`).
+//! The two live behind separate mutexes — see [`charge_status::ChargeStatus`]
+//! for why.
 
+pub(crate) mod charge_status;
 pub(crate) mod history;
 
 use std::time::Duration;
 
-use crate::charging::fault_reason::FaultReason;
-use crate::charging::inhibit_reason::InhibitReason;
-use crate::charging::phase::Phase;
 use history::History;
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -59,7 +57,10 @@ pub struct Sample {
     pub voltage: f32,
     pub battery_current: f32,
     pub ps_current: f32,
-    /// 1.0 when power supply is online, 0.0 when offline. Averaged during compaction.
+    /// Fraction of the sample's span the supply was online: exactly `1.0` or
+    /// `0.0` on a raw sample, anything between once compaction averages
+    /// several together. The dashboard reads it as a duty cycle and reports
+    /// the complement as an offline percentage.
     pub power_online: f32,
 }
 
@@ -76,81 +77,12 @@ pub(crate) const STALE_WINDOW: Duration = Duration::from_secs(5);
 /// any real rail.
 const POWER_ONLINE_VOLTAGE_THRESHOLD: f32 = 2.0;
 
-#[derive(Debug)]
-struct LiveReadings {
-    latest_battery: Option<Ina228Reading>,
-    latest_ps: Option<PsReading>,
-    /// Time since the last accepted `update_*`. Initialised to
-    /// `Duration::MAX` so a fresh `LiveReadings` treats both sensors as
-    /// absent until the first live reading lands.
-    battery_stale: Duration,
-    ps_stale: Duration,
-}
-
-impl LiveReadings {
-    fn new() -> Self {
-        Self {
-            latest_battery: None,
-            latest_ps: None,
-            battery_stale: Duration::MAX,
-            ps_stale: Duration::MAX,
-        }
-    }
-
-    fn update_battery(&mut self, bat: Ina228Reading) {
-        if !bat.is_finite() {
-            log::warn!("dropping non-finite battery reading");
-            return;
-        }
-        self.latest_battery = Some(bat);
-        self.battery_stale = Duration::ZERO;
-    }
-
-    fn update_ps(&mut self, ps: PsReading) {
-        if !ps.is_finite() {
-            log::warn!("dropping non-finite PS reading");
-            return;
-        }
-        self.latest_ps = Some(ps);
-        self.ps_stale = Duration::ZERO;
-    }
-
-    /// Age both staleness clocks by the wall time since the previous tick.
-    /// Called once per `SensorData::tick`, before any reads.
-    fn age(&mut self, elapsed: Duration) {
-        self.battery_stale = self.battery_stale.saturating_add(elapsed);
-        self.ps_stale = self.ps_stale.saturating_add(elapsed);
-    }
-
-    fn battery(&self) -> Option<Ina228Reading> {
-        if self.battery_stale > STALE_WINDOW {
-            return None;
-        }
-        self.latest_battery
-    }
-
-    fn ps(&self) -> Option<PsReading> {
-        if self.ps_stale > STALE_WINDOW {
-            return None;
-        }
-        self.latest_ps
-    }
-
-    /// `1.0` when a fresh PS reading shows measurable voltage, `0.0` otherwise
-    /// (including before the first reading and after PS goes stale).
-    fn power_online(&self) -> f32 {
-        match self.ps() {
-            Some(ps) if ps.voltage > POWER_ONLINE_VOLTAGE_THRESHOLD => 1.0,
-            _ => 0.0,
-        }
-    }
-}
-
-/// Central data store with adaptive-resolution history. Producer threads
-/// publish via `update_*`; the supervisor's 1 Hz `tick` drives commits.
+/// Latest reading per producer plus the adaptive-resolution history built
+/// from them. Producer threads publish via `update_*`; the main loop's 1 Hz
+/// `tick` charges the staleness clocks and drives history commits.
 ///
 /// Wrapped in `Arc<Mutex<_>>` and shared across the INA/XY producers, the
-/// supervisor, HTTP handlers, and the LCD task. All sites use
+/// main loop, HTTP handlers, and the LCD task. All sites use
 /// `.lock().unwrap()` deliberately — the panic hook in `src/main.rs`
 /// reboots the device on any thread panic, so a poisoned mutex is
 /// unreachable in practice. Don't switch these calls to `lock().ok()` or
@@ -158,31 +90,14 @@ impl LiveReadings {
 /// continuing past a poisoned lock would mask a real fault.
 #[derive(Debug)]
 pub struct SensorData {
-    live: LiveReadings,
+    latest_battery: Option<Ina228Reading>,
+    latest_ps: Option<PsReading>,
+    /// Time since the last accepted `update_*`. Initialised to
+    /// `Duration::MAX` so a fresh store treats both sensors as absent until
+    /// the first live reading lands.
+    battery_stale: Duration,
+    ps_stale: Duration,
     history: History,
-    /// XY `MODEL` register (`0x0016`) read once at boot. `0` = not yet read.
-    /// Diagnostic only — confirms the configured `Model`'s scale family.
-    pub model_code: u16,
-    /// `true` while the buck reports input UVLO (`ProtectionStatus::Lvp`) —
-    /// the DC supply was disconnected or sagged. Set live each XY poll, so
-    /// it self-clears when the supply returns. Surfaced to LCD/web as a
-    /// benign "PS offline" status rather than a fault, since it recovers on
-    /// its own without operator action.
-    pub ps_offline: bool,
-    /// Current charging phase, or `None` while the supervisor is still in
-    /// Pending bring-up / latched off. Written by the XY supervisor each tick.
-    pub charge_phase: Option<Phase>,
-    /// Latched supervisor fault, if any. `None` during normal operation;
-    /// `Some(reason)` once the buck has been latched off, and it stays set
-    /// until a reboot. Conditions that recover on their own report through
-    /// `charge_inhibit` instead and never reach this field.
-    pub charge_fault: Option<FaultReason>,
-    /// Why the supervisor is holding the buck off without having latched.
-    /// `None` while regulating normally or once a fault has latched. Unlike
-    /// `charge_fault` this self-clears, so it distinguishes "waiting for the
-    /// input rail" from "the INA228 is dead" — both of which otherwise look
-    /// like a dark output with no phase.
-    pub charge_inhibit: Option<InhibitReason>,
 }
 
 impl Default for SensorData {
@@ -194,13 +109,11 @@ impl Default for SensorData {
 impl SensorData {
     pub fn new() -> Self {
         Self {
-            live: LiveReadings::new(),
+            latest_battery: None,
+            latest_ps: None,
+            battery_stale: Duration::MAX,
+            ps_stale: Duration::MAX,
             history: History::new(),
-            model_code: 0,
-            ps_offline: false,
-            charge_phase: None,
-            charge_fault: None,
-            charge_inhibit: None,
         }
     }
 
@@ -208,29 +121,49 @@ impl SensorData {
     /// and resets its staleness counter. Does NOT commit — the main-loop
     /// 1 Hz `tick` drives commits so one dead producer can't halt history.
     pub fn update_battery(&mut self, bat: Ina228Reading) {
-        self.live.update_battery(bat);
+        if !bat.is_finite() {
+            log::warn!("dropping non-finite battery reading");
+            return;
+        }
+        self.latest_battery = Some(bat);
+        self.battery_stale = Duration::ZERO;
     }
 
     /// Called by the XY thread once per poll.
     pub fn update_ps(&mut self, ps: PsReading) {
-        self.live.update_ps(ps);
+        if !ps.is_finite() {
+            log::warn!("dropping non-finite PS reading");
+            return;
+        }
+        self.latest_ps = Some(ps);
+        self.ps_stale = Duration::ZERO;
     }
 
     /// Latest battery reading, filtered by staleness. `None` before the
-    /// first update, or once the staleness window has elapsed without a
-    /// refresh.
+    /// first update, or once [`STALE_WINDOW`] has elapsed without a refresh.
     pub fn battery_reading(&self) -> Option<Ina228Reading> {
-        self.live.battery()
+        if self.battery_stale > STALE_WINDOW {
+            return None;
+        }
+        self.latest_battery
     }
 
     pub fn ps_reading(&self) -> Option<PsReading> {
-        self.live.ps()
+        if self.ps_stale > STALE_WINDOW {
+            return None;
+        }
+        self.latest_ps
     }
 
-    /// `1.0` when the PS shows measurable voltage, `0.0` otherwise
-    /// (including before the first reading and after PS goes stale).
-    pub fn power_online(&self) -> f32 {
-        self.live.power_online()
+    /// `1.0` when a fresh PS reading shows measurable voltage, `0.0`
+    /// otherwise (including before the first reading and after PS goes
+    /// stale). Only ever stamped onto a raw [`Sample`]; the fractional
+    /// values on the wire come from compaction averaging these.
+    fn power_online(&self) -> f32 {
+        match self.ps_reading() {
+            Some(ps) if ps.voltage > POWER_ONLINE_VOLTAGE_THRESHOLD => 1.0,
+            _ => 0.0,
+        }
     }
 
     pub fn history(&self) -> &[Sample] {
@@ -249,7 +182,8 @@ impl SensorData {
     /// continuous and the dead side surfaces as flat-line zero on the
     /// dashboard.
     pub fn tick(&mut self, now_epoch: Option<u32>, elapsed: Duration) {
-        self.live.age(elapsed);
+        self.battery_stale = self.battery_stale.saturating_add(elapsed);
+        self.ps_stale = self.ps_stale.saturating_add(elapsed);
 
         let Some(time_s) = now_epoch else {
             return;
@@ -269,14 +203,14 @@ impl SensorData {
         // Stale / absent producers yield zeroed readings. History stays
         // continuous; the zeros surface the dead producer to the dashboard
         // rather than silently freezing the timeline.
-        let bat = self.live.battery().unwrap_or_default();
-        let ps = self.live.ps().unwrap_or_default();
+        let bat = self.battery_reading().unwrap_or_default();
+        let ps = self.ps_reading().unwrap_or_default();
         let sample = Sample {
             time_s,
             voltage: bat.voltage,
             battery_current: bat.current,
             ps_current: ps.current,
-            power_online: self.live.power_online(),
+            power_online: self.power_online(),
         };
 
         self.history.commit(sample);

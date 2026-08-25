@@ -7,7 +7,7 @@ use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
 use esp32_battery_logic::EventLog;
-use esp32_battery_logic::SensorData;
+use esp32_battery_logic::{ChargeStatus, SensorData};
 
 use crate::log_ring;
 use crate::net::ResetSignal;
@@ -17,6 +17,7 @@ use super::{create_server, serve_common_assets, serve_static};
 
 pub fn start(
     sensor_data: Arc<Mutex<SensorData>>,
+    charge_status: Arc<Mutex<ChargeStatus>>,
     event_log: Arc<Mutex<EventLog>>,
     nvs: Arc<EspNvs<NvsDefault>>,
     reset: ResetSignal,
@@ -41,7 +42,7 @@ pub fn start(
         true,
     );
 
-    api::mount(&mut server, sensor_data);
+    api::mount(&mut server, sensor_data, charge_status);
     errors::mount(&mut server, event_log);
 
     log_ring::mount(&mut server);

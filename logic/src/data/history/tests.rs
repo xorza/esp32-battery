@@ -119,17 +119,41 @@ fn after_compaction_samples_at_new_interval() {
 }
 
 #[test]
-fn interval_doubles_each_compaction() {
+fn interval_doubles_each_compaction_up_to_the_cap() {
+    // A compaction to interval `i` leaves CAP/2 entries plus the row that
+    // triggered it, so the next one is 101 further rows away plus the
+    // trigger: R(2i) = R(i) + 102·i raw samples, from R(2) = CAP + 1 = 205.
+    // That gives 409, 817, 1633, 3265, 6529 for intervals 4…64.
+    const LADDER: [(u32, u32); 6] = [
+        (205, 2),
+        (409, 4),
+        (817, 8),
+        (1633, 16),
+        (3265, 32),
+        (6529, 64),
+    ];
     let mut h = History::new();
     assert_eq!(h.interval, 1);
-    fill(&mut h, 820, 0);
+    let mut fed = 0;
+    for (raw_total, interval) in LADDER {
+        fill(&mut h, raw_total - fed, fed);
+        fed = raw_total;
+        assert_eq!(h.interval, interval, "after {raw_total} raw samples");
+    }
+    assert_eq!(
+        h.interval, MAX_INTERVAL,
+        "the ladder has to end on the cap, or it is not testing the cap"
+    );
+
+    // Past the cap the interval stops doubling — the window slides instead.
+    fill(&mut h, 10 * MAX_INTERVAL, fed);
     assert_eq!(h.interval, MAX_INTERVAL);
 }
 
 #[test]
 fn long_run_stays_bounded_and_chronological() {
     let mut h = History::new();
-    fill(&mut h, 10000, 0);
+    fill(&mut h, 20000, 0);
     assert!(h.samples.len() <= CAP);
     assert!(h.samples.len() >= HALF);
     for i in 1..h.samples.len() {
@@ -173,22 +197,26 @@ fn at_max_interval_drops_oldest_via_commit() {
 
 #[test]
 fn transition_from_compaction_to_dropping() {
+    // One interval below the cap with a full buffer: the next row compacts,
+    // landing the interval exactly on MAX_INTERVAL.
     let mut h = History::new();
     h.interval = MAX_INTERVAL / 2;
     push_direct(&mut h, CAP, 0);
-
-    h.compact_if_needed();
-    assert_eq!(h.samples.len(), HALF);
+    let t = fill(&mut h, MAX_INTERVAL / 2, CAP as u32);
+    assert_eq!(h.samples.len(), HALF + 1);
     assert_eq!(h.interval, MAX_INTERVAL);
-
+    // Pairs of 0..203 average to stamps 1, 3, …, 203.
     let first_after_compact = h.samples[0].time_s;
-    push_direct(&mut h, HALF, CAP as u32);
+    assert_eq!(first_after_compact, 1);
 
-    h.compact_if_needed();
-
-    assert_eq!(h.samples.len(), CAP - 1);
-    assert_eq!(h.interval, MAX_INTERVAL);
-    assert!(h.samples[0].time_s > first_after_compact);
+    // Refill to capacity, then one row more: at the cap the oldest is
+    // dropped rather than the buffer halved again.
+    push_direct(&mut h, HALF - 1, t);
+    assert_eq!(h.samples.len(), CAP);
+    fill(&mut h, MAX_INTERVAL, t + HALF as u32);
+    assert_eq!(h.samples.len(), CAP, "the window slides, it does not grow");
+    assert_eq!(h.interval, MAX_INTERVAL, "no further doubling past the cap");
+    assert_eq!(h.samples[0].time_s, 3, "exactly one sample fell off the front");
 }
 
 #[test]

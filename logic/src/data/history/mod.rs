@@ -9,15 +9,21 @@
 
 use super::Sample;
 
-/// 204 samples × 4 s ≈ 13.6 min of history at max interval.
 pub const HISTORY_CAPACITY: usize = 204;
-/// Once interval reaches this, drop old samples instead of compacting
-/// further.
-const MAX_INTERVAL: u32 = 4;
+
+/// Once the interval reaches this, the window slides (oldest sample dropped)
+/// instead of coarsening further. 204 samples × 64 s ≈ 3.6 h, which covers a
+/// full `MAX_ABSORB` charge cycle with margin — a chart that cannot span one
+/// absorb cannot show the taper that ends it.
+const MAX_INTERVAL: u32 = 64;
 
 const _: () = assert!(
     HISTORY_CAPACITY.is_multiple_of(2),
     "HISTORY_CAPACITY must be even"
+);
+const _: () = assert!(
+    MAX_INTERVAL.is_power_of_two(),
+    "the interval doubles from 1, so the cap has to be a power of two to be hit exactly"
 );
 
 #[derive(Default, Debug)]
@@ -36,6 +42,9 @@ impl SampleAccum {
         self.power_online += s.power_online;
     }
 
+    /// Mean of the `n` samples added so far, stamped `time_s`. Used both for
+    /// the running accumulator and for pairwise compaction, so the two paths
+    /// cannot drift apart on which fields get averaged.
     fn average(&self, n: u32, time_s: u32) -> Sample {
         assert!(n > 0, "cannot average zero samples");
         let n = n as f32;
@@ -86,43 +95,47 @@ impl History {
 
     /// Feed one raw sample into the pipeline. Accumulates; when the
     /// running count reaches `interval`, averages and pushes onto the
-    /// history (compacting first if needed).
+    /// history, making room first if the buffer is full.
     pub fn commit(&mut self, raw: Sample) {
         self.acc.add(&raw);
         self.acc_count += 1;
-
-        if self.acc_count >= self.interval {
-            let averaged = self.acc.average(self.acc_count, raw.time_s);
-            self.acc = SampleAccum::default();
-            self.acc_count = 0;
-
-            self.compact_if_needed();
-            assert!(self.samples.push(averaged).is_ok(), "history overflow");
+        if self.acc_count < self.interval {
+            return;
         }
+
+        let averaged = self.acc.average(self.acc_count, raw.time_s);
+        self.acc = SampleAccum::default();
+        self.acc_count = 0;
+
+        if self.samples.is_full() {
+            if self.interval < MAX_INTERVAL {
+                self.compact();
+            } else {
+                // At the cap the window slides rather than coarsening: one
+                // sample's worth of memmove per `MAX_INTERVAL` seconds buys a
+                // contiguous buffer for every reader and a chart whose left
+                // edge advances smoothly instead of in jumps.
+                self.samples.remove(0);
+            }
+        }
+        self.samples
+            .push(averaged)
+            .expect("buffer has room after compacting or dropping");
     }
 
-    fn compact_if_needed(&mut self) {
-        if self.samples.len() < HISTORY_CAPACITY {
-            return;
-        }
-        if self.interval >= MAX_INTERVAL {
-            // At max interval (~13.6 min of history) — drop oldest sample to
-            // make room for the next push.
-            self.samples.remove(0);
-            return;
-        }
-        let len = self.samples.len();
-        let half = len / 2;
+    /// Halve the buffer by averaging adjacent pairs, doubling the interval
+    /// each entry now represents. Time coverage grows exponentially in fixed
+    /// memory; resolution is what pays for it.
+    fn compact(&mut self) {
+        let half = self.samples.len() / 2;
         for i in 0..half {
-            let a = self.samples[2 * i];
-            let b = self.samples[2 * i + 1];
-            self.samples[i] = Sample {
-                time_s: b.time_s,
-                voltage: (a.voltage + b.voltage) / 2.0,
-                battery_current: (a.battery_current + b.battery_current) / 2.0,
-                ps_current: (a.ps_current + b.ps_current) / 2.0,
-                power_online: (a.power_online + b.power_online) / 2.0,
-            };
+            let mut pair = SampleAccum::default();
+            pair.add(&self.samples[2 * i]);
+            pair.add(&self.samples[2 * i + 1]);
+            // The later of the two stamps: like an accumulated sample, a
+            // compacted one is labelled by the end of the span it covers.
+            let time_s = self.samples[2 * i + 1].time_s;
+            self.samples[i] = pair.average(2, time_s);
         }
         self.samples.truncate(half);
         self.interval *= 2;

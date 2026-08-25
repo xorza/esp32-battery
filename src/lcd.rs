@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use esp32_battery_logic::EventLog;
-use esp32_battery_logic::{Ina228Reading, PsReading, SensorData};
+use esp32_battery_logic::{ChargeStatus, Ina228Reading, PsReading, SensorData};
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Point, Size};
@@ -458,18 +458,20 @@ where
 pub fn start(
     pins: LcdPins,
     sensor_data: Arc<Mutex<SensorData>>,
+    charge_status: Arc<Mutex<ChargeStatus>>,
     event_log: Arc<Mutex<EventLog>>,
     status: NetStatusHandle,
 ) {
     thread::Builder::new()
         .stack_size(16384)
-        .spawn(move || run(pins, sensor_data, event_log, status))
+        .spawn(move || run(pins, sensor_data, charge_status, event_log, status))
         .unwrap();
 }
 
 fn run(
     pins: LcdPins,
     sensor_data: Arc<Mutex<SensorData>>,
+    charge_status: Arc<Mutex<ChargeStatus>>,
     event_log: Arc<Mutex<EventLog>>,
     status: NetStatusHandle,
 ) {
@@ -532,14 +534,14 @@ fn run(
             .flatten();
         let has_errors = !event_log.lock().unwrap().is_empty();
 
-        let (bat, ps, ps_offline) = {
+        let (bat, ps) = {
             let sd = sensor_data.lock().unwrap();
             (
                 sd.battery_reading().unwrap_or_default(),
                 sd.ps_reading().unwrap_or_default(),
-                sd.ps_offline,
             )
         };
+        let ps_offline = charge_status.lock().unwrap().ps_offline;
 
         ui.draw_upper(bat, ps, crate::clock::uptime());
         ui.draw_lower(LowerKey::from_inputs(

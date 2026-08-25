@@ -6,7 +6,7 @@ use xy_modbus::{ProtectionStatus, Setpoints};
 /// `setpoints` is from the V_SET/I_SET readback; `setpoints.is_some()`
 /// doubles as the modbus-healthy signal. `battery` is independent —
 /// it's the latest fresh INA228 reading.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct PollResult {
     pub battery: Option<BatterySample>,
     pub setpoints: Option<Setpoints>,
@@ -21,7 +21,7 @@ pub struct PollResult {
 /// so the relation belongs in the type. `cause: Normal` covers the
 /// "output is off and the buck reports no protection cause" case
 /// (e.g. fresh-off after boot, post-disable, panel toggle).
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum BuckOutput {
     /// OUTPUT_EN reads 1.
     On,

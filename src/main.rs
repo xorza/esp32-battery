@@ -30,7 +30,7 @@ use log::warn;
 
 use esp32_battery_logic::Chemistry;
 use esp32_battery_logic::EventLog;
-use esp32_battery_logic::SensorData;
+use esp32_battery_logic::{ChargeStatus, SensorData};
 use esp32_battery_logic::{INPUT_LVP_MARGIN_V, Profile};
 use xy_modbus::SafetyLimits;
 
@@ -87,6 +87,7 @@ fn init_logging() {
 
 struct StaCtx {
     sensor_data: Arc<Mutex<SensorData>>,
+    charge_status: Arc<Mutex<ChargeStatus>>,
     event_log: Arc<Mutex<EventLog>>,
     nvs: Arc<EspNvs<NvsDefault>>,
     reset: ResetSignal,
@@ -96,6 +97,7 @@ impl StaCtx {
     fn start_dashboard(&self) -> EspHttpServer<'static> {
         http::start_main(
             self.sensor_data.clone(),
+            self.charge_status.clone(),
             self.event_log.clone(),
             self.nvs.clone(),
             self.reset.clone(),
@@ -124,6 +126,7 @@ fn main() {
 
     let sensor_data: Arc<Mutex<SensorData>> =
         Arc::new(Mutex::new(esp32_battery_logic::SensorData::new()));
+    let charge_status: Arc<Mutex<ChargeStatus>> = Arc::new(Mutex::new(ChargeStatus::default()));
     let event_log: Arc<Mutex<EventLog>> =
         Arc::new(Mutex::new(esp32_battery_logic::EventLog::new()));
     let net_status = NetStatusHandle::new();
@@ -132,13 +135,19 @@ fn main() {
 
     let recorder = EventRecorder::new(event_log.clone(), clock.clone());
 
-    xy::start(board.xy, sensor_data.clone(), recorder.clone());
+    xy::start(
+        board.xy,
+        sensor_data.clone(),
+        charge_status.clone(),
+        recorder.clone(),
+    );
     ina::start(board.i2c, sensor_data.clone(), recorder);
 
     #[cfg(feature = "lcd")]
     lcd::start(
         board.lcd,
         sensor_data.clone(),
+        charge_status.clone(),
         event_log.clone(),
         net_status.clone(),
     );
@@ -146,6 +155,7 @@ fn main() {
     let reset = ResetSignal::new();
     let sta_ctx = StaCtx {
         sensor_data: sensor_data.clone(),
+        charge_status,
         event_log,
         nvs: nvs.clone(),
         reset,

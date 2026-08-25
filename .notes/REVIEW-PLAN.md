@@ -201,28 +201,46 @@ if a collapse is unsafe, they are where it shows.
 
 ---
 
-## Phase 4 — The data layer
+## Phase 4 — The data layer — **DONE**
 
-23. **Split `SensorData`.** The supervisor → dashboard mailbox
-    (`model_code`, `ps_offline`, `charge_phase`, `charge_fault`,
-    `charge_inhibit`) is a different concern from the reading store and currently
-    shares its mutex, so the LCD and `/api` contend with the XY poll thread.
-24. **Flatten the delegating wrapper** once the mailbox is out — every remaining
-    `SensorData` method is a one-liner onto `LiveReadings` or `History`.
-25. **[needs your call] `power_online` on the wire.** It is a bool carried as
-    `f32` because compaction averages it, and that reaches `/api` and the
-    history rows. Changing it touches `assets/index.html`.
-26. **Reduce the xy loop to one lock acquisition per tick** (currently three).
-27. **[needs your call] History coverage.** `MAX_INTERVAL = 4` caps the chart at
-    ~13.6 min while `MAX_ABSORB` permits a 2 h absorb — the dashboard cannot
-    show a charge cycle. Either the cap moves or the compaction machinery is
-    doing very little for its size.
-28. **Replace the steady-state `samples.remove(0)`** — a ~4 KB memmove on every
-    push once the interval is capped — and collapse the two hand-written
-    averaging paths in `history/mod.rs` into one.
+Both flagged decisions were taken: the dead `/api` field goes, and the chart
+window becomes 3.6 h.
 
-**Verify:** `./run_tests.sh`, plus a dashboard load against a live unit if 25 or
-27 land.
+`power_online` turned out not to be the finding it was written as. Nothing reads
+`/api`'s top-level `power_online` — the dashboard only touches the history
+column, and there the fractional average is load-bearing: it *is* the offline
+percentage. So the live field was deleted as dead, and the history column stayed
+`f32` and got documented as what it actually is, a duty-cycle fraction over the
+sample's span. No dashboard change.
+
+`MAX_INTERVAL` 4 → 64. The buffer was already 204 × 20 B, so the window grows
+from 13.6 min to 3.6 h for no RAM: it now covers a full `MAX_ABSORB` cycle with
+margin, and the doubling ladder does five steps instead of two before it caps.
+
+The mailbox is `ChargeStatus`, behind its own mutex, and it is `Copy` — every
+reader takes the lock, copies the struct out and releases it, so the two locks
+are never nested and cannot deadlock whichever order a future caller wants them.
+`SensorData` absorbed `LiveReadings` and is no longer a delegating wrapper. The
+XY loop now takes each mutex exactly once per tick (it took `SensorData` three
+times), and publishes `ps_offline` in the same acquisition as the supervisor
+state derived from it, so readers see a coherent pair rather than a half-updated
+one.
+
+**One deviation, in step 28.** The two averaging paths are collapsed —
+compaction now goes through `SampleAccum::average`, so the two cannot drift on
+which fields get averaged. `samples.remove(0)` was **kept**. Its premise moved
+under the cap decision: it now runs once per 64 s, not once per 4 s, and it is a
+~4 KB memmove costing single-digit microseconds. Replacing it means a
+`heapless::Deque`, which costs every reader the contiguous `&[Sample]`
+(`/api`'s `HistoryView` and ~35 slice-indexing sites in tests); the alternative,
+dropping in chunks, makes the chart's left edge jump instead of slide. Under the
+project's stated order — convenience and good looks both outrank performance —
+paying microseconds a minute for a contiguous buffer and a smooth left edge is
+the right trade. The finding stays open in `REVIEW.md` with corrected numbers.
+
+**Verify:** `./run_tests.sh` passes. A dashboard load against a live unit is
+still worth doing for the `power_online` removal, though nothing in
+`assets/index.html` references that field.
 
 ---
 

@@ -26,6 +26,7 @@ pub use charging::profile::Profile;
 pub use charging::voltage_writer::{VoltageWriteOutcome, VoltageWriter, apply_update_voltage};
 pub use charging::INPUT_LVP_MARGIN_V;
 
+pub use data::charge_status::ChargeStatus;
 pub use data::{Ina228Reading, PsReading, Sample, SensorData};
 pub use error::CredentialsError;
 pub use error_log::{

@@ -18,8 +18,8 @@ use esp32_battery_logic::{
     Action, BatterySample, BuckOutput, BusError, ChargeSupervisor, PollResult, VoltageWriteOutcome,
     VoltageWriter, apply_update_voltage,
 };
+use esp32_battery_logic::{ChargeStatus, PsReading, SensorData};
 use esp32_battery_logic::{Event, XyError};
-use esp32_battery_logic::{PsReading, SensorData};
 
 use xy_modbus::{ModelCheck, ProtectionStatus, SafetyLimits, Status};
 
@@ -443,12 +443,17 @@ fn boot_with_retries<D: XyDevice>(xy: &mut D, recorder: &EventRecorder) -> u16 {
 /// by the supervisor; permanent faults latch in `Action::None` and the
 /// loop keeps polling so observability and the LCD stay live until a
 /// reboot. Panics propagate (the panic hook reboots the MCU).
-fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
+fn run<D: XyDevice>(
+    mut xy: D,
+    sensor_data: Arc<Mutex<SensorData>>,
+    charge_status: Arc<Mutex<ChargeStatus>>,
+    recorder: EventRecorder,
+) {
     // !Send token stays bound to this FreeRTOS task for its lifetime.
     let wdt = task_wdt::subscribe();
 
     let model_code = boot_with_retries(&mut xy, &recorder);
-    sensor_data.lock().unwrap().model_code = model_code;
+    charge_status.lock().unwrap().model_code = model_code;
     let mut supervisor = ChargeSupervisor::new(PACK_PROFILE);
 
     // Tracks the last-seen PROTECT cause so a latch is logged to the event
@@ -460,61 +465,69 @@ fn run<D: XyDevice>(mut xy: D, sensor_data: Arc<Mutex<SensorData>>, recorder: Ev
     let mut timer = LoopTimer::start();
     loop {
         wdt.reset();
-        let p = poll(&mut xy, &sensor_data, &recorder, &mut last_protection);
-        let action = supervisor.tick(p, timer.lap());
+        let outcome = poll(&mut xy, &sensor_data, &recorder, &mut last_protection);
+        let action = supervisor.tick(outcome.poll, timer.lap());
         apply_action(&mut xy, &mut supervisor, action, &recorder);
         // The supervisor has no clock, so it buffers latch transitions and
         // we timestamp them here.
         while let Some(t) = supervisor.pop_transition() {
             recorder.record(Event::Charge(t));
         }
-        // Publish supervisor state for /api + LCD. `active_phase()` is
-        // only Some while regulating; Pending/Tripped surface as None
-        // so dashboards distinguish "not yet charging" from a real phase.
+        // One publish per tick, covering this cycle's buck reading and the
+        // supervisor state derived from it — so /api and the LCD always see
+        // a coherent pair rather than a half-updated one. `active_phase()`
+        // is only Some while regulating; Pending/Tripped surface as None so
+        // dashboards distinguish "not yet charging" from a real phase.
         {
-            let mut sd = sensor_data.lock().unwrap();
-            sd.charge_phase = supervisor.active_phase();
-            sd.charge_fault = supervisor.fault();
-            sd.charge_inhibit = supervisor.inhibit();
+            let mut status = charge_status.lock().unwrap();
+            status.ps_offline = outcome.ps_offline;
+            status.phase = supervisor.active_phase();
+            status.fault = supervisor.fault();
+            status.inhibit = supervisor.inhibit();
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// What one read cycle produced: the supervisor's view of the world, and
+/// the input-rail status the dashboard shows. Returned together so `run`
+/// publishes the status in the same lock as the supervisor state it feeds.
+#[derive(Debug)]
+struct PollOutcome {
+    poll: PollResult,
+    ps_offline: bool,
 }
 
 /// One read cycle: poll the buck, push readings into shared sensor data,
 /// snapshot the latest battery sample, and return the supervisor's
 /// per-tick view of the world.
 ///
-/// The Modbus reads run *without* the `SensorData` lock held — UART
+/// The Modbus read runs *without* the `SensorData` lock held — UART
 /// transactions can take up to `response_timeout` (500 ms) and we don't
-/// want HTTP / LCD / INA blocked on that. The mutex is only acquired in
-/// short scopes around the actual writes/reads.
+/// want HTTP / LCD / INA blocked on that. Everything it yields is decoded
+/// first, then published and read back under a single acquisition.
 fn poll<D: XyDevice>(
     xy: &mut D,
     sensor_data: &Mutex<SensorData>,
     recorder: &EventRecorder,
     last_protection: &mut ProtectionStatus,
-) -> PollResult {
+) -> PollOutcome {
     // Single bulk read covers V_SET..V_IN, PROTECT, CVCC, OUTPUT_EN —
     // one Modbus round-trip instead of three. PROTECT is necessarily
     // Normal while OUTPUT_EN is on; non-Normal here means the buck
     // self-disabled this session (boot_sequence wiped 0x0010).
-    let (setpoints, output) = match xy.read_status() {
+    let (setpoints, output, ps, ps_offline) = match xy.read_status() {
         Ok(s) => {
             // Input UVLO = the DC supply was disconnected / sagged. Treat it
             // as a benign, self-clearing "PS offline" status, not a fault.
             let ps_offline = !s.output_on && s.protection == ProtectionStatus::Lvp;
-            {
-                let mut sd = sensor_data.lock().unwrap();
-                sd.update_ps(PsReading {
-                    voltage: s.v_out,
-                    current: s.i_out,
-                    power: s.p_out,
-                    v_set: s.setpoints.v_set,
-                    i_set: s.setpoints.i_set,
-                });
-                sd.ps_offline = ps_offline;
-            }
+            let ps = Some(PsReading {
+                voltage: s.v_out,
+                current: s.i_out,
+                power: s.p_out,
+                v_set: s.setpoints.v_set,
+                i_set: s.setpoints.i_set,
+            });
             let setpoints = Some(s.setpoints);
             let output = Some(if s.output_on {
                 *last_protection = ProtectionStatus::Normal;
@@ -537,26 +550,35 @@ fn poll<D: XyDevice>(
                     cause: s.protection,
                 }
             });
-            (setpoints, output)
+            (setpoints, output, ps, ps_offline)
         }
         Err(e) => {
             warn!("XY read_status: {e}");
             recorder.record(Event::Xy(XyError::ReadStatus));
-            (None, None)
+            (None, None, None, false)
         }
     };
-    let battery = sensor_data
-        .lock()
-        .unwrap()
-        .battery_reading()
-        .map(|b| BatterySample {
+
+    // The cycle's only `SensorData` acquisition: publish what the buck said
+    // and take the battery snapshot the supervisor needs, together.
+    let battery = {
+        let mut sd = sensor_data.lock().unwrap();
+        if let Some(ps) = ps {
+            sd.update_ps(ps);
+        }
+        sd.battery_reading().map(|b| BatterySample {
             voltage: b.voltage,
             current: b.current,
-        });
-    PollResult {
-        setpoints,
-        output,
-        battery,
+        })
+    };
+
+    PollOutcome {
+        poll: PollResult {
+            setpoints,
+            output,
+            battery,
+        },
+        ps_offline,
     }
 }
 
@@ -625,10 +647,15 @@ fn make_device(pins: XyPins) -> fake::Xy<'static> {
     fake::Xy::new(pins)
 }
 
-pub fn start(pins: XyPins, sensor_data: Arc<Mutex<SensorData>>, recorder: EventRecorder) {
+pub fn start(
+    pins: XyPins,
+    sensor_data: Arc<Mutex<SensorData>>,
+    charge_status: Arc<Mutex<ChargeStatus>>,
+    recorder: EventRecorder,
+) {
     thread::Builder::new()
         .name("xy".into())
         .stack_size(8192)
-        .spawn(move || run(make_device(pins), sensor_data, recorder))
+        .spawn(move || run(make_device(pins), sensor_data, charge_status, recorder))
         .unwrap();
 }

@@ -1,7 +1,7 @@
 //! GET /api: typed JSON snapshot of current sensor state + history.
 //!
-//! Wire format preserves the prior hand-rolled shape so the frontend is unchanged.
-//! History rows use a 5-tuple that serializes as `[t, v, c1, c2, online]`.
+//! History rows use a 5-tuple that serializes as `[t, v, c1, c2, online]`,
+//! where `online` is the fraction of the row's span the supply was up.
 
 use core::fmt::Write as _;
 
@@ -12,7 +12,7 @@ use serde::ser::SerializeSeq;
 
 use std::sync::{Arc, Mutex};
 
-use esp32_battery_logic::{Sample, SensorData};
+use esp32_battery_logic::{ChargeStatus, Sample, SensorData};
 
 use crate::PACK_PROFILE;
 use crate::clock::uptime;
@@ -84,7 +84,6 @@ pub struct ApiResponse<'a> {
     pub uptime: u32,
     pub rssi: i32,
     pub voltage: f32,
-    pub power_online: f32,
     pub heap: HeapInfo,
     pub battery: BatteryReading,
     pub ps: PsReading,
@@ -122,8 +121,16 @@ fn reason_message<T: core::fmt::Display>(
     Some(out)
 }
 
-pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorData>>) {
+pub fn mount(
+    server: &mut EspHttpServer<'static>,
+    sensor_data: Arc<Mutex<SensorData>>,
+    charge_status: Arc<Mutex<ChargeStatus>>,
+) {
     mount_json_get(server, "/api", move |buf| {
+        // Copied out and released before the sensor-data lock is taken, so
+        // the XY thread's per-tick publish never queues behind the history
+        // serialization below and the two locks are never nested.
+        let status = *charge_status.lock().unwrap();
         // Sensor-data lock held only through serialization — history
         // is borrowed, not cloned. Lock drops at closure end, before
         // the network write.
@@ -132,13 +139,12 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
         let ps = store.ps_reading().unwrap_or_default();
         let mut profile = heapless::String::<32>::new();
         let _ = write!(profile, "{PACK_PROFILE}");
-        let fault_message = reason_message(store.charge_fault);
-        let inhibit_message = reason_message(store.charge_inhibit);
+        let fault_message = reason_message(status.fault);
+        let inhibit_message = reason_message(status.inhibit);
         let response = ApiResponse {
             uptime: uptime().as_secs() as u32,
             rssi: sta_rssi(),
             voltage: bat.voltage,
-            power_online: store.power_online(),
             heap: HeapInfo::new(),
             battery: BatteryReading {
                 soc: PACK_PROFILE.soc(bat.voltage),
@@ -152,13 +158,13 @@ pub fn mount(server: &mut EspHttpServer<'static>, sensor_data: Arc<Mutex<SensorD
                 v_set: ps.v_set,
                 i_set: ps.i_set,
             },
-            model_code: store.model_code,
+            model_code: status.model_code,
             profile: &profile,
-            ps_offline: store.ps_offline,
-            phase: store.charge_phase.map(|p| p.label()),
-            fault: store.charge_fault.map(|f| f.label()),
+            ps_offline: status.ps_offline,
+            phase: status.phase.map(|p| p.label()),
+            fault: status.fault.map(|f| f.label()),
             fault_message: fault_message.as_deref(),
-            inhibit: store.charge_inhibit.map(|i| i.label()),
+            inhibit: status.inhibit.map(|i| i.label()),
             inhibit_message: inhibit_message.as_deref(),
             history: HistoryView(store.history()),
         };
