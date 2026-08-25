@@ -5,8 +5,7 @@ use super::*;
 
 use crate::battery::Chemistry;
 use crate::charging::action::{Action, DisableTicket, EnableTicket, VoltageTicket};
-use crate::charging::charge_supervisor::ChargeSupervisor;
-use crate::charging::charge_supervisor::internals::SupervisorInternals;
+use crate::charging::charge_supervisor::{ChargeSupervisor, internals::SupervisorInternals};
 use crate::charging::fault_reason::FaultReason;
 use crate::charging::inhibit_reason::InhibitReason;
 use crate::charging::phase::Phase;

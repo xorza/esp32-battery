@@ -636,19 +636,20 @@ impl ChargeSupervisor {
     }
 }
 
-/// What the charging tests read out of a supervisor. `target_voltage` and
-/// `expected_setpoints` are production methods that were only ever widened
-/// past private for the tests; `LatchState` stays private here and the
-/// tests ask about it through predicates instead of matching the type.
+/// What the charging tests read out of a supervisor, gated so none of it
+/// widens the production surface. `LatchState` stays private: the tests ask
+/// about it through predicates rather than matching the type.
 #[cfg(test)]
 pub(crate) mod internals {
     use xy_modbus::Setpoints;
 
     use crate::charging::charge_supervisor::{ChargeSupervisor, LatchState};
 
-    /// Widens the supervisor's private reads to the charging tests without
-    /// widening them in production. Bring it into scope to call these as
-    /// methods; the same-named inherent ones stay private to this file.
+    /// A trait, not an inherent `impl`, because two of these names are
+    /// already private inherent methods and a second inherent definition
+    /// of a name is a duplicate-definition error however it is gated.
+    /// Tests reach them by importing this; the bodies below spell out
+    /// `ChargeSupervisor::…` so it is clear they forward rather than recurse.
     pub(crate) trait SupervisorInternals {
         /// Output is off and the supervisor is deciding whether to bring it up.
         fn is_pending(&self) -> bool;
